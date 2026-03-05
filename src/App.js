@@ -49,8 +49,8 @@ const translateTextBasic = async (text) => {
 // ============================================================================
 // 引擎 2：AI 深度引擎 (阿里云 DashScope) - 用于文本润色 & 生成课堂总结
 // ============================================================================
-const apiKey = process.env.REACT_APP_DASHSCOPE_API_KEY; // 请在此处填入您的阿里云 DashScope API Key
-const modelName = "qwen3.5-flash-2026-02-23"; // 您可以替换为 qwen-max, qwen-turbo 等您拥有的模型
+// API Key 现已交由 Vercel 后端 (/api 目录下的接口) 安全管理，前端不再直接引用以避免 process 环境变量报错
+const modelName = "qwen3.5-flash-2026-02-23"; 
 
 const polishWithAI = async (rawEn) => {
   const url = `/api/polish`; 
@@ -83,7 +83,6 @@ const polishWithAI = async (rawEn) => {
 
   const data = await response.json();
 
-  // 添加保护逻辑：如果 API 还是报错，方便我们查看
   if (data.error) {
     console.error("API Error Detail:", data.error.message);
     throw new Error(data.error.message);
@@ -94,7 +93,7 @@ const polishWithAI = async (rawEn) => {
 };
 
 const generateSummaryWithAI = async (fullTextContent) => {
-  const url = `/api/summary`; // 请求你的后端中转接口
+  const url = `/api/summary`; 
 
   const payload = {
     model: modelName,
@@ -112,8 +111,6 @@ const generateSummaryWithAI = async (fullTextContent) => {
         content: `以下是课堂记录内容：\n\n${fullTextContent}`,
       },
     ],
-    // 注意：总结功能通常返回纯文本，所以这里不需要 response_format: { type: "json_object" }
-    // 如果你一定要用 json_object，请务必在 system content 里加入 "json" 单词
   };
 
   const response = await fetch(url, {
@@ -135,24 +132,40 @@ const generateSummaryWithAI = async (fullTextContent) => {
 // ============================================================================
 const PipContent = ({ transcripts, activeEn, activeZh }) => {
   const bottomRef = useRef(null);
+  const containerRef = useRef(null);
+  const [isAutoScroll, setIsAutoScroll] = useState(true);
+
+  // 监听画中画内的滚动事件，实现智能悬停
+  const handleScroll = () => {
+    if (!containerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
+    // 距离底部不到 80px 时，自动恢复滚屏
+    setIsAutoScroll(scrollHeight - scrollTop - clientHeight < 80);
+  };
 
   useEffect(() => {
-    if (bottomRef.current) {
+    if (isAutoScroll && bottomRef.current) {
       bottomRef.current.scrollIntoView({ behavior: "smooth" });
     }
-  }, [transcripts, activeEn, activeZh]);
+  }, [transcripts, activeEn, activeZh, isAutoScroll]);
 
   return (
     <div
+      ref={containerRef}
+      onScroll={handleScroll}
       style={{
         display: "flex",
         flexDirection: "column",
         padding: "20px",
         boxSizing: "border-box",
-        minHeight: "100%",
-        justifyContent: "flex-end",
+        height: "100vh",
+        overflowY: "auto",
+        overflowX: "hidden",
+        backgroundColor: "#0f172a",
+        position: "relative",
       }}
     >
+      <div style={{ flex: 1, minHeight: "20px" }}></div>
       {transcripts.map((item) => (
         <div
           key={item.id}
@@ -166,6 +179,7 @@ const PipContent = ({ transcripts, activeEn, activeZh }) => {
             border: item.en.includes("⚠️")
               ? "1px solid #e11d48"
               : "1px solid rgba(255, 255, 255, 0.05)",
+            flexShrink: 0,
           }}
         >
           <div
@@ -203,6 +217,7 @@ const PipContent = ({ transcripts, activeEn, activeZh }) => {
             marginBottom: "16px",
             border: "1px solid rgba(79, 70, 229, 0.4)",
             boxShadow: "0 4px 12px rgba(79, 70, 229, 0.1)",
+            flexShrink: 0,
           }}
         >
           <div
@@ -243,7 +258,39 @@ const PipContent = ({ transcripts, activeEn, activeZh }) => {
           </div>
         </div>
       )}
-      <div ref={bottomRef} style={{ height: "1px" }} />
+      <div ref={bottomRef} style={{ height: "40px", flexShrink: 0 }} />
+
+      {/* 画中画悬浮返回按钮 */}
+      {!isAutoScroll && (
+        <div
+          onClick={() => {
+            setIsAutoScroll(true);
+            bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+          }}
+          style={{
+            position: "fixed",
+            bottom: "20px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            backgroundColor: "rgba(79, 70, 229, 0.95)",
+            color: "white",
+            padding: "10px 20px",
+            borderRadius: "30px",
+            cursor: "pointer",
+            fontSize: "14px",
+            fontWeight: "bold",
+            boxShadow: "0 4px 15px rgba(0,0,0,0.4)",
+            zIndex: 50,
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            fontFamily: "sans-serif",
+          }}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          返回最新同传
+        </div>
+      )}
     </div>
   );
 };
@@ -253,7 +300,6 @@ export default function App() {
   const [listeningMode, setListeningMode] = useState("none");
   const [isPaused, setIsPaused] = useState(false);
   const [transcripts, setTranscripts] = useState([]);
-  // 下面这行是记录录音秒数
   const [recordingTime, setRecordingTime] = useState(0);
 
   const [activeEn, setActiveEn] = useState("");
@@ -262,7 +308,11 @@ export default function App() {
   const [isSupported, setIsSupported] = useState(true);
 
   const [pipWindow, setPipWindow] = useState(null);
+  
+  // 主页面滚动相关的 Refs 和 State
   const scrollRef = useRef(null);
+  const mainRef = useRef(null);
+  const [isAutoScroll, setIsAutoScroll] = useState(true);
 
   const [devices, setDevices] = useState([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState("default");
@@ -284,13 +334,12 @@ export default function App() {
   const isTranslatingRef = useRef(false);
   const silenceTimerRef = useRef(null);
 
-  const PAUSE_THRESHOLD = 2500; // <--- 关键修复：补全缺失的 PAUSE_THRESHOLD 定义
+  const PAUSE_THRESHOLD = 2500; 
   const TRANSLATE_INTERVAL = 1200;
 
   const activeEnRef = useRef("");
   const activeZhRef = useRef("");
 
-  // [无缝防吞字滑动窗口]：记录当前 Session 已经归档处理掉的字符串长度
   const processedLengthRef = useRef(0);
   const lastSessionStringRef = useRef("");
 
@@ -323,13 +372,11 @@ export default function App() {
     return () => clearInterval(interval);
   }, [listeningMode, isPaused]);
 
-  // 将秒数转换为 00:00 格式
   const formatTime = (totalSeconds) => {
     const m = Math.floor(totalSeconds / 60);
     const s = totalSeconds % 60;
     return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
-  // 计时器逻辑结束
 
   useEffect(() => {
     fetchDevices();
@@ -354,7 +401,6 @@ export default function App() {
     }
   };
 
-  // 封存当前记录块（滑动窗口前移）
   const finalizeCurrentBlock = useCallback(() => {
     const textToFinalize = activeEnRef.current.trim();
     if (!textToFinalize) return;
@@ -377,7 +423,6 @@ export default function App() {
     activeBlockIdRef.current =
       Date.now().toString() + Math.random().toString(36).substring(2, 7);
 
-    // 无缝向前移动截断窗口，不重置浏览器识别引擎
     processedLengthRef.current = lastSessionStringRef.current.length;
 
     setActiveEn("");
@@ -416,7 +461,6 @@ export default function App() {
       });
   }, []);
 
-  // 基础翻译循环 (轮询)
   useEffect(() => {
     const intervalId = setInterval(async () => {
       if (listeningMode !== "mic" || isPaused) return;
@@ -471,16 +515,14 @@ export default function App() {
     };
 
     recognition.onresult = (event) => {
-      if (isPausedRef.current) return; // 暂停期间强行忽略
+      if (isPausedRef.current) return; 
 
-      // 获取当前大段会话累积的全部长字符串
       let currentSessionFullText = "";
       for (let i = 0; i < event.results.length; ++i) {
         currentSessionFullText += event.results[i][0].transcript;
       }
       lastSessionStringRef.current = currentSessionFullText;
 
-      // 截取掉已经封存归档过的头部内容（这就是无缝防吞字的核心机制）
       const activeNewText = currentSessionFullText.substring(
         processedLengthRef.current
       );
@@ -507,7 +549,6 @@ export default function App() {
     recognition.onend = () => {
       if (activeEnRef.current.trim()) finalizeCurrentBlock();
 
-      // 浏览器底层引擎偶尔自动断开时的重置
       processedLengthRef.current = 0;
       lastSessionStringRef.current = "";
 
@@ -532,14 +573,6 @@ export default function App() {
     };
   }, [finalizeCurrentBlock]);
 
-  // --------------------------------------------------------------------------
-  // [模式 B] 网课直连同传模式 (WebRTC)
-  // --------------------------------------------------------------------------
-  const tabStreamRef = useRef(null);
-  const tabRecorderRef = useRef(null);
-  const tabAudioCtxRef = useRef(null);
-  const tabRafRef = useRef(null);
-
   const startTabMode = () => {
     alert(
       "当前使用的阿里云文本模型不支持原生音频流解析。请使用『麦克风上课』模式，并将网课声音通过扬声器外放以实现无缝翻译！"
@@ -547,22 +580,11 @@ export default function App() {
   };
 
   const stopTabMode = () => {
-    if (tabRafRef.current) cancelAnimationFrame(tabRafRef.current);
-    if (tabRecorderRef.current && tabRecorderRef.current.state !== "inactive") {
-      tabRecorderRef.current.stop();
-    }
-    if (tabAudioCtxRef.current) tabAudioCtxRef.current.close();
-    if (tabStreamRef.current) {
-      tabStreamRef.current.getTracks().forEach((t) => t.stop());
-    }
     setListeningMode("none");
     setIsPaused(false);
     isPausedRef.current = false;
   };
 
-  // --------------------------------------------------------------------------
-  // 悬浮字幕画中画功能
-  // --------------------------------------------------------------------------
   const togglePip = async () => {
     if (pipWindow) {
       pipWindow.close();
@@ -583,9 +605,10 @@ export default function App() {
       });
 
       const style = pip.document.createElement("style");
+      // 注意这里的修改：将 #pip-mount 设置为 overflow: hidden，把滚动权交还给 PipContent 组件内部，实现智能滚屏
       style.textContent = `
         body { margin: 0; padding: 0; background-color: #0f172a; overflow: hidden; }
-        #pip-mount { height: 100vh; overflow-y: auto; overflow-x: hidden; }
+        #pip-mount { height: 100vh; overflow: hidden; } 
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
         ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
@@ -612,7 +635,6 @@ export default function App() {
     }
   };
 
-  // 获取去重后的纯净文本数组
   const getCleanedTranscripts = () => {
     const filteredTranscripts = [];
     const normalizeText = (text) => {
@@ -658,7 +680,6 @@ export default function App() {
     return filteredTranscripts;
   };
 
-  // 导出为 Word
   const exportToWord = () => {
     if (transcripts.length === 0) {
       alert("没有可导出的翻译记录！");
@@ -709,7 +730,6 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  // 导出总结为 Word
   const exportSummaryToWord = () => {
     if (!summaryResult) return;
     const formattedSummary = summaryResult.replace(/\n/g, "<br/>");
@@ -775,22 +795,28 @@ export default function App() {
   };
 
   // --------------------------------------------------------------------------
-  // 通用交互逻辑
+  // 主页面智能滚屏逻辑 (Smart Auto-Scroll)
   // --------------------------------------------------------------------------
+  const handleMainScroll = () => {
+    if (!mainRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = mainRef.current;
+    // 如果用户距离底部小于 100px，则视为在最底部，允许自动滚屏
+    setIsAutoScroll(scrollHeight - scrollTop - clientHeight < 100);
+  };
+
   useEffect(() => {
-    if (scrollRef.current)
+    // 只有在开启了自动滚屏时，才将页面拽到底部
+    if (isAutoScroll && scrollRef.current) {
       scrollRef.current.scrollIntoView({ behavior: "smooth" });
-  }, [transcripts, activeEn, activeZh]);
+    }
+  }, [transcripts, activeEn, activeZh, isAutoScroll]);
 
   const toggleMicMode = async () => {
     if (!recognitionRef.current) return;
 
     if (listeningMode === "mic") {
-      // ===== 修复：彻底停止 =====
       shouldListenRef.current = false;
       
-      // 关键修复：如果当前是“挂起”状态，底层引擎已经停了，不会再触发 onend，
-      // 所以我们必须在这里手动强制重置界面状态！
       if (isPausedRef.current) {
         setListeningMode("none");
         setIsPaused(false);
@@ -803,7 +829,6 @@ export default function App() {
       
       if (activeEnRef.current.trim()) finalizeCurrentBlock();
     } else {
-      // ===== 开始上课 =====
       if (listeningMode === "tab") stopTabMode();
 
       if (selectedDeviceId !== "default") {
@@ -817,7 +842,9 @@ export default function App() {
       }
 
       shouldListenRef.current = true;
-      setRecordingTime(0); // 每次重新开始时，重置计时器为 0
+      setRecordingTime(0); 
+      // 开启时默认将页面拽到底部
+      setIsAutoScroll(true);
       
       try {
         recognitionRef.current.start();
@@ -827,7 +854,6 @@ export default function App() {
     }
   };
 
-  // [新增] 暂停/继续逻辑
   const togglePause = () => {
     if (isPaused) {
       setIsPaused(false);
@@ -875,7 +901,8 @@ export default function App() {
     devices.find((d) => d.deviceId === selectedDeviceId)?.label || "默认麦克风";
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
+    // 修复：将 min-h-screen 更改为 h-screen 和 overflow-hidden，让主页面的 scroll 事件正确挂载在 main 元素上
+    <div className="h-screen bg-slate-50 flex flex-col font-sans relative overflow-hidden">
       {/* AI 纪要弹窗 */}
       {showSummaryModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
@@ -925,7 +952,7 @@ export default function App() {
         </div>
       )}
 
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-10 shadow-sm">
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-10 shadow-sm shrink-0">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 h-auto py-3 md:h-16 md:py-0 flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center space-x-3 w-full md:w-auto justify-center md:justify-start">
             <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-inner relative overflow-hidden shrink-0">
@@ -946,7 +973,6 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center justify-center md:justify-end gap-2 w-full md:w-auto">
-            {/* 麦克风选择组件 */}
             <div className="relative" ref={deviceMenuRef}>
               <button
                 onClick={() => {
@@ -987,7 +1013,6 @@ export default function App() {
               )}
             </div>
 
-            {/* AI 生成纪要按钮 */}
             {transcripts.length > 0 && (
               <button
                 onClick={handleGenerateSummary}
@@ -1001,7 +1026,6 @@ export default function App() {
 
             <div className="h-6 w-px bg-slate-200 mx-1 hidden sm:block"></div>
 
-            {/* 导出记录按钮 */}
             {transcripts.length > 0 && (
               <button
                 onClick={exportToWord}
@@ -1012,7 +1036,6 @@ export default function App() {
               </button>
             )}
 
-            {/* 悬浮窗按钮 */}
             <button
               onClick={togglePip}
               className={`p-2 rounded-lg transition-colors flex items-center justify-center border ${
@@ -1025,7 +1048,6 @@ export default function App() {
               <PictureInPicture className="w-4 h-4" />
             </button>
 
-            {/* 清空按钮 */}
             <button
               onClick={clearTranscripts}
               className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors border border-transparent hover:border-rose-100"
@@ -1044,7 +1066,6 @@ export default function App() {
               </button>
             ) : (
               <div className="flex items-center space-x-2">
-                {/* 👇 新增：超酷的数字计时器面板 👇 */}
                 <div className="flex items-center justify-center px-3 py-1.5 bg-slate-800 text-white rounded-lg text-sm font-mono font-bold tracking-wider shadow-inner border border-slate-700 ml-1">
                   <span
                     className={`w-2 h-2 rounded-full mr-2 ${
@@ -1054,7 +1075,6 @@ export default function App() {
                   {formatTime(recordingTime)}
                 </div>
 
-                {/* 暂停/继续按钮 */}
                 {isPaused ? (
                   <button
                     onClick={togglePause}
@@ -1073,7 +1093,6 @@ export default function App() {
                   </button>
                 )}
                 
-                {/* 彻底停止按钮 */}
                 <button
                   onClick={listeningMode === "mic" ? toggleMicMode : stopTabMode}
                   className="flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-rose-100 text-rose-700 hover:bg-rose-200 border border-rose-200"
@@ -1088,7 +1107,7 @@ export default function App() {
       </header>
 
       {errorMsg && (
-        <div className="max-w-4xl mx-auto w-full px-4 mt-4">
+        <div className="max-w-4xl mx-auto w-full px-4 mt-4 shrink-0">
           <div className="bg-rose-50 border-l-4 border-rose-500 p-4 rounded-r-lg flex items-start">
             <AlertCircle className="w-5 h-5 text-rose-500 mt-0.5 mr-3 flex-shrink-0" />
             <p className="text-sm text-rose-700">{errorMsg}</p>
@@ -1096,7 +1115,12 @@ export default function App() {
         </div>
       )}
 
-      <main className="flex-1 max-w-4xl mx-auto w-full px-4 py-6 flex flex-col gap-4 overflow-y-auto">
+      {/* 注意：给 main 添加了 ref 和 onScroll 监听 */}
+      <main 
+        ref={mainRef}
+        onScroll={handleMainScroll}
+        className="flex-1 max-w-4xl mx-auto w-full px-4 py-6 flex flex-col gap-4 overflow-y-auto"
+      >
         {transcripts.length === 0 && !activeEn && listeningMode === "none" && (
           <div className="flex-1 flex flex-col items-center justify-center text-slate-400 opacity-60 mt-10 md:mt-20">
             <Mic className="w-16 h-16 mb-4 stroke-[1.5] text-indigo-400" />
@@ -1120,7 +1144,7 @@ export default function App() {
         {transcripts.map((item) => (
           <div
             key={item.id}
-            className={`bg-white rounded-2xl p-5 shadow-sm border transition-all hover:shadow-md ${
+            className={`bg-white rounded-2xl p-5 shadow-sm border transition-all hover:shadow-md shrink-0 ${
               item.isPolished
                 ? "border-purple-100/60 shadow-purple-900/5"
                 : "border-slate-100"
@@ -1186,7 +1210,7 @@ export default function App() {
 
         {listeningMode === "mic" && (activeEn || isPaused) && (
           <div
-            className={`rounded-2xl p-5 shadow-sm border-2 transition-all relative overflow-hidden ${
+            className={`bg-white rounded-2xl p-5 shadow-sm border-2 transition-all relative overflow-hidden shrink-0 ${
               isPaused
                 ? "bg-amber-50/50 border-amber-200"
                 : "bg-indigo-50/40 border-indigo-100"
@@ -1223,8 +1247,22 @@ export default function App() {
           </div>
         )}
 
-        <div ref={scrollRef} className="h-4" />
+        <div ref={scrollRef} className="h-4 shrink-0" />
       </main>
+
+      {/* 主页面智能悬浮按钮：当用户向上滚动查看记录时出现 */}
+      {!isAutoScroll && (transcripts.length > 0 || activeEn) && (
+        <button
+          onClick={() => {
+            setIsAutoScroll(true);
+            scrollRef.current?.scrollIntoView({ behavior: "smooth" });
+          }}
+          className="absolute bottom-16 left-1/2 transform -translate-x-1/2 bg-indigo-600/95 text-white px-5 py-2.5 rounded-full shadow-lg shadow-indigo-500/30 text-sm font-bold flex items-center space-x-2 hover:bg-indigo-700 hover:-translate-y-1 transition-all z-20 backdrop-blur-sm border border-indigo-400"
+        >
+          <ChevronDown className="w-4 h-4" />
+          <span>返回最新同传</span>
+        </button>
+      )}
 
       {pipMountNode &&
         createPortal(
@@ -1236,7 +1274,7 @@ export default function App() {
           pipMountNode
         )}
 
-      <footer className="text-center py-4 text-xs text-slate-400 flex flex-wrap items-center justify-center gap-2">
+      <footer className="text-center py-4 text-xs text-slate-400 flex flex-wrap items-center justify-center gap-2 shrink-0 border-t border-slate-200 bg-slate-50">
         <span>Dual Mode Translation Engine</span>
         <span className="hidden sm:inline w-1 h-1 rounded-full bg-slate-300"></span>
         <span>Aliyun DashScope & Web Speech API</span>
