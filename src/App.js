@@ -50,7 +50,7 @@ const translateTextBasic = async (text) => {
 // 引擎 2：AI 深度引擎 (阿里云 DashScope) - 用于文本润色 & 生成课堂总结
 // ============================================================================
 const apiKey = process.env.REACT_APP_DASHSCOPE_API_KEY; // 请在此处填入您的阿里云 DashScope API Key
-const modelName = "qwen3.5-flash"; // 您可以替换为 qwen-max, qwen-turbo 等您拥有的模型
+const modelName = "qwen3.5-flash-2026-02-23"; // 您可以替换为 qwen-max, qwen-turbo 等您拥有的模型
 
 const polishWithAI = async (rawEn) => {
   const url = `/api/polish`; 
