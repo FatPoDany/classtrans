@@ -9,7 +9,6 @@ import {
   Loader2,
   Sparkles,
   PictureInPicture,
-  Download,
   FileText,
   ChevronDown,
   Settings,
@@ -56,7 +55,7 @@ const translateTextBasic = async (text) => {
 // 引擎 2：AI 深度引擎 (阿里云 DashScope) - 用于文本润色 & 生成课堂总结
 // ============================================================================
 // API Key 现已交由 Vercel 后端 (/api 目录下的接口) 安全管理，前端不再直接引用以避免 process 环境变量报错
-const modelName = "qwen3-vl-235b-a22b-thinking"; 
+const modelName = "qwen3.6-plus"; 
 
 // ============================================================================
 // 课堂术语纠错：用于提升浏览器识别后的英文可读性与专业词准确率
@@ -832,6 +831,14 @@ export default function App() {
   const [temporarySessions, setTemporarySessions] = useState([]);
   const [selectedSavedSession, setSelectedSavedSession] = useState(null);
   const [savedSessionsQuery, setSavedSessionsQuery] = useState("");
+  const [sessionCompletionModal, setSessionCompletionModal] = useState({
+    open: false,
+    durationSec: 0,
+    transcriptCount: 0,
+    enWordCount: 0,
+    zhCharCount: 0,
+    mode: "mic",
+  });
 
   // --------------------------------------------------------------------------
   // [极致无缝引擎核心 Refs]
@@ -904,6 +911,24 @@ export default function App() {
     const m = Math.floor(totalSeconds / 60);
     const s = totalSeconds % 60;
     return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  };
+
+  const getSessionStatsFromTranscripts = (items = []) => {
+    const transcriptCount = items.length;
+    const enWordCount = items.reduce((total, item) => {
+      const words = String(item?.en || "").match(/[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g);
+      return total + (words ? words.length : 0);
+    }, 0);
+    const zhCharCount = items.reduce((total, item) => {
+      const zhChars = String(item?.zh || "").match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g);
+      return total + (zhChars ? zhChars.length : 0);
+    }, 0);
+
+    return {
+      transcriptCount,
+      enWordCount,
+      zhCharCount,
+    };
   };
 
   const supportsDirectoryPicker =
@@ -1139,12 +1164,32 @@ export default function App() {
     });
   };
 
-  const handleDeviceChange = (deviceId) => {
+  const handleDeviceChange = async (deviceId) => {
     setSelectedDeviceId(deviceId);
     setIsDeviceMenuOpen(false);
+
     if (listeningMode === "mic") {
-      toggleMicMode();
-      setTimeout(() => toggleMicMode(), 500);
+      try {
+        if (deviceId && deviceId !== "default") {
+          await navigator.mediaDevices.getUserMedia({
+            audio: { deviceId: { exact: deviceId } },
+          });
+        } else {
+          await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+      } catch (err) {
+        console.warn("切换麦克风设备授权失败:", err);
+      }
+
+      // 关键修复：仅重启识别引擎，不触发停止收尾与生成纪要
+      shouldListenRef.current = true;
+      targetModeRef.current = "mic";
+      if (!isPausedRef.current) {
+        setErrorMsg("已切换麦克风，正在继续当前同传…");
+        try {
+          recognitionRef.current?.stop();
+        } catch (e) {}
+      }
     } else if (listeningMode === "none") {
       setTimeout(() => {
         toggleMicMode();
@@ -1419,7 +1464,13 @@ export default function App() {
     };
   }, [finalizeCurrentBlock, stopSystemAudioCapture]);
 
-  const autoSaveCurrentSessionWithSummary = useCallback(async () => {
+  const autoSaveCurrentSessionWithSummary = useCallback(async (options = {}) => {
+    const {
+      showCompletionModal = false,
+      sessionDurationSec = 0,
+      restartMode = "mic",
+    } = options;
+
     const isAiPolishPending = (item) => {
       if (!item) return false;
       if (item.isTranslating) return true;
@@ -1477,10 +1528,23 @@ export default function App() {
           item.zh !== "..."
       );
 
+      const sessionStats = getSessionStatsFromTranscripts(cleaned);
+
       if (cleaned.length === 0) {
         await saveSessionToFolder(summaryResult);
         if (sessionFolderHandle) {
           await loadSavedSessionsFromFolder(sessionFolderHandle);
+        }
+        setActiveView("saved");
+        if (showCompletionModal) {
+          setSessionCompletionModal({
+            open: true,
+            durationSec: sessionDurationSec,
+            transcriptCount: 0,
+            enWordCount: 0,
+            zhCharCount: 0,
+            mode: restartMode,
+          });
         }
         return;
       }
@@ -1514,13 +1578,30 @@ export default function App() {
         await loadSavedSessionsFromFolder(sessionFolderHandle);
       }
       setActiveView("saved");
+      if (showCompletionModal) {
+        setSessionCompletionModal({
+          open: true,
+          durationSec: sessionDurationSec,
+          transcriptCount: sessionStats.transcriptCount,
+          enWordCount: sessionStats.enWordCount,
+          zhCharCount: sessionStats.zhCharCount,
+          mode: restartMode,
+        });
+      }
     } finally {
       setIsFinalizingSession(false);
       setFinalizingProgress({ done: 0, total: 0, phase: "idle" });
     }
-  }, [finalizeCurrentBlock, loadSavedSessionsFromFolder, saveSessionToFolder, sessionFolderHandle, summaryResult]);
+  }, [
+    finalizeCurrentBlock,
+    loadSavedSessionsFromFolder,
+    saveSessionToFolder,
+    sessionFolderHandle,
+    summaryResult,
+  ]);
 
   const stopTabMode = useCallback(async () => {
+    const stopDurationSec = recordingTime;
     shouldListenRef.current = false;
 
     // 与麦克风模式保持一致：停止时先收口当前活跃片段
@@ -1534,13 +1615,17 @@ export default function App() {
 
     stopSystemAudioCapture();
     if (transcriptsRef.current.length > 0 || activeEnRef.current.trim()) {
-      await autoSaveCurrentSessionWithSummary();
+      await autoSaveCurrentSessionWithSummary({
+        showCompletionModal: true,
+        sessionDurationSec: stopDurationSec,
+        restartMode: "tab",
+      });
     }
 
     setListeningMode("none");
     setIsPaused(false);
     isPausedRef.current = false;
-  }, [autoSaveCurrentSessionWithSummary, finalizeCurrentBlock, stopSystemAudioCapture]);
+  }, [autoSaveCurrentSessionWithSummary, finalizeCurrentBlock, recordingTime, stopSystemAudioCapture]);
 
   const startTabMode = useCallback(async () => {
     if (!recognitionRef.current) return;
@@ -1712,58 +1797,6 @@ export default function App() {
     return filteredTranscripts;
   };
 
-  const exportToWord = () => {
-    if (transcripts.length === 0) {
-      alert("没有可导出的翻译记录！");
-      return;
-    }
-
-    const filteredTranscripts = getCleanedTranscripts();
-    let htmlContent = `
-      <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
-      <head>
-        <meta charset="utf-8">
-        <title>课堂翻译记录</title>
-        <style>
-          body { font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif; font-size: 14pt; line-height: 1.6; }
-          .entry { margin-bottom: 20px; border-bottom: 1px solid #ccc; padding-bottom: 10px; }
-          .speaker { font-size: 10pt; color: #4f46e5; background-color: #e0e7ff; display: inline-block; padding: 2px 8px; border-radius: 12px; margin-bottom: 6px; font-weight: bold; }
-          .en { color: #555; font-size: 12pt; margin-bottom: 8px; }
-          .zh { color: #000; font-weight: bold; }
-        </style>
-      </head>
-      <body>
-        <h1 style="text-align: center;">课堂同传记录</h1>
-        <p style="text-align: center; color: #666;">生成时间：${new Date().toLocaleString()}</p>
-        <hr>
-    `;
-
-    filteredTranscripts.forEach((item) => {
-      htmlContent += `
-        <div class="entry">
-          <div class="speaker">${item.speaker || "👩‍🏫 主讲人"}</div>
-          <div class="en">${item.en}</div>
-          <div class="zh">${item.zh}</div>
-        </div>
-      `;
-    });
-    htmlContent += `</body></html>`;
-
-    const blob = new Blob(["\ufeff", htmlContent], {
-      type: "application/msword",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `课堂翻译记录_${new Date()
-      .toLocaleDateString()
-      .replace(/[\/:]/g, "")}.doc`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  };
-
   const handleGenerateSummary = async () => {
     const cleaned = getCleanedTranscripts();
     if (cleaned.length === 0) {
@@ -1813,6 +1846,7 @@ export default function App() {
     if (!recognitionRef.current) return;
 
     if (listeningMode === "mic") {
+      const stopDurationSec = recordingTime;
       shouldListenRef.current = false;
       
       if (isPausedRef.current) {
@@ -1827,8 +1861,12 @@ export default function App() {
       
       if (activeEnRef.current.trim()) finalizeCurrentBlock();
 
-      if (transcripts.length > 0) {
-        await autoSaveCurrentSessionWithSummary();
+      if (transcriptsRef.current.length > 0 || activeEnRef.current.trim()) {
+        await autoSaveCurrentSessionWithSummary({
+          showCompletionModal: true,
+          sessionDurationSec: stopDurationSec,
+          restartMode: "mic",
+        });
       }
     } else {
       if (listeningMode === "tab") await stopTabMode();
@@ -1856,6 +1894,22 @@ export default function App() {
         console.error("启动录音失败", e);
       }
     }
+  };
+
+  const handleStartNextRecording = async () => {
+    const nextMode = sessionCompletionModal.mode || "mic";
+    setSessionCompletionModal((prev) => ({ ...prev, open: false }));
+    clearTranscripts();
+    setSummaryResult("");
+    setActiveView("home");
+    setRecordingTime(0);
+
+    if (nextMode === "tab") {
+      await startTabMode();
+      return;
+    }
+
+    await toggleMicMode();
   };
 
   const togglePause = () => {
@@ -2281,16 +2335,6 @@ export default function App() {
             )}
 
             <div className="h-6 w-px bg-slate-200 mx-1 hidden sm:block"></div>
-
-            {transcripts.length > 0 && (
-              <button
-                onClick={exportToWord}
-                className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors flex items-center justify-center border border-transparent hover:border-indigo-100"
-                title="导出全文翻译记录为 Word"
-              >
-                <Download className="w-4 h-4" />
-              </button>
-            )}
 
             {transcripts.length > 0 && (
               <button
@@ -2778,6 +2822,51 @@ export default function App() {
           />,
           pipMountNode
         )}
+
+      {sessionCompletionModal.open && (
+        <div className="absolute inset-0 z-40 bg-slate-900/50 backdrop-blur-[1px] flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-slate-200 shadow-2xl p-6">
+            <h3 className="text-lg font-bold text-slate-900">本次录制已完成</h3>
+            <p className="text-sm text-slate-500 mt-1">
+              AI 润色与纪要已处理完成，下面是本次同传统计：
+            </p>
+
+            <div className="grid grid-cols-2 gap-3 mt-4">
+              <div className="rounded-xl border border-indigo-100 bg-indigo-50/60 px-3 py-2">
+                <p className="text-xs text-indigo-600 font-semibold">录制时长</p>
+                <p className="text-base font-bold text-indigo-900 mt-1">{formatTime(sessionCompletionModal.durationSec)}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                <p className="text-xs text-slate-500 font-semibold">转录块数</p>
+                <p className="text-base font-bold text-slate-900 mt-1">{sessionCompletionModal.transcriptCount}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                <p className="text-xs text-slate-500 font-semibold">英文词数</p>
+                <p className="text-base font-bold text-slate-900 mt-1">{sessionCompletionModal.enWordCount}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                <p className="text-xs text-slate-500 font-semibold">中文字数</p>
+                <p className="text-base font-bold text-slate-900 mt-1">{sessionCompletionModal.zhCharCount}</p>
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                onClick={() => setSessionCompletionModal((prev) => ({ ...prev, open: false }))}
+                className="px-3.5 py-2 text-sm rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100"
+              >
+                稍后再录
+              </button>
+              <button
+                onClick={handleStartNextRecording}
+                className="px-4 py-2 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+              >
+                开始下一场录制
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <footer className="text-center py-4 text-xs text-slate-400 flex flex-wrap items-center justify-center gap-2 shrink-0 border-t border-slate-200 bg-slate-50">
         <span>Dual Mode Translation Engine</span>
