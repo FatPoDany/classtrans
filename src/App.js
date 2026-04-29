@@ -22,6 +22,7 @@ import {
   BookOpen,
   ChevronsLeft,
   ChevronsRight,
+  Cpu,
 } from "lucide-react";
 
 // ============================================================================
@@ -55,7 +56,24 @@ const translateTextBasic = async (text) => {
 // 引擎 2：AI 深度引擎 (阿里云 DashScope) - 用于文本润色 & 生成课堂总结
 // ============================================================================
 // API Key 现已交由 Vercel 后端 (/api 目录下的接口) 安全管理，前端不再直接引用以避免 process 环境变量报错
-const modelName = "qwen3.6-plus"; 
+const MODEL_STORAGE_KEY = "classtrans.aiModelName.v1";
+let runtimeModelName = "qwen3.5-122b-a10b";
+try {
+  if (typeof window !== "undefined") {
+    const savedModel = window.localStorage.getItem(MODEL_STORAGE_KEY);
+    if (savedModel) runtimeModelName = savedModel;
+  }
+} catch (err) {}
+
+export const setGlobalModelName = (name) => {
+  const cleanName = String(name || "").trim();
+  if (cleanName) {
+    runtimeModelName = cleanName;
+    try {
+      window.localStorage.setItem(MODEL_STORAGE_KEY, cleanName);
+    } catch (e) {}
+  }
+}; 
 
 // ============================================================================
 // 课堂术语纠错：用于提升浏览器识别后的英文可读性与专业词准确率
@@ -157,7 +175,7 @@ const renderInlineMarkdownToSafeHtml = (rawText) => {
 
   const codeTokens = [];
   let html = escapeHtml(source).replace(/`([^`]+)`/g, (_, code) => {
-    const token = `@@INLINE_CODE_${codeTokens.length}@@`;
+    const token = `@@INLINECODE${codeTokens.length}@@`;
     codeTokens.push(`<code>${escapeHtml(code)}</code>`);
     return token;
   });
@@ -172,7 +190,7 @@ const renderInlineMarkdownToSafeHtml = (rawText) => {
       '<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>'
     );
 
-  return html.replace(/@@INLINE_CODE_(\d+)@@/g, (_, index) => {
+  return html.replace(/@@INLINECODE(\d+)@@/g, (_, index) => {
     return codeTokens[Number(index)] || "";
   });
 };
@@ -297,13 +315,23 @@ const applyClassroomGlossary = (input) => {
   }, input);
 };
 
+const sanitizeRecognitionArtifacts = (input) => {
+  return String(input || "")
+    // 典型 ASR 垃圾标记，可能出现在句尾并导致 “</S>” 可见或吞词
+    .replace(/<\/?s>/gi, " ")
+    .replace(/<\/?[^>]+>/g, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+};
+
 // ============================================================================
 // 轻量英文可读性增强：实时阶段先做基础标点与大小写修正（不改写语义）
 // ============================================================================
 const smartPunctuateEnglish = (input, forceTerminalPunctuation = false) => {
   if (!input) return "";
 
-  let text = applyClassroomGlossary(input)
+  let text = applyClassroomGlossary(sanitizeRecognitionArtifacts(input))
     .replace(/\s+/g, " ")
     .replace(/\s+([,.!?;:])/g, "$1")
     .trim();
@@ -345,7 +373,7 @@ const pickBestTranscriptAlternative = (result) => {
       best = candidate;
     }
   }
-  return (best?.transcript || "").replace(/\s+/g, " ").trim();
+  return sanitizeRecognitionArtifacts(best?.transcript || "");
 };
 
 const pickBestAlternativeConfidence = (result) => {
@@ -364,10 +392,10 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 const getAdaptivePauseThreshold = (text) => {
   const cleanText = (text || "").trim();
-  if (!cleanText) return 1500;
+  if (!cleanText) return 1700;
 
   const wordCount = cleanText.split(/\s+/).filter(Boolean).length;
-  let threshold = 1500;
+  let threshold = 1700;
 
   // 短句更容易是“思考停顿”，延迟一点再截断，降低漏字率
   if (wordCount <= 4) threshold += 700;
@@ -378,10 +406,21 @@ const getAdaptivePauseThreshold = (text) => {
   if (/[.!?…]$/.test(cleanText)) threshold -= 450;
   else if (/[,;:]$/.test(cleanText)) threshold += 250;
 
+  // 快速连续语流更容易被过早切段，适当延后截断，降低跨块吞字
+  if (wordCount >= 12 && !/[.!?…]$/.test(cleanText)) {
+    threshold += 450;
+  }
+
+  const tailToken = cleanText.split(/\s+/).pop() || "";
+  // 末词太短通常仍在抖动更新阶段（例如 "a", "to"），延后收口
+  if (!/[.!?…]$/.test(cleanText) && tailToken.length > 0 && tailToken.length <= 2) {
+    threshold += 350;
+  }
+
   // 超长 active 文本避免无限等待
   if (cleanText.length > 160) threshold -= 350;
 
-  return clamp(threshold, 900, 2800);
+  return clamp(threshold, 1200, 3400);
 };
 
 const normalizeComparableText = (text) =>
@@ -453,7 +492,7 @@ const polishWithAI = async (rawEn) => {
   const url = `/api/polish`; 
   
   const payload = {
-    model: modelName,
+    model: runtimeModelName,
     messages: [
       {
         role: "system",
@@ -560,8 +599,8 @@ const polishWithAI = async (rawEn) => {
     .filter(seg => seg && (seg.en || seg.zh)) 
     .map(seg => ({
       speaker: seg.speaker || "👩‍🏫 主讲人",
-      en: seg.en || seg.correctedEn || rawEn,
-      zh: seg.zh || seg.polishedZh || ""
+      en: sanitizeRecognitionArtifacts(seg.en || seg.correctedEn || rawEn),
+      zh: String(seg.zh || seg.polishedZh || "").replace(/<\/?[^>]+>/g, " ").replace(/\s+/g, " ").trim()
     }));
 
   if (validSegments.length > 0 && validSegments.every((seg) => String(seg.zh || "").trim())) {
@@ -576,7 +615,7 @@ const generateSummaryWithAI = async (fullTextContent) => {
   const url = `/api/summary`; 
 
   const payload = {
-    model: modelName,
+    model: runtimeModelName,
     messages: [
       {
         role: "system",
@@ -840,6 +879,9 @@ export default function App() {
     mode: "mic",
   });
 
+  const [modelDraft, setModelDraft] = useState("");
+  const [modelSuccessMsg, setModelSuccessMsg] = useState("");
+
   // --------------------------------------------------------------------------
   // [极致无缝引擎核心 Refs]
   // --------------------------------------------------------------------------
@@ -853,6 +895,9 @@ export default function App() {
   const silenceTimerRef = useRef(null);
   const systemAudioStreamRef = useRef(null);
   const systemAudioTrackRef = useRef(null);
+  const micInputStreamRef = useRef(null);
+  const micProcessedStreamRef = useRef(null);
+  const micProcessedTrackRef = useRef(null);
   const isResizingSidebarRef = useRef(false);
   const transcriptsRef = useRef([]);
   const lastExpandedSidebarWidthRef = useRef(240);
@@ -951,6 +996,69 @@ export default function App() {
       systemAudioStreamRef.current = null;
     }
   }, []);
+
+  const stopMicCaptureEnhancer = useCallback(() => {
+    if (micProcessedTrackRef.current) {
+      try {
+        micProcessedTrackRef.current.stop();
+      } catch (e) {}
+      micProcessedTrackRef.current = null;
+    }
+
+    if (micProcessedStreamRef.current) {
+      micProcessedStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch (e) {}
+      });
+      micProcessedStreamRef.current = null;
+    }
+
+    if (micInputStreamRef.current) {
+      micInputStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch (e) {}
+      });
+      micInputStreamRef.current = null;
+    }
+  }, []);
+
+  const prepareEnhancedMicCapture = useCallback(
+    async (deviceId) => {
+      if (!navigator?.mediaDevices?.getUserMedia) return null;
+
+      stopMicCaptureEnhancer();
+
+      const wantedDevice = deviceId || selectedDeviceId;
+      const baseAudioConstraint = {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1,
+        sampleRate: 48000,
+      };
+
+      const audioConstraint =
+        wantedDevice && wantedDevice !== "default"
+          ? { ...baseAudioConstraint, deviceId: { exact: wantedDevice } }
+          : baseAudioConstraint;
+
+      try {
+        const inputStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint });
+        micInputStreamRef.current = inputStream;
+
+        const rawTrack = inputStream.getAudioTracks?.()[0] || null;
+        micProcessedTrackRef.current = rawTrack;
+        return rawTrack;
+      } catch (err) {
+        console.warn("麦克风增强链路初始化失败，回退默认收音:", err);
+        stopMicCaptureEnhancer();
+        return null;
+      }
+    },
+    [selectedDeviceId, stopMicCaptureEnhancer]
+  );
 
   const buildSessionPayload = useCallback(
     (overrideSummary = "") => {
@@ -1170,13 +1278,7 @@ export default function App() {
 
     if (listeningMode === "mic") {
       try {
-        if (deviceId && deviceId !== "default") {
-          await navigator.mediaDevices.getUserMedia({
-            audio: { deviceId: { exact: deviceId } },
-          });
-        } else {
-          await navigator.mediaDevices.getUserMedia({ audio: true });
-        }
+        await prepareEnhancedMicCapture(deviceId);
       } catch (err) {
         console.warn("切换麦克风设备授权失败:", err);
       }
@@ -1190,10 +1292,6 @@ export default function App() {
           recognitionRef.current?.stop();
         } catch (e) {}
       }
-    } else if (listeningMode === "none") {
-      setTimeout(() => {
-        toggleMicMode();
-      }, 120);
     }
   };
 
@@ -1442,6 +1540,8 @@ export default function App() {
         try {
           if (targetModeRef.current === "tab" && systemAudioTrackRef.current) {
             recognition.start(systemAudioTrackRef.current);
+          } else if (targetModeRef.current === "mic" && micProcessedTrackRef.current) {
+            recognition.start(micProcessedTrackRef.current);
           } else {
             recognition.start();
           }
@@ -1461,8 +1561,9 @@ export default function App() {
       shouldListenRef.current = false;
       if (recognitionRef.current) recognitionRef.current.stop();
       stopSystemAudioCapture();
+      stopMicCaptureEnhancer();
     };
-  }, [finalizeCurrentBlock, stopSystemAudioCapture]);
+  }, [finalizeCurrentBlock, stopMicCaptureEnhancer, stopSystemAudioCapture]);
 
   const autoSaveCurrentSessionWithSummary = useCallback(async (options = {}) => {
     const {
@@ -1475,8 +1576,9 @@ export default function App() {
       if (!item) return false;
       if (item.isTranslating) return true;
       const speaker = String(item.speaker || "");
+      const enText = String(item.en || "");
       // 防止出现状态不同步：即使 isTranslating 被错误置为 false，仍以“识别中”作为未完成信号
-      return /识别中/.test(speaker);
+      return /识别中/.test(speaker) || /<\/?[^>]+>/.test(enText);
     };
 
     const updatePolishProgress = () => {
@@ -1639,6 +1741,7 @@ export default function App() {
       if (listeningMode === "mic") {
         shouldListenRef.current = false;
         recognitionRef.current.stop();
+        stopMicCaptureEnhancer();
       }
 
       const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -1700,7 +1803,7 @@ export default function App() {
         setErrorMsg("启动系统音频模式失败，请重试。");
       }
     }
-  }, [listeningMode, stopSystemAudioCapture, stopTabMode]);
+  }, [listeningMode, stopMicCaptureEnhancer, stopSystemAudioCapture, stopTabMode]);
 
   const togglePip = async () => {
     if (pipWindow) {
@@ -1858,6 +1961,8 @@ export default function App() {
       try {
         recognitionRef.current.stop();
       } catch (e) {}
+
+      stopMicCaptureEnhancer();
       
       if (activeEnRef.current.trim()) finalizeCurrentBlock();
 
@@ -1871,15 +1976,7 @@ export default function App() {
     } else {
       if (listeningMode === "tab") await stopTabMode();
 
-      if (selectedDeviceId !== "default") {
-        try {
-          await navigator.mediaDevices.getUserMedia({
-            audio: { deviceId: { exact: selectedDeviceId } },
-          });
-        } catch (e) {
-          console.warn("尝试绑定特定麦克风失败", e);
-        }
-      }
+      const enhancedTrack = await prepareEnhancedMicCapture(selectedDeviceId);
 
       shouldListenRef.current = true;
     targetModeRef.current = "mic";
@@ -1889,7 +1986,12 @@ export default function App() {
       setIsAutoScroll(true);
       
       try {
-        recognitionRef.current.start();
+        if (enhancedTrack) {
+          recognitionRef.current.start(enhancedTrack);
+        } else {
+          recognitionRef.current.start();
+          setErrorMsg("已启用兼容收音模式。若远距离收音仍偏弱，建议提高麦克风输入增益或靠近声源。");
+        }
       } catch (e) {
         console.error("启动录音失败", e);
       }
@@ -1916,16 +2018,24 @@ export default function App() {
     if (isPaused) {
       setIsPaused(false);
       isPausedRef.current = false;
-      if (listeningMode === "mic") {
+      if (listeningMode === "mic" || listeningMode === "tab") {
         try {
-          recognitionRef.current.start();
+          if (listeningMode === "tab" && systemAudioTrackRef.current) {
+            recognitionRef.current.start(systemAudioTrackRef.current);
+          } else if (listeningMode === "mic" && micProcessedTrackRef.current) {
+            recognitionRef.current.start(micProcessedTrackRef.current);
+          } else {
+            recognitionRef.current.start();
+          }
         } catch (e) {}
       }
     } else {
       setIsPaused(true);
       isPausedRef.current = true;
-      if (listeningMode === "mic") {
-        recognitionRef.current.stop();
+      if (listeningMode === "mic" || listeningMode === "tab") {
+        try {
+          recognitionRef.current.stop();
+        } catch (e) {}
       }
     }
   };
@@ -1966,6 +2076,21 @@ export default function App() {
     window.localStorage.setItem(GLOSSARY_STORAGE_KEY, JSON.stringify(nextPairs));
     setGlossaryError("");
     setActiveView("home");
+  };
+
+  const openModelConfigModal = () => {
+    setModelSuccessMsg("");
+    setModelDraft(runtimeModelName);
+    setActiveView("modelConfig");
+  };
+
+  const handleSaveModelConfig = () => {
+    setGlobalModelName(modelDraft);
+    setModelSuccessMsg("模型配置已保存并立即生效！");
+    setTimeout(() => {
+      setModelSuccessMsg("");
+      setActiveView("home");
+    }, 1500);
   };
 
   const handleClearGlossary = () => {
@@ -2235,6 +2360,19 @@ export default function App() {
               <Settings className="w-4 h-4 shrink-0" />
               {!isSidebarCollapsed && <span>术语词典</span>}
             </button>
+
+            <button
+              onClick={openModelConfigModal}
+              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
+                activeView === "modelConfig"
+                  ? "bg-indigo-50 text-indigo-700 border-indigo-200"
+                  : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+              }`}
+              title="配置模型"
+            >
+              <Cpu className="w-4 h-4 shrink-0" />
+              {!isSidebarCollapsed && <span>配置模型</span>}
+            </button>
           </div>
 
           {!isSidebarCollapsed && (
@@ -2386,7 +2524,7 @@ export default function App() {
                   {formatTime(recordingTime)}
                 </div>
 
-                {listeningMode === "mic" && isPaused ? (
+                {isPaused ? (
                   <button
                     onClick={togglePause}
                     className="flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-emerald-500 text-white hover:bg-emerald-600 hover:shadow-md"
@@ -2394,7 +2532,7 @@ export default function App() {
                     <Play className="w-4 h-4 fill-current" />
                     <span className="hidden sm:inline">继续收音</span>
                   </button>
-                ) : listeningMode === "mic" ? (
+                ) : (
                   <button
                     onClick={togglePause}
                     className="flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-amber-100 text-amber-700 hover:bg-amber-200 border border-amber-200"
@@ -2402,7 +2540,7 @@ export default function App() {
                     <Pause className="w-4 h-4 fill-current" />
                     <span className="hidden sm:inline">暂时挂起</span>
                   </button>
-                ) : null}
+                )}
                 
                 <button
                   onClick={listeningMode === "mic" ? toggleMicMode : stopTabMode}
@@ -2417,14 +2555,24 @@ export default function App() {
 
             <div className="shrink-0">
               {listeningMode === "none" ? (
-                <button
-                  onClick={handleMicEntryClick}
-                  className="flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-md"
-                  title="点击选择麦克风设备"
-                >
-                  <Mic className="w-4 h-4" />
-                  <span>选择麦克风</span>
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleMicEntryClick}
+                    className="flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-md"
+                    title="点击选择麦克风设备"
+                  >
+                    <Mic className="w-4 h-4" />
+                    <span>选择麦克风</span>
+                  </button>
+                  <button
+                    onClick={toggleMicMode}
+                    className="flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-emerald-600 text-white hover:bg-emerald-700 hover:shadow-md"
+                    title="点击开始语音转录"
+                  >
+                    <Play className="w-4 h-4" />
+                    <span>开始语音转录</span>
+                  </button>
+                </div>
               ) : null}
             </div>
           </div>
@@ -2793,6 +2941,42 @@ export default function App() {
                 className="text-sm px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
               >
                 保存并应用
+              </button>
+            </div>
+          </div>
+        )}
+
+        {activeView === "modelConfig" && (
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-4 min-h-[70vh]">
+            <h2 className="text-lg font-bold text-indigo-900">配置 AI 模型</h2>
+            <p className="text-sm text-slate-600 leading-relaxed">
+              在这里可以配置自定义的 AI 模型名称。输入模型名称并保存，后续的转录将立刻使用新模型进行翻译和润色。
+            </p>
+            <p className="text-xs text-slate-500">当前正在使用的模型：<span className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">{runtimeModelName}</span></p>
+
+            <input
+              type="text"
+              value={modelDraft}
+              onChange={(e) => {
+                setModelDraft(e.target.value);
+                if (modelSuccessMsg) setModelSuccessMsg("");
+              }}
+              className="w-full rounded-xl border border-slate-200 p-4 text-sm leading-relaxed font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              placeholder="例如: qwen3.5-122b-a10b"
+            />
+
+            {modelSuccessMsg && (
+              <div className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                {modelSuccessMsg}
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2 justify-end">
+              <button
+                onClick={handleSaveModelConfig}
+                className="text-sm px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+              >
+                保存并应用新模型
               </button>
             </div>
           </div>
