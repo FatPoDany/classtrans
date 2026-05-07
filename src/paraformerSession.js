@@ -37,7 +37,12 @@ const SILENCE_FRAME = new ArrayBuffer(FRAME_SIZE * 2); // pre-zeroed
 // session is supposed to be live, proactively renew the task. This catches
 // the case where DashScope silently stops producing results without sending
 // any close / task-finished / task-failed event.
-const WATCHDOG_TIMEOUT_MS = 90_000;
+const WATCHDOG_TIMEOUT_MS = 45_000;
+
+// Proactive rotation: DashScope paraformer-realtime-v2 has an undocumented
+// maximum task duration (~15-20 min). Rather than waiting for it to silently
+// stop, we proactively tear down and rebuild the full pipeline every 14 min.
+const PROACTIVE_ROTATION_MS = 14 * 60 * 1000;
 
 // Auto-reconnect: if the relay drops mid-session (e.g. CF runtime update),
 // we transparently re-establish the connection so the user doesn't notice.
@@ -108,6 +113,7 @@ export class ParaformerSession {
     this._heartbeatTimer = null;
     this._silenceTimer = null;
     this._watchdogTimer = null;
+    this._rotationTimer = null;
     this._lastAudioSentAt = 0;
     this._lastResultAt = 0;
     this._reconnectAttempt = 0;
@@ -124,6 +130,7 @@ export class ParaformerSession {
     await this._awaitTaskStarted();
     this.onStatus({ phase: "started" });
     this._lastResultAt = Date.now(); // arm watchdog from session start
+    this._startRotationTimer();
   }
 
   pause() {
@@ -141,6 +148,7 @@ export class ParaformerSession {
     this._clearHeartbeat();
     this._clearSilenceTimer();
     this._clearWatchdog();
+    this._clearRotationTimer();
 
     try {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -476,34 +484,72 @@ export class ParaformerSession {
     }
   }
 
-  // --- task renewal (same WS, new DashScope task) ----------------------------
-  // When DashScope sends task-finished (idle timeout / max duration), we
-  // simply start a fresh task on the *same* WebSocket. This is seamless for
-  // the user because the audio pipeline and CF relay connection remain intact.
+  // --- task renewal (full reconnect through relay) ---------------------------
+  // When DashScope ends a task (task-finished, watchdog, or proactive rotation)
+  // we do a FULL reconnect: close old WS → open new WS → new run-task.
+  // This is more reliable than trying to reuse the existing WS, because
+  // DashScope may have silently abandoned the upstream connection.
 
   async _renewTask() {
     if (this.stopped || this._isRenewing) return;
     this._isRenewing = true;
 
-    console.log("ParaformerSession: renewing DashScope task on existing WS");
+    console.log("ParaformerSession: renewing task (full reconnect)");
     this.onStatus({ phase: "reconnecting", attempt: 0 });
+
+    this._clearHeartbeat();
+    this._clearWatchdog();
+    this._clearRotationTimer();
+
+    // Close old WS cleanly.
+    if (this.ws) {
+      try {
+        this.ws.send(JSON.stringify({
+          header: { action: "finish-task", task_id: this.taskId, streaming: "duplex" },
+          payload: { input: {} },
+        }));
+      } catch (_) {}
+      try { this.ws.close(1000, "task renewal"); } catch (_) {}
+      this.ws = null;
+    }
 
     try {
       this.taskId = generateTaskId();
       this.taskStartedPromise = null;
+
+      await this._openWebSocket();  // new WS → new upstream in Worker
       this._sendRunTask();
       await this._awaitTaskStarted();
 
       this._isRenewing = false;
+      this._reconnectAttempt = 0;
+      this._lastResultAt = Date.now();
+      this._startRotationTimer();
       this.onStatus({ phase: "started" });
-      this._lastResultAt = Date.now(); // reset watchdog for new task
-      this._startWatchdog();
       console.log("ParaformerSession: task renewed successfully");
     } catch (err) {
       console.warn("ParaformerSession: task renewal failed, trying full reconnect:", err);
       this._isRenewing = false;
-      // If in-place renewal fails, fall back to full reconnect.
       this._attemptReconnect("task-renew-failed", 0);
+    }
+  }
+
+  // --- proactive rotation timer ----------------------------------------------
+  // Don't wait for DashScope to time out — preemptively rotate every 14 min.
+
+  _startRotationTimer() {
+    this._clearRotationTimer();
+    this._rotationTimer = setTimeout(() => {
+      if (this.stopped || this.paused || this._isRenewing || this._isReconnecting) return;
+      console.log("ParaformerSession: proactive rotation timer fired");
+      this._renewTask();
+    }, PROACTIVE_ROTATION_MS);
+  }
+
+  _clearRotationTimer() {
+    if (this._rotationTimer) {
+      clearTimeout(this._rotationTimer);
+      this._rotationTimer = null;
     }
   }
 
@@ -557,6 +603,7 @@ export class ParaformerSession {
       this._reconnectAttempt = 0;
       this._isReconnecting = false;
       this._lastResultAt = Date.now();
+      this._startRotationTimer();
       this.onStatus({ phase: "started" });
       console.log("ParaformerSession: reconnected successfully");
     } catch (err) {
