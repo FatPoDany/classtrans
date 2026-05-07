@@ -361,6 +361,7 @@ export class ParaformerSession {
     // DashScope ended the ASR task (idle timeout / max duration reached).
     // The WebSocket connection is still open and reusable — start a new task.
     if (evt === "task-finished") {
+      if (this._isRenewing || this._isReconnecting) return; // already handling
       console.log("ParaformerSession: task-finished received, renewing task");
       this._renewTask();
       return;
@@ -377,8 +378,8 @@ export class ParaformerSession {
       this._taskStartedReject = null;
     }
 
-    // If not intentionally stopped and not already reconnecting, try to recover.
-    if (!this.stopped && !this._isReconnecting) {
+    // If not intentionally stopped and not already reconnecting/renewing, try to recover.
+    if (!this.stopped && !this._isReconnecting && !this._isRenewing) {
       this._attemptReconnect("close", event.code);
       return;
     }
@@ -399,7 +400,7 @@ export class ParaformerSession {
     }
 
     // Try to reconnect on unexpected errors too.
-    if (!this.stopped && !this._isReconnecting) {
+    if (!this.stopped && !this._isReconnecting && !this._isRenewing) {
       this._attemptReconnect("error", 0);
       return;
     }
