@@ -224,6 +224,19 @@ export class ParaformerSession {
     });
     this.audioContext = ctx;
 
+    // Chrome suspends AudioContext when the tab goes to background.
+    // Auto-resume to keep audio flowing.
+    ctx.addEventListener("statechange", () => {
+      if (ctx.state === "suspended" && !this.stopped && !this.paused) {
+        console.warn("ParaformerSession: AudioContext suspended, resuming...");
+        ctx.resume().catch(() => {});
+      }
+    });
+    // Ensure it's running from the start.
+    if (ctx.state === "suspended") {
+      await ctx.resume().catch(() => {});
+    }
+
     await ctx.audioWorklet.addModule("/pcm16-worklet.js");
 
     const source = ctx.createMediaStreamSource(new MediaStream([this.audioTrack]));
@@ -439,11 +452,33 @@ export class ParaformerSession {
     this._clearWatchdog();
     this._watchdogTimer = setInterval(() => {
       if (this.stopped || this.paused || this._isRenewing || this._isReconnecting) return;
+
+      // --- audio health check ---
+      this._ensureAudioContextRunning();
+
+      // Check if the audio track has ended (e.g. user stopped sharing tab).
+      if (this.audioTrack && this.audioTrack.readyState === "ended") {
+        console.error("ParaformerSession: audioTrack ended");
+        this.onError(new Error("音频轨道已结束，请重新开始同传"));
+        this._clearWatchdog();
+        return;
+      }
+
+      // --- result staleness check ---
       const elapsed = Date.now() - this._lastResultAt;
       if (elapsed >= WATCHDOG_TIMEOUT_MS) {
+        const audioAge = Date.now() - this._lastAudioSentAt;
+        const ctxState = this.audioContext ? this.audioContext.state : "none";
+        const wsState = this.ws ? this.ws.readyState : -1;
         console.warn(
-          `ParaformerSession: watchdog fired – no results for ${Math.round(elapsed / 1000)}s, renewing task`
+          `ParaformerSession: watchdog fired – no results for ${Math.round(elapsed / 1000)}s, ` +
+          `audioCtx=${ctxState}, ws=${wsState}, lastAudio=${Math.round(audioAge / 1000)}s ago`
         );
+        this.onStatus({
+          phase: "reconnecting",
+          attempt: 0,
+          reason: `watchdog: no results ${Math.round(elapsed / 1000)}s, ctx=${ctxState}`,
+        });
         this._clearWatchdog();
         this._renewTask();
       }
@@ -454,6 +489,14 @@ export class ParaformerSession {
     if (this._watchdogTimer) {
       clearInterval(this._watchdogTimer);
       this._watchdogTimer = null;
+    }
+  }
+
+  // Resume AudioContext if Chrome suspended it (background tab, etc.)
+  _ensureAudioContextRunning() {
+    if (this.audioContext && this.audioContext.state !== "running" && !this.stopped) {
+      console.warn(`ParaformerSession: AudioContext state=${this.audioContext.state}, resuming`);
+      this.audioContext.resume().catch(() => {});
     }
   }
 
