@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createPortal } from "react-dom";
 import {
   Mic,
@@ -23,10 +23,14 @@ import {
   ChevronsLeft,
   ChevronsRight,
   Cpu,
+  Activity,
 } from "lucide-react";
+import { ParaformerSession } from "./paraformerSession";
+
+const PARAFORMER_WS_URL = process.env.REACT_APP_PARAFORMER_WS_URL || "";
 
 // ============================================================================
-// 引擎 1：免费谷歌翻译公共接口 (用于麦克风模式的实时快速跟进)
+// 引擎 1a：免费谷歌翻译公共接口 (作为最后兜底使用)
 // ============================================================================
 const translateTextBasic = async (text) => {
   if (!text.trim()) return "";
@@ -53,15 +57,85 @@ const translateTextBasic = async (text) => {
 };
 
 // ============================================================================
+// 引擎 1b：qwen-turbo 实时快译 (取代 Google 公共接口作为主路径，可控、可观测)
+// ============================================================================
+const REALTIME_TRANSLATE_SYSTEM_PROMPT =
+  "你是专业的同传译者。把用户给出的英文翻译成简体中文，要求：忠实、准确、术语一致、口语自然。只输出译文本身，不要任何引号、不要解释、不要前后缀。";
+
+const translateRealtimeWithQwen = async (text) => {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "";
+
+  const modelName = runtimeRealtimeModelName || DEFAULT_REALTIME_MODEL;
+  const payload = {
+    model: modelName,
+    messages: [
+      { role: "system", content: REALTIME_TRANSLATE_SYSTEM_PROMPT },
+      { role: "user", content: trimmed },
+    ],
+    temperature: 0.1,
+  };
+
+  const response = await fetch("/api/polish", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(`qwen-turbo translate failed: ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (data?.error) {
+    const msg = typeof data.error === "string" ? data.error : data.error?.message;
+    throw new Error(msg || "qwen-turbo upstream error");
+  }
+
+  const result = String(data?.choices?.[0]?.message?.content || "")
+    .replace(/<\/?[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!result) throw new Error("qwen-turbo empty response");
+  recordAiUsage({ type: "realtime", model: modelName, usage: data?.usage });
+  return result;
+};
+
+const translateRealtimeFast = async (text) => {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "";
+  try {
+    return await translateRealtimeWithQwen(trimmed);
+  } catch (err) {
+    console.warn("qwen-turbo realtime translate failed, falling back to Google:", err);
+    return translateTextBasic(trimmed);
+  }
+};
+
+// ============================================================================
 // 引擎 2：AI 深度引擎 (阿里云 DashScope) - 用于文本润色 & 生成课堂总结
 // ============================================================================
 // API Key 现已交由 Vercel 后端 (/api 目录下的接口) 安全管理，前端不再直接引用以避免 process 环境变量报错
 const MODEL_STORAGE_KEY = "classtrans.aiModelName.v1";
-let runtimeModelName = "qwen3.5-122b-a10b";
+const REALTIME_MODEL_STORAGE_KEY = "classtrans.realtimeModelName.v1";
+const SUMMARY_MODEL_STORAGE_KEY = "classtrans.summaryModelName.v1";
+
+const DEFAULT_POLISH_MODEL = "qwen3.5-122b-a10b";
+const DEFAULT_REALTIME_MODEL = "qwen-turbo";
+
+let runtimeModelName = DEFAULT_POLISH_MODEL;
+let runtimeRealtimeModelName = DEFAULT_REALTIME_MODEL;
+let runtimeSummaryModelName = ""; // 空 → 回退到 polish 模型
+
 try {
   if (typeof window !== "undefined") {
-    const savedModel = window.localStorage.getItem(MODEL_STORAGE_KEY);
-    if (savedModel) runtimeModelName = savedModel;
+    const ls = window.localStorage;
+    const m = ls.getItem(MODEL_STORAGE_KEY);
+    if (m) runtimeModelName = m;
+    const r = ls.getItem(REALTIME_MODEL_STORAGE_KEY);
+    if (r) runtimeRealtimeModelName = r;
+    runtimeSummaryModelName = ls.getItem(SUMMARY_MODEL_STORAGE_KEY) || "";
   }
 } catch (err) {}
 
@@ -73,7 +147,92 @@ export const setGlobalModelName = (name) => {
       window.localStorage.setItem(MODEL_STORAGE_KEY, cleanName);
     } catch (e) {}
   }
-}; 
+};
+
+const setGlobalRealtimeModelName = (name) => {
+  const cleanName = String(name || "").trim();
+  if (cleanName) {
+    runtimeRealtimeModelName = cleanName;
+    try {
+      window.localStorage.setItem(REALTIME_MODEL_STORAGE_KEY, cleanName);
+    } catch (e) {}
+  }
+};
+
+const setGlobalSummaryModelName = (name) => {
+  const cleanName = String(name || "").trim();
+  runtimeSummaryModelName = cleanName;
+  try {
+    if (cleanName) {
+      window.localStorage.setItem(SUMMARY_MODEL_STORAGE_KEY, cleanName);
+    } else {
+      window.localStorage.removeItem(SUMMARY_MODEL_STORAGE_KEY);
+    }
+  } catch (e) {}
+};
+
+const getEffectiveSummaryModel = () =>
+  (runtimeSummaryModelName || runtimeModelName).trim();
+
+// ============================================================================
+// AI 用量日志：记录每次 LLM 调用的 prompt / completion / total tokens
+// 仅本地 (localStorage)，订阅模式给 React 组件用
+// ============================================================================
+const USAGE_LOG_STORAGE_KEY = "classtrans.aiUsageLog.v1";
+const USAGE_LOG_MAX_ENTRIES = 200;
+
+const usageListeners = new Set();
+let usageLogCache = null;
+
+const readUsageLog = () => {
+  if (usageLogCache) return usageLogCache;
+  try {
+    const raw = window.localStorage.getItem(USAGE_LOG_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    usageLogCache = Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    usageLogCache = [];
+  }
+  return usageLogCache;
+};
+
+const writeUsageLog = (entries) => {
+  const trimmed = Array.isArray(entries)
+    ? entries.slice(-USAGE_LOG_MAX_ENTRIES)
+    : [];
+  usageLogCache = trimmed;
+  try {
+    window.localStorage.setItem(USAGE_LOG_STORAGE_KEY, JSON.stringify(trimmed));
+  } catch (e) {}
+  for (const fn of usageListeners) {
+    try { fn(trimmed); } catch (e) {}
+  }
+};
+
+const recordAiUsage = ({ type, model, usage }) => {
+  if (!usage) return;
+  const promptTokens = Number(usage.prompt_tokens || 0);
+  const completionTokens = Number(usage.completion_tokens || 0);
+  const totalTokens =
+    Number(usage.total_tokens || 0) || promptTokens + completionTokens;
+  if (!totalTokens) return;
+  const entry = {
+    timestamp: Date.now(),
+    type: String(type || "unknown"),
+    model: String(model || ""),
+    promptTokens,
+    completionTokens,
+    totalTokens,
+  };
+  writeUsageLog(readUsageLog().concat(entry));
+};
+
+const subscribeUsageLog = (fn) => {
+  usageListeners.add(fn);
+  return () => usageListeners.delete(fn);
+};
+
+const clearUsageLog = () => writeUsageLog([]);
 
 // ============================================================================
 // 课堂术语纠错：用于提升浏览器识别后的英文可读性与专业词准确率
@@ -98,8 +257,148 @@ const CLASSROOM_TERM_RULES = [
 ];
 
 const GLOSSARY_STORAGE_KEY = "classtrans.customGlossaryTerms.v1";
+const VOCAB_ID_STORAGE_KEY = "classtrans.paraformerVocabularyId.v1";
+const VOCAB_SIGNATURE_STORAGE_KEY = "classtrans.paraformerVocabularySignature.v1";
 const SESSION_FILE_SUFFIX = ".classtrans.json";
 let customClassroomTermRules = [];
+
+// ============================================================================
+// Paraformer 热词词典：自定义术语保存时同步注册到 DashScope，得到 vocabulary_id
+// 后续 ASR 会话在 run-task 的 parameters 里带上它，实现声学层的偏置纠错
+// ============================================================================
+const PARAFORMER_VOCAB_TARGET_MODEL = "paraformer-realtime-v2";
+const PARAFORMER_VOCAB_PREFIX = "classtrans";
+const PARAFORMER_VOCAB_DEFAULT_WEIGHT = 4;
+
+const buildVocabularyFromPairs = (pairs) => {
+  const dedup = new Map();
+  for (const pair of pairs || []) {
+    if (!pair) continue;
+    const text = String(pair.to || "").trim();
+    if (!text) continue;
+    if (!dedup.has(text)) {
+      dedup.set(text, {
+        text,
+        weight: PARAFORMER_VOCAB_DEFAULT_WEIGHT,
+        lang: "en",
+      });
+    }
+  }
+  return Array.from(dedup.values());
+};
+
+const computeVocabularySignature = (vocabulary) =>
+  vocabulary
+    .map((v) => `${v.text}|${v.weight}|${v.lang}`)
+    .sort()
+    .join("\n");
+
+const getStoredVocabularyId = () => {
+  try {
+    return window.localStorage.getItem(VOCAB_ID_STORAGE_KEY) || "";
+  } catch (e) {
+    return "";
+  }
+};
+
+const setStoredVocabulary = (vocabularyId, signature) => {
+  try {
+    if (vocabularyId) {
+      window.localStorage.setItem(VOCAB_ID_STORAGE_KEY, vocabularyId);
+      window.localStorage.setItem(VOCAB_SIGNATURE_STORAGE_KEY, signature || "");
+    } else {
+      window.localStorage.removeItem(VOCAB_ID_STORAGE_KEY);
+      window.localStorage.removeItem(VOCAB_SIGNATURE_STORAGE_KEY);
+    }
+  } catch (e) {}
+};
+
+const syncGlossaryToParaformerVocabulary = async (pairs) => {
+  const vocabulary = buildVocabularyFromPairs(pairs);
+  const signature = computeVocabularySignature(vocabulary);
+  const storedSignature = (() => {
+    try {
+      return window.localStorage.getItem(VOCAB_SIGNATURE_STORAGE_KEY) || "";
+    } catch (e) {
+      return "";
+    }
+  })();
+  const storedVocabId = getStoredVocabularyId();
+
+  if (vocabulary.length === 0) {
+    if (storedVocabId) {
+      try {
+        await fetch("/api/asr-vocabulary", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "speech-biasing",
+            input: {
+              action: "delete_vocabulary",
+              vocabulary_id: storedVocabId,
+            },
+          }),
+        });
+      } catch (e) {
+        console.warn("vocabulary delete failed (ignored):", e);
+      }
+    }
+    setStoredVocabulary("", "");
+    return { vocabularyId: "", changed: !!storedVocabId };
+  }
+
+  if (storedSignature === signature && storedVocabId) {
+    return { vocabularyId: storedVocabId, changed: false };
+  }
+
+  const body = storedVocabId
+    ? {
+        model: "speech-biasing",
+        input: {
+          action: "update_vocabulary",
+          vocabulary_id: storedVocabId,
+          vocabulary,
+        },
+      }
+    : {
+        model: "speech-biasing",
+        input: {
+          action: "create_vocabulary",
+          target_model: PARAFORMER_VOCAB_TARGET_MODEL,
+          prefix: PARAFORMER_VOCAB_PREFIX,
+          vocabulary,
+        },
+      };
+
+  const response = await fetch("/api/asr-vocabulary", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    data = null;
+  }
+
+  if (!response.ok) {
+    const msg =
+      (data && (data.message || data.error || (data.output && data.output.message))) ||
+      `HTTP ${response.status}`;
+    throw new Error(`vocabulary register failed: ${msg}`);
+  }
+
+  const newId =
+    (data && data.output && data.output.vocabulary_id) || storedVocabId || "";
+  if (!newId) {
+    throw new Error("vocabulary register: no vocabulary_id in response");
+  }
+
+  setStoredVocabulary(newId, signature);
+  return { vocabularyId: newId, changed: true };
+};
 
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -364,30 +663,6 @@ const smartPunctuateEnglish = (input, forceTerminalPunctuation = false) => {
   return text;
 };
 
-const pickBestTranscriptAlternative = (result) => {
-  if (!result || result.length === 0) return "";
-  let best = result[0];
-  for (let i = 1; i < result.length; i++) {
-    const candidate = result[i];
-    if ((candidate?.confidence ?? 0) > (best?.confidence ?? 0)) {
-      best = candidate;
-    }
-  }
-  return sanitizeRecognitionArtifacts(best?.transcript || "");
-};
-
-const pickBestAlternativeConfidence = (result) => {
-  if (!result || result.length === 0) return 0;
-  let best = result[0];
-  for (let i = 1; i < result.length; i++) {
-    const candidate = result[i];
-    if ((candidate?.confidence ?? 0) > (best?.confidence ?? 0)) {
-      best = candidate;
-    }
-  }
-  return Number(best?.confidence ?? 0);
-};
-
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 const getAdaptivePauseThreshold = (text) => {
@@ -488,134 +763,240 @@ const evaluateAiPolishQuality = ({ rawEn, aiSegments, basicZh }) => {
   return { ok: true, reason: "ok" };
 };
 
-const polishWithAI = async (rawEn) => {
-  const url = `/api/polish`; 
-  
+// ============================================================================
+// 行式纯文本解析：增量友好，可在流式过程中反复 re-parse 当前累积的 raw 文本
+// ----------------------------------------------------------------------------
+// 期望的模型输出（无 JSON、无代码块、无前后缀）：
+//   ## SEG
+//   SPEAKER: 👩‍🏫 主讲人
+//   EN: Corrected English on a single line
+//   ZH: 中文译文写在同一行
+//   ## SEG
+//   ...
+// 容忍：行首加粗 (**SPEAKER:**)、Chinese 全角冒号、缺失 ## SEG 头、缺失字段。
+// ============================================================================
+const FIELD_KEY_PATTERN = /^\**\s*(SPEAKER|EN|ZH)\s*\**\s*[:：]\s*(.*)$/i;
+const SEGMENT_HEADER_PATTERN = /^#{1,3}\s*SEG\b/i;
+
+const parseLineFormatSegments = (rawText) => {
+  const text = String(rawText || "");
+  if (!text.trim()) return [];
+
+  const cleaned = text
+    .replace(/^```[a-zA-Z]*\s*/m, "")
+    .replace(/```\s*$/m, "");
+
+  const lines = cleaned.split(/\r?\n/);
+  const segments = [];
+  let cur = null;
+  let activeField = null;
+
+  const ensureSegment = () => {
+    if (!cur) {
+      cur = { speaker: "", en: "", zh: "" };
+      segments.push(cur);
+    }
+  };
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+
+    if (!trimmed) {
+      activeField = null;
+      continue;
+    }
+
+    if (SEGMENT_HEADER_PATTERN.test(trimmed)) {
+      cur = { speaker: "", en: "", zh: "" };
+      segments.push(cur);
+      activeField = null;
+      continue;
+    }
+
+    const match = trimmed.match(FIELD_KEY_PATTERN);
+    if (match) {
+      ensureSegment();
+      activeField = match[1].toLowerCase();
+      cur[activeField] = match[2] || "";
+      continue;
+    }
+
+    if (activeField && cur) {
+      cur[activeField] = (cur[activeField] ? cur[activeField] + " " : "") + trimmed;
+    }
+  }
+
+  return segments.filter((seg) => seg.en || seg.zh);
+};
+
+const normalizePolishSegments = (segments, rawEn) =>
+  segments.map((seg) => ({
+    speaker: (seg.speaker || "").trim() || "👩‍🏫 主讲人",
+    en: sanitizeRecognitionArtifacts(seg.en || rawEn),
+    zh: String(seg.zh || "")
+      .replace(/<\/?[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  }));
+
+// 等多久 polish 还没出第一个 ZH delta，再启动 qwen-turbo 基线（用于质量门控对比 + 兜底）
+const POLISH_BASELINE_DELAY_MS = 2500;
+
+const POLISH_SYSTEM_PROMPT = `You are a professional interpreter and context analyzer. Output ONLY plain text in the segment format below. Do NOT use JSON, do NOT wrap in code fences, do NOT add any preamble or trailing commentary.
+
+OUTPUT FORMAT — repeat for each segment:
+## SEG
+SPEAKER: <role with emoji, e.g. 👩‍🏫 主讲人 / 🙋 提问者 / 🗣️ 互动者>
+EN: <corrected English on ONE single line; no speaker prefix>
+ZH: <polished Simplified Chinese on ONE single line; no speaker prefix>
+
+HARD QUALITY BAR:
+1. Chinese translation quality must be at least as good as literal machine translation; never omit, summarize, or weaken factual details.
+2. Keep technical terms, numbers, names, versions, API names and code identifiers accurate.
+3. If a phrase is uncertain, prefer conservative literal translation over free paraphrase.
+4. Split into multiple segments ONLY when the speaker clearly changes. Keep continuous speech as ONE segment.
+5. Each field on a single line. No blank lines inside a segment. No markdown decoration around the field keys.
+6. Begin output immediately with "## SEG" — no preamble.
+7. If "Earlier context" is provided, use it ONLY to keep terminology, named entities, and pronoun references consistent. Do NOT re-translate the earlier context. Do NOT mention it in the output.`;
+
+const buildPolishUserMessage = (rawEn, contextHistory) => {
+  const safeHistory = Array.isArray(contextHistory)
+    ? contextHistory
+        .filter((h) => h && (h.en || h.zh))
+        .slice(-2)
+    : [];
+
+  if (safeHistory.length === 0) {
+    return `Raw text: "${rawEn}"`;
+  }
+
+  const ctxLines = safeHistory
+    .map(
+      (h, i) =>
+        `(${i + 1}) EN: ${String(h.en || "").trim()}\n    ZH: ${String(h.zh || "").trim()}`
+    )
+    .join("\n\n");
+
+  return `Earlier context (in chronological order — for terminology consistency only; do NOT re-translate):\n${ctxLines}\n\nCurrent raw text to translate:\n"${rawEn}"`;
+};
+
+const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) => {
+  const url = `/api/polish`;
+
+  const polishModel = runtimeModelName;
   const payload = {
-    model: runtimeModelName,
+    model: polishModel,
+    stream: true,
+    stream_options: { include_usage: true },
     messages: [
-      {
-        role: "system",
-        // 核心修复：强化“保真优先 + 不劣于机译”的系统指令
-        content: `You are a professional interpreter and context analyzer. IMPORTANT: You must output strictly a **JSON object** containing a "segments" array.
-
-        HARD QUALITY BAR:
-        1. Your Chinese translation quality must be at least as good as literal machine translation baseline.
-        2. Never omit, summarize, or weaken factual details.
-        3. Keep technical terms, numbers, names, versions, API names and code identifiers accurate.
-        4. If a phrase is uncertain, prefer conservative literal translation over free paraphrase.
-
-        STEP 1: Split into segments ONLY when speaker clearly changes. Keep continuous speech together.
-        STEP 2: Infer speaker role (e.g., "👩‍🏫 主讲人", "🙋‍♂️ 提问者", "🗣️ 互动者").
-        STEP 3: Correct English punctuation only. Do NOT rewrite meaning.
-        STEP 4: Translate ENTIRE text into polished Simplified Chinese with full fidelity.
-        STEP 5: Self-check before output:
-          - no missing clauses
-          - no missing numbers/entities
-          - no markdown fences or explanations
-          - output valid JSON only
-
-        Output EXACTLY this JSON format:
-        {
-          "segments": [
-            {
-              "speaker": "role with emoji",
-              "en": "Corrected English text without speaker prefixes",
-              "zh": "Polished Chinese translation without speaker prefixes"
-            }
-          ]
-        }`,
-      },
-      {
-        role: "user",
-        content: `Raw text: "${rawEn}"`,
-      },
+      { role: "system", content: POLISH_SYSTEM_PROMPT },
+      { role: "user", content: buildPolishUserMessage(rawEn, contextHistory) },
     ],
-    response_format: { type: "json_object" },
   };
 
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal,
   });
 
-  const data = await response.json();
-
-  if (data.error) {
-    console.error("API Error Detail:", data.error.message);
-    throw new Error(data.error.message);
+  if (!response.ok || !response.body) {
+    let errMessage = `Polish stream failed: ${response.status}`;
+    try {
+      const errBody = await response.json();
+      if (errBody?.error) errMessage = typeof errBody.error === "string" ? errBody.error : JSON.stringify(errBody.error);
+    } catch (e) {}
+    throw new Error(errMessage);
   }
 
-  const textResult = data.choices[0].message.content;
-  let parsed = {};
-  
-  // 核心修复：超强容错解析机制
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let sseBuffer = "";
+  let assistantText = "";
+  let lastEmittedSnapshot = "";
+  let capturedUsage = null;
+
+  const emitProgress = () => {
+    if (!onUpdate) return;
+    if (assistantText === lastEmittedSnapshot) return;
+    lastEmittedSnapshot = assistantText;
+    try {
+      onUpdate(parseLineFormatSegments(assistantText));
+    } catch (e) {
+      console.warn("polish onUpdate threw:", e);
+    }
+  };
+
+  const ingestSseJson = (json) => {
+    if (!json) return;
+    if (json.error) {
+      const errMsg = typeof json.error === "string" ? json.error : json.error?.message || "upstream error";
+      throw new Error(errMsg);
+    }
+    const delta = json?.choices?.[0]?.delta?.content || "";
+    if (delta) {
+      assistantText += delta;
+      emitProgress();
+    }
+    if (json.usage && Number(json.usage.total_tokens || 0) > 0) {
+      capturedUsage = json.usage;
+    }
+  };
+
   try {
-    let cleanText = textResult.replace(/```json/gi, "").replace(/```/g, "").trim();
-    
-    // 智能截取首尾的括号，防止 AI 在前后加了废话或者返回破损的结构
-    const firstBrace = cleanText.indexOf('{');
-    const firstBracket = cleanText.indexOf('[');
-    let startIdx = -1;
-    if (firstBrace !== -1 && firstBracket !== -1) {
-        startIdx = Math.min(firstBrace, firstBracket);
-    } else {
-        startIdx = Math.max(firstBrace, firstBracket);
-    }
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, { stream: true });
 
-    if (startIdx !== -1) {
-        const lastBrace = cleanText.lastIndexOf('}');
-        const lastBracket = cleanText.lastIndexOf(']');
-        const endIdx = Math.max(lastBrace, lastBracket);
-        if (endIdx !== -1 && endIdx >= startIdx) {
-            cleanText = cleanText.substring(startIdx, endIdx + 1);
-        } else {
-            cleanText = cleanText.substring(startIdx);
+      let newlineIdx;
+      while ((newlineIdx = sseBuffer.indexOf("\n")) !== -1) {
+        const rawLine = sseBuffer.slice(0, newlineIdx).replace(/\r$/, "");
+        sseBuffer = sseBuffer.slice(newlineIdx + 1);
+
+        if (!rawLine.startsWith("data:")) continue;
+        const dataStr = rawLine.slice(5).trim();
+        if (!dataStr || dataStr === "[DONE]") continue;
+
+        try {
+          ingestSseJson(JSON.parse(dataStr));
+        } catch (e) {
+          if (e instanceof SyntaxError) continue;
+          throw e;
         }
+      }
     }
-
-    parsed = JSON.parse(cleanText);
-  } catch (e) {
-    console.warn("AI JSON 解析失败，抛出异常触发机译兜底。Raw output:", textResult);
-    // 绝不返回乱码展示在页面上！抛出异常让外层触发安全的机器翻译兜底。
-    throw new Error("AI 返回了无法解析的乱码");
-  }
-  
-  // 智能寻找 segments 的位置（应对 AI 随性修改 JSON 层级的问题）
-  let segments = [];
-  if (Array.isArray(parsed)) {
-    segments = parsed;
-  } else if (parsed && Array.isArray(parsed.segments)) {
-    segments = parsed.segments;
-  } else if (parsed && parsed.result && Array.isArray(parsed.result.segments)) {
-    segments = parsed.result.segments;
-  } else if (parsed && typeof parsed === 'object') {
-    segments = [parsed];
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
   }
 
-  // 过滤出有效数据
-  const validSegments = segments
-    .filter(seg => seg && (seg.en || seg.zh)) 
-    .map(seg => ({
-      speaker: seg.speaker || "👩‍🏫 主讲人",
-      en: sanitizeRecognitionArtifacts(seg.en || seg.correctedEn || rawEn),
-      zh: String(seg.zh || seg.polishedZh || "").replace(/<\/?[^>]+>/g, " ").replace(/\s+/g, " ").trim()
-    }));
-
-  if (validSegments.length > 0 && validSegments.every((seg) => String(seg.zh || "").trim())) {
-    return validSegments;
+  if (sseBuffer.startsWith("data:")) {
+    const dataStr = sseBuffer.slice(5).trim();
+    if (dataStr && dataStr !== "[DONE]") {
+      try { ingestSseJson(JSON.parse(dataStr)); } catch (e) {}
+    }
   }
 
-  // 终极兜底
-  throw new Error("AI 返回了结构异常的数据");
+  if (capturedUsage) {
+    recordAiUsage({ type: "polish", model: polishModel, usage: capturedUsage });
+  }
+
+  const segments = parseLineFormatSegments(assistantText);
+  if (segments.length === 0 || segments.every((seg) => !String(seg.zh || "").trim())) {
+    console.warn("AI 流式输出无法解析为有效片段。Raw output:", assistantText);
+    throw new Error("AI 流式输出为空或缺失中文翻译");
+  }
+
+  return normalizePolishSegments(segments, rawEn);
 };
 
 const generateSummaryWithAI = async (fullTextContent) => {
-  const url = `/api/summary`; 
+  const url = `/api/summary`;
 
+  const modelName = getEffectiveSummaryModel();
   const payload = {
-    model: runtimeModelName,
+    model: modelName,
     messages: [
       {
         role: "system",
@@ -639,10 +1020,10 @@ const generateSummaryWithAI = async (fullTextContent) => {
   });
 
   if (!response.ok) {
-    const errText = await response.text();
     throw new Error(`Summary request failed: ${response.status}`);
   }
   const data = await response.json();
+  recordAiUsage({ type: "summary", model: modelName, usage: data?.usage });
   return data.choices[0].message.content;
 };
 
@@ -826,6 +1207,630 @@ const PipContent = ({ transcripts, activeEn, activeZh }) => {
   );
 };
 
+// ============================================================================
+// 转录列表的 2 分钟分桶（用于主页面的灰条分隔 + 右侧时间轴）
+// ============================================================================
+const HOME_BUCKET_MS = 2 * 60 * 1000;
+
+const formatHHMM = (ts) => {
+  if (!ts) return "";
+  const d = new Date(ts);
+  const h = String(d.getHours()).padStart(2, "0");
+  const m = String(d.getMinutes()).padStart(2, "0");
+  return `${h}:${m}`;
+};
+
+const bucketStartOf = (ts) => {
+  if (!ts) return 0;
+  const d = new Date(ts);
+  d.setSeconds(0, 0);
+  d.setMinutes(Math.floor(d.getMinutes() / 2) * 2);
+  return d.getTime();
+};
+
+// 在 transcripts 序列里把"新桶起点"的位置标出来，并汇总每个桶的 metadata。
+// items: 仍然按原顺序返回；buckets: 用于侧边时间轴。
+const buildTranscriptRowsAndBuckets = (transcripts) => {
+  const rows = [];
+  const buckets = [];
+  let lastBucket = null;
+  for (const item of transcripts) {
+    const ts = item?.createdAt || 0;
+    if (ts) {
+      const b = bucketStartOf(ts);
+      if (b !== lastBucket) {
+        rows.push({ kind: "separator", bucketStart: b, key: `bucket-${b}` });
+        buckets.push({ startMs: b, count: 0 });
+        lastBucket = b;
+      }
+      if (buckets.length > 0) buckets[buckets.length - 1].count += 1;
+    }
+    rows.push({ kind: "transcript", item, key: item.id });
+  }
+  return { rows, buckets };
+};
+
+// ============================================================================
+// StreamingText：把流入的文本拆成"已稳定段 + 新增段"，新增段触发 CSS 渐入动画。
+// 兼容回退（value 缩短或重置）：清空段队列重新开始。
+// ============================================================================
+const StreamingText = ({ value, animate, withCursor }) => {
+  const [segments, setSegments] = useState(() => {
+    const initial = String(value || "");
+    return initial ? [{ text: initial, id: 0, animate: false }] : [];
+  });
+  const idCounterRef = useRef(0);
+  const lastValueRef = useRef(String(value || ""));
+
+  useEffect(() => {
+    const next = String(value || "");
+    const prev = lastValueRef.current;
+    if (next === prev) return;
+
+    if (animate && next.length > prev.length && next.startsWith(prev)) {
+      const added = next.slice(prev.length);
+      idCounterRef.current += 1;
+      const id = idCounterRef.current;
+      setSegments((segs) => [...segs, { text: added, id, animate: true }]);
+    } else {
+      idCounterRef.current += 1;
+      const id = idCounterRef.current;
+      setSegments(next ? [{ text: next, id, animate: false }] : []);
+    }
+    lastValueRef.current = next;
+  }, [value, animate]);
+
+  if (segments.length === 0 && !withCursor) return null;
+
+  return (
+    <>
+      {segments.map((seg) =>
+        seg.animate ? (
+          <span key={seg.id} className="ct-stream-fade">
+            {seg.text}
+          </span>
+        ) : (
+          <span key={seg.id}>{seg.text}</span>
+        )
+      )}
+      {withCursor && <span className="ct-stream-cursor" aria-hidden />}
+    </>
+  );
+};
+
+// ============================================================================
+// 管线状态卡：固定右下角，显示收音 / 识别 / 润色 / 实时机翻 四段管线的当前状态
+// ============================================================================
+const PIPELINE_PILL_BASE =
+  "flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold border transition-colors";
+const PIPELINE_PILL_STYLES = {
+  idle: "bg-slate-50 border-slate-200 text-slate-400",
+  active: "bg-indigo-50 border-indigo-200 text-indigo-700",
+  paused: "bg-amber-50 border-amber-200 text-amber-700",
+  warn: "bg-amber-50 border-amber-200 text-amber-700",
+  error: "bg-rose-50 border-rose-200 text-rose-700",
+};
+
+const PipelineStatusPill = ({ icon: Icon, label, state, hint }) => {
+  const styleKey = PIPELINE_PILL_STYLES[state] ? state : "idle";
+  return (
+    <div className={`${PIPELINE_PILL_BASE} ${PIPELINE_PILL_STYLES[styleKey]}`} title={hint || label}>
+      <Icon className="w-3.5 h-3.5" />
+      <span>{label}</span>
+      <span
+        className={`ml-1 inline-block w-1.5 h-1.5 rounded-full ${
+          styleKey === "active"
+            ? "bg-indigo-500"
+            : styleKey === "paused" || styleKey === "warn"
+            ? "bg-amber-500"
+            : styleKey === "error"
+            ? "bg-rose-500"
+            : "bg-slate-300"
+        }`}
+      />
+    </div>
+  );
+};
+
+const PipelineStatusCard = ({ capture, asr, polish, realtime, captureHint, asrHint }) => {
+  const allIdle =
+    capture.state === "idle" &&
+    asr.state === "idle" &&
+    polish.state === "idle" &&
+    realtime.state === "idle";
+  if (allIdle) return null;
+
+  return (
+    <div
+      className="fixed bottom-5 right-5 z-40 bg-white/85 backdrop-blur-md border border-slate-200 rounded-2xl shadow-lg px-3 py-2.5 flex flex-col gap-1.5"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="flex items-center gap-1.5 px-1 pb-1 text-[10px] uppercase tracking-wider text-slate-400 font-bold">
+        管线状态
+      </div>
+      <PipelineStatusPill
+        icon={capture.icon}
+        label={capture.label}
+        state={capture.state}
+        hint={captureHint}
+      />
+      <PipelineStatusPill
+        icon={asr.icon}
+        label={asr.label}
+        state={asr.state}
+        hint={asrHint}
+      />
+      <PipelineStatusPill
+        icon={polish.icon}
+        label={polish.label}
+        state={polish.state}
+      />
+      <PipelineStatusPill
+        icon={realtime.icon}
+        label={realtime.label}
+        state={realtime.state}
+      />
+    </div>
+  );
+};
+
+const USAGE_TYPE_LABELS = {
+  polish: "AI 润色",
+  realtime: "实时机翻",
+  summary: "课堂纪要",
+};
+
+const formatUsageTimestamp = (ts) => {
+  try {
+    const d = new Date(ts);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  } catch (e) {
+    return "";
+  }
+};
+
+const colorForModel = (model) => {
+  const s = String(model || "");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return `hsl(${Math.abs(h) % 360}, 65%, 55%)`;
+};
+
+const startOfTodayMs = () => {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+};
+
+// 把 log 按"小时桶"汇总：默认 anchor=今天 00:00，往后铺 24 桶
+const computeHourlyBuckets = (entries, anchorMs, hours = 24) => {
+  const HOUR = 3600 * 1000;
+  const buckets = [];
+  for (let i = 0; i < hours; i++) {
+    buckets.push({ startMs: anchorMs + i * HOUR, total: 0, byModel: {} });
+  }
+  for (const entry of entries) {
+    const ts = Number(entry?.timestamp || 0);
+    if (ts < anchorMs || ts >= anchorMs + hours * HOUR) continue;
+    const idx = Math.floor((ts - anchorMs) / HOUR);
+    if (idx < 0 || idx >= hours) continue;
+    const tokens = Number(entry.totalTokens || 0);
+    const b = buckets[idx];
+    b.total += tokens;
+    const m = entry.model || "(unknown)";
+    b.byModel[m] = (b.byModel[m] || 0) + tokens;
+  }
+  return buckets;
+};
+
+// 24h 堆叠柱状图（纯 SVG，无依赖）
+const HourlyStackedChart = ({ buckets, modelOrder, nowMs }) => {
+  const width = 960;
+  const height = 140;
+  const paddingLeft = 36;
+  const paddingRight = 8;
+  const paddingTop = 10;
+  const paddingBottom = 22;
+  const chartWidth = width - paddingLeft - paddingRight;
+  const chartHeight = height - paddingTop - paddingBottom;
+  const max = Math.max(1, ...buckets.map((b) => b.total));
+  const colWidth = chartWidth / buckets.length;
+  const yTicks = 4;
+  const niceTickFor = (v) => {
+    if (v < 1000) return v;
+    if (v < 10000) return Math.round(v / 100) * 100;
+    if (v < 1000000) return Math.round(v / 1000) * 1000;
+    return Math.round(v / 10000) * 10000;
+  };
+  const HOUR = 3600 * 1000;
+  const nowBucketIdx = Math.floor((nowMs - buckets[0].startMs) / HOUR);
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      className="w-full h-36 block"
+    >
+      {/* 横向网格 + Y 轴标签 */}
+      {Array.from({ length: yTicks + 1 }).map((_, i) => {
+        const y = paddingTop + (i / yTicks) * chartHeight;
+        const value = niceTickFor(max * (1 - i / yTicks));
+        return (
+          <g key={i}>
+            <line
+              x1={paddingLeft}
+              x2={width - paddingRight}
+              y1={y}
+              y2={y}
+              stroke="#e2e8f0"
+              strokeWidth="1"
+            />
+            <text
+              x={paddingLeft - 6}
+              y={y + 3}
+              fontSize="9"
+              fill="#94a3b8"
+              textAnchor="end"
+              fontFamily="monospace"
+            >
+              {value >= 1000 ? `${Math.round(value / 1000)}k` : value}
+            </text>
+          </g>
+        );
+      })}
+
+      {/* "现在"竖线 */}
+      {nowBucketIdx >= 0 && nowBucketIdx <= buckets.length && (
+        <line
+          x1={paddingLeft + nowBucketIdx * colWidth}
+          x2={paddingLeft + nowBucketIdx * colWidth}
+          y1={paddingTop}
+          y2={paddingTop + chartHeight}
+          stroke="#6366f1"
+          strokeWidth="1"
+          strokeDasharray="2 2"
+          opacity="0.5"
+        />
+      )}
+
+      {/* 堆叠柱 */}
+      {buckets.map((b, i) => {
+        const x = paddingLeft + i * colWidth;
+        let cumY = paddingTop + chartHeight;
+        return (
+          <g key={i}>
+            {modelOrder.map((model) => {
+              const tokens = b.byModel[model] || 0;
+              if (!tokens) return null;
+              const h = (tokens / max) * chartHeight;
+              cumY -= h;
+              return (
+                <rect
+                  key={model}
+                  x={x + 1}
+                  y={cumY}
+                  width={Math.max(0.5, colWidth - 2)}
+                  height={h}
+                  fill={colorForModel(model)}
+                  opacity={0.85}
+                >
+                  <title>{`${new Date(b.startMs).getHours()}:00 · ${model} · ${tokens.toLocaleString()} tokens`}</title>
+                </rect>
+              );
+            })}
+          </g>
+        );
+      })}
+
+      {/* X 轴小时标签：每 3h 一格 */}
+      {buckets.map((b, i) => {
+        if (i % 3 !== 0 && i !== buckets.length - 1) return null;
+        const x = paddingLeft + i * colWidth + colWidth / 2;
+        const hour = new Date(b.startMs).getHours();
+        return (
+          <text
+            key={i}
+            x={x}
+            y={height - 6}
+            fontSize="9"
+            fill="#94a3b8"
+            textAnchor="middle"
+            fontFamily="monospace"
+          >
+            {String(hour).padStart(2, "0")}
+          </text>
+        );
+      })}
+    </svg>
+  );
+};
+
+const UsageView = ({ log, onClear }) => {
+  const entries = Array.isArray(log) ? log : [];
+  const reversed = [...entries].slice(-50).reverse();
+
+  const todayStart = startOfTodayMs();
+  const nowMs = Date.now();
+
+  const todayEntries = entries.filter(
+    (e) => Number(e?.timestamp || 0) >= todayStart
+  );
+
+  const aggregateByModel = (list) =>
+    list.reduce((acc, entry) => {
+      const key = entry.model || "(unknown)";
+      if (!acc[key]) {
+        acc[key] = { calls: 0, prompt: 0, completion: 0, total: 0 };
+      }
+      acc[key].calls += 1;
+      acc[key].prompt += Number(entry.promptTokens || 0);
+      acc[key].completion += Number(entry.completionTokens || 0);
+      acc[key].total += Number(entry.totalTokens || 0);
+      return acc;
+    }, {});
+
+  const todayByModel = aggregateByModel(todayEntries);
+  const totalsByModel = aggregateByModel(entries);
+
+  const totalsByType = entries.reduce((acc, entry) => {
+    const key = entry.type || "unknown";
+    if (!acc[key]) acc[key] = { calls: 0, total: 0 };
+    acc[key].calls += 1;
+    acc[key].total += Number(entry.totalTokens || 0);
+    return acc;
+  }, {});
+
+  const todayTotal = todayEntries.reduce(
+    (s, e) => s + Number(e.totalTokens || 0),
+    0
+  );
+  const grandTotal = entries.reduce(
+    (s, e) => s + Number(e.totalTokens || 0),
+    0
+  );
+
+  // 模型颜色顺序：按今日总量倒序，然后历史里出现过但今天没用的接在后面
+  const modelOrder = (() => {
+    const todayList = Object.entries(todayByModel)
+      .sort((a, b) => b[1].total - a[1].total)
+      .map(([m]) => m);
+    const todaySet = new Set(todayList);
+    const restList = Object.keys(totalsByModel).filter((m) => !todaySet.has(m));
+    return [...todayList, ...restList];
+  })();
+
+  const buckets = computeHourlyBuckets(entries, todayStart, 24);
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-6 min-h-[70vh]">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-bold text-indigo-900">AI 用量统计</h2>
+          <p className="text-xs text-slate-500 mt-1">
+            统计每次 LLM 调用的 token 消耗（本地仅保留最近 {USAGE_LOG_MAX_ENTRIES} 条）。Paraformer 语音识别按音频时长计费，不在此处统计。
+          </p>
+        </div>
+        <button
+          onClick={onClear}
+          className="text-xs px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+        >
+          清空记录
+        </button>
+      </div>
+
+      {/* 今日 hero 卡片 */}
+      <div className="rounded-2xl border border-indigo-100 bg-gradient-to-br from-indigo-50/70 to-violet-50/40 p-5">
+        <div className="flex items-baseline justify-between gap-3 flex-wrap">
+          <div>
+            <div className="text-[11px] text-indigo-700 font-bold uppercase tracking-wider">
+              今日总用量
+            </div>
+            <div className="flex items-baseline gap-2 mt-1">
+              <span className="text-4xl font-bold text-indigo-900 tabular-nums">
+                {todayTotal.toLocaleString()}
+              </span>
+              <span className="text-sm text-indigo-600 font-semibold">
+                tokens · {todayEntries.length} 次调用
+              </span>
+            </div>
+          </div>
+          <div className="text-right text-xs text-slate-500">
+            <div>累计：<span className="font-mono text-slate-700">{grandTotal.toLocaleString()}</span> tokens</div>
+            <div>涉及模型：<span className="font-mono text-slate-700">{Object.keys(totalsByModel).length}</span></div>
+          </div>
+        </div>
+
+        {Object.keys(todayByModel).length > 0 ? (
+          <div className="mt-4 space-y-1.5">
+            {Object.entries(todayByModel)
+              .sort((a, b) => b[1].total - a[1].total)
+              .map(([model, t]) => {
+                const pct = todayTotal > 0 ? (t.total / todayTotal) * 100 : 0;
+                return (
+                  <div key={model} className="flex items-center gap-2 text-xs">
+                    <span
+                      className="inline-block w-2.5 h-2.5 rounded-sm shrink-0"
+                      style={{ backgroundColor: colorForModel(model) }}
+                    />
+                    <span className="font-mono text-indigo-900 w-40 truncate">
+                      {model}
+                    </span>
+                    <div className="flex-1 h-2 bg-indigo-100/60 rounded-full overflow-hidden">
+                      <div
+                        className="h-full"
+                        style={{
+                          width: `${pct}%`,
+                          backgroundColor: colorForModel(model),
+                        }}
+                      />
+                    </div>
+                    <span className="font-mono text-indigo-800 w-20 text-right tabular-nums">
+                      {t.total.toLocaleString()}
+                    </span>
+                    <span className="text-indigo-500 w-10 text-right tabular-nums">
+                      {pct.toFixed(0)}%
+                    </span>
+                  </div>
+                );
+              })}
+          </div>
+        ) : (
+          <div className="mt-4 text-sm text-indigo-700/70">
+            今天还没有调用。开始一次同传或生成纪要即可看到数据。
+          </div>
+        )}
+      </div>
+
+      {/* 24h 堆叠柱状图 */}
+      <div className="rounded-xl border border-slate-200 overflow-hidden">
+        <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-3">
+          <span className="text-xs font-semibold text-slate-600">
+            今日 24 小时 token 走势（按模型堆叠）
+          </span>
+          <span className="text-[10px] font-mono text-slate-400">
+            {new Date(todayStart).toLocaleDateString()}
+          </span>
+        </div>
+        <div className="p-3">
+          <HourlyStackedChart buckets={buckets} modelOrder={modelOrder} nowMs={nowMs} />
+          {modelOrder.length > 0 && (
+            <div className="flex flex-wrap gap-x-4 gap-y-1.5 mt-2 px-1">
+              {modelOrder.map((model) => {
+                const t = todayByModel[model] || totalsByModel[model];
+                if (!t) return null;
+                const isToday = !!todayByModel[model];
+                return (
+                  <div
+                    key={model}
+                    className={`flex items-center gap-1.5 text-[11px] ${
+                      isToday ? "text-slate-700" : "text-slate-400"
+                    }`}
+                  >
+                    <span
+                      className="inline-block w-2.5 h-2.5 rounded-sm"
+                      style={{ backgroundColor: colorForModel(model) }}
+                    />
+                    <span className="font-mono">{model}</span>
+                    {!isToday && <span className="text-slate-400">(历史)</span>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 按调用类型快览 */}
+      {Object.keys(totalsByType).length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {Object.entries(totalsByType).map(([type, t]) => (
+            <div
+              key={type}
+              className="rounded-full bg-indigo-50 text-indigo-700 border border-indigo-100 px-3 py-1 text-xs"
+            >
+              <span className="font-semibold">{USAGE_TYPE_LABELS[type] || type}</span>
+              <span className="text-indigo-500 mx-1">·</span>
+              <span>{t.calls} 次 / {t.total.toLocaleString()} tokens</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 按模型聚合（累计） */}
+      {Object.keys(totalsByModel).length > 0 && (
+        <div className="rounded-xl border border-slate-200 overflow-hidden">
+          <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+            按模型聚合（累计）
+          </div>
+          <table className="w-full text-sm">
+            <thead className="text-xs text-slate-500 bg-white">
+              <tr>
+                <th className="text-left px-4 py-2 font-medium">模型</th>
+                <th className="text-right px-4 py-2 font-medium">调用</th>
+                <th className="text-right px-4 py-2 font-medium">prompt</th>
+                <th className="text-right px-4 py-2 font-medium">completion</th>
+                <th className="text-right px-4 py-2 font-medium">total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(totalsByModel)
+                .sort((a, b) => b[1].total - a[1].total)
+                .map(([model, t]) => (
+                  <tr key={model} className="border-t border-slate-100">
+                    <td className="px-4 py-2 font-mono text-slate-700 flex items-center gap-2">
+                      <span
+                        className="inline-block w-2.5 h-2.5 rounded-sm"
+                        style={{ backgroundColor: colorForModel(model) }}
+                      />
+                      {model}
+                    </td>
+                    <td className="px-4 py-2 text-right text-slate-600">{t.calls}</td>
+                    <td className="px-4 py-2 text-right text-slate-600">{t.prompt.toLocaleString()}</td>
+                    <td className="px-4 py-2 text-right text-slate-600">{t.completion.toLocaleString()}</td>
+                    <td className="px-4 py-2 text-right font-semibold text-slate-800">{t.total.toLocaleString()}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="rounded-xl border border-slate-200 overflow-hidden">
+        <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+          最近调用（倒序）
+        </div>
+        {reversed.length === 0 ? (
+          <div className="px-4 py-8 text-center text-sm text-slate-500">
+            还没有记录。开始一次同传或生成纪要后这里会出现 token 消耗。
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-xs text-slate-500 bg-white">
+              <tr>
+                <th className="text-left px-4 py-2 font-medium">时间</th>
+                <th className="text-left px-4 py-2 font-medium">类型</th>
+                <th className="text-left px-4 py-2 font-medium">模型</th>
+                <th className="text-right px-4 py-2 font-medium">prompt</th>
+                <th className="text-right px-4 py-2 font-medium">completion</th>
+                <th className="text-right px-4 py-2 font-medium">total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reversed.map((entry, idx) => (
+                <tr
+                  key={`${entry.timestamp}-${idx}`}
+                  className="border-t border-slate-100"
+                >
+                  <td className="px-4 py-2 text-slate-600 whitespace-nowrap">
+                    {formatUsageTimestamp(entry.timestamp)}
+                  </td>
+                  <td className="px-4 py-2 text-slate-700">
+                    {USAGE_TYPE_LABELS[entry.type] || entry.type}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-xs text-slate-600">
+                    {entry.model}
+                  </td>
+                  <td className="px-4 py-2 text-right text-slate-500">
+                    {Number(entry.promptTokens || 0).toLocaleString()}
+                  </td>
+                  <td className="px-4 py-2 text-right text-slate-500">
+                    {Number(entry.completionTokens || 0).toLocaleString()}
+                  </td>
+                  <td className="px-4 py-2 text-right font-semibold text-slate-700">
+                    {Number(entry.totalTokens || 0).toLocaleString()}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
 
   const [listeningMode, setListeningMode] = useState("none");
@@ -836,8 +1841,62 @@ export default function App() {
   const [activeEn, setActiveEn] = useState("");
   const [activeZh, setActiveZh] = useState("");
   const [activeConfidence, setActiveConfidence] = useState(1);
-  const [errorMsg, setErrorMsg] = useState("");
+  const [unsupportedReason, setUnsupportedReason] = useState("");
   const [isSupported, setIsSupported] = useState(true);
+  const [asrStatus, setAsrStatus] = useState("idle"); // 'idle' | 'connecting' | 'live' | 'error'
+  const [asrErrorReason, setAsrErrorReason] = useState("");
+
+  // ---- Toasts: 可堆栈、自动消失、可手动关 -----------------------------------
+  const [toasts, setToasts] = useState([]);
+  const toastIdRef = useRef(0);
+  const toastTimeoutsRef = useRef(new Map());
+
+  const dismissToast = useCallback((id) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+    const timeout = toastTimeoutsRef.current.get(id);
+    if (timeout) {
+      clearTimeout(timeout);
+      toastTimeoutsRef.current.delete(id);
+    }
+  }, []);
+
+  const pushToast = useCallback(({ level = "info", text, ttl = 4500 } = {}) => {
+    const trimmed = String(text || "").trim();
+    if (!trimmed) return null;
+    toastIdRef.current += 1;
+    const id = toastIdRef.current;
+    setToasts((prev) => [...prev, { id, level, text: trimmed, ts: Date.now() }]);
+    if (ttl > 0) {
+      const timeout = setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+        toastTimeoutsRef.current.delete(id);
+      }, ttl);
+      toastTimeoutsRef.current.set(id, timeout);
+    }
+    return id;
+  }, []);
+
+  useEffect(
+    () => () => {
+      for (const timeout of toastTimeoutsRef.current.values()) clearTimeout(timeout);
+      toastTimeoutsRef.current.clear();
+    },
+    []
+  );
+
+  // 兼容老调用点：setErrorMsg("") = 无操作；非空字符串走 toast
+  // 文本里含"失败/异常/拒绝/无法" → error；"已..." / "建议" / "正在" → info；其他 → warn
+  const setErrorMsg = useCallback(
+    (text) => {
+      const t = String(text || "").trim();
+      if (!t) return;
+      let level = "warn";
+      if (/失败|异常|拒绝|无法|错误/.test(t)) level = "error";
+      else if (/^已|^正在|建议|提示|^切换|^请/.test(t)) level = "info";
+      pushToast({ level, text: t });
+    },
+    [pushToast]
+  );
 
   const [pipWindow, setPipWindow] = useState(null);
   
@@ -880,12 +1939,16 @@ export default function App() {
   });
 
   const [modelDraft, setModelDraft] = useState("");
+  const [realtimeModelDraft, setRealtimeModelDraft] = useState("");
+  const [summaryModelDraft, setSummaryModelDraft] = useState("");
   const [modelSuccessMsg, setModelSuccessMsg] = useState("");
+
+  const [aiUsageLog, setAiUsageLog] = useState(() => readUsageLog());
+  useEffect(() => subscribeUsageLog(setAiUsageLog), []);
 
   // --------------------------------------------------------------------------
   // [极致无缝引擎核心 Refs]
   // --------------------------------------------------------------------------
-  const recognitionRef = useRef(null);
   const targetModeRef = useRef("mic");
   const shouldListenRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -895,6 +1958,7 @@ export default function App() {
   const silenceTimerRef = useRef(null);
   const systemAudioStreamRef = useRef(null);
   const systemAudioTrackRef = useRef(null);
+  const paraformerSessionRef = useRef(null);
   const micInputStreamRef = useRef(null);
   const micProcessedStreamRef = useRef(null);
   const micProcessedTrackRef = useRef(null);
@@ -915,6 +1979,16 @@ export default function App() {
   useEffect(() => {
     transcriptsRef.current = transcripts;
   }, [transcripts]);
+
+  const { rows: homeRows, buckets: homeBuckets } = useMemo(
+    () => buildTranscriptRowsAndBuckets(transcripts),
+    [transcripts]
+  );
+
+  const scrollToBucket = useCallback((bucketStart) => {
+    const target = document.getElementById(`ct-bucket-${bucketStart}`);
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
   const fetchDevices = async () => {
     try {
@@ -1128,7 +2202,7 @@ export default function App() {
         return false;
       }
     },
-    [buildSessionPayload, sessionFolderHandle]
+    [buildSessionPayload, sessionFolderHandle, setErrorMsg]
   );
 
   const loadSavedSessionsFromFolder = useCallback(async (folderHandle) => {
@@ -1167,7 +2241,7 @@ export default function App() {
       console.error("加载已保存会话失败:", err);
       setErrorMsg("读取文件夹中的历史会话失败，请重新选择文件夹。");
     }
-  }, []);
+  }, [setErrorMsg]);
 
   const pickSessionFolder = useCallback(async () => {
     if (!supportsDirectoryPicker) {
@@ -1188,7 +2262,7 @@ export default function App() {
       }
       return false;
     }
-  }, [loadSavedSessionsFromFolder, supportsDirectoryPicker]);
+  }, [loadSavedSessionsFromFolder, setErrorMsg, supportsDirectoryPicker]);
 
   const ensureSessionFolderSelected = useCallback(async () => {
     if (sessionFolderHandle) return true;
@@ -1276,28 +2350,39 @@ export default function App() {
     setSelectedDeviceId(deviceId);
     setIsDeviceMenuOpen(false);
 
-    if (listeningMode === "mic") {
-      try {
-        await prepareEnhancedMicCapture(deviceId);
-      } catch (err) {
-        console.warn("切换麦克风设备授权失败:", err);
-      }
+    if (listeningMode !== "mic") return;
 
-      // 关键修复：仅重启识别引擎，不触发停止收尾与生成纪要
-      shouldListenRef.current = true;
-      targetModeRef.current = "mic";
-      if (!isPausedRef.current) {
-        setErrorMsg("已切换麦克风，正在继续当前同传…");
-        try {
-          recognitionRef.current?.stop();
-        } catch (e) {}
-      }
+    // 关键：换麦不收尾本次同传，只把 Paraformer 会话原地重启到新设备上。
+    setErrorMsg("已切换麦克风，正在继续当前同传…");
+    await stopParaformerSession();
+
+    let nextTrack = null;
+    try {
+      nextTrack = await prepareEnhancedMicCapture(deviceId);
+    } catch (err) {
+      console.warn("切换麦克风设备授权失败:", err);
     }
-  };
 
-  const handleMicEntryClick = async () => {
-    await fetchDevices();
-    setIsDeviceMenuOpen(true);
+    if (!nextTrack) {
+      setErrorMsg("切换后无法获取麦克风音频，请重试或换一个输入设备。");
+      shouldListenRef.current = false;
+      setListeningMode("none");
+      return;
+    }
+
+    shouldListenRef.current = true;
+    targetModeRef.current = "mic";
+
+    try {
+      await startParaformerForMode(nextTrack, "mic");
+      setErrorMsg("");
+    } catch (err) {
+      console.error("切麦后启动 Paraformer 失败:", err);
+      stopMicCaptureEnhancer();
+      shouldListenRef.current = false;
+      setListeningMode("none");
+      setErrorMsg(`切麦后识别启动失败：${err && err.message ? err.message : err}`);
+    }
   };
 
   const finalizeCurrentBlock = useCallback(() => {
@@ -1307,7 +2392,24 @@ export default function App() {
     const id = activeBlockIdRef.current;
     const currentInterimZh = activeZhRef.current;
     const blockConfidence = activeConfidenceRef.current;
+    const blockCreatedAt = Date.now();
     const isTabCapture = targetModeRef.current === "tab";
+
+    // 跨块上下文：取最近 2 条已完成、干净的转录，给 polish 维持术语 / 代词一致
+    const contextHistory = (transcriptsRef.current || [])
+      .filter(
+        (t) =>
+          t &&
+          !t.isTranslating &&
+          t.en &&
+          t.zh &&
+          t.zh !== "..." &&
+          !String(t.en).includes("⚠️") &&
+          !String(t.en).includes("🔊") &&
+          !String(t.speaker || "").includes("识别中")
+      )
+      .slice(-2)
+      .map((t) => ({ en: t.en, zh: t.zh }));
 
     setTranscripts((prev) => [
       ...prev,
@@ -1318,17 +2420,21 @@ export default function App() {
         confidence: blockConfidence,
         lowConfidence: blockConfidence < 0.65,
         isTranslating: true,
+        isStreamingPolish: false,
         isPolished: false,
         fromTab: isTabCapture,
         speaker: "🕵️ 识别中...", // 初始状态为识别中，等待大模型覆盖
+        createdAt: blockCreatedAt,
       },
     ]);
 
     activeBlockIdRef.current =
       Date.now().toString() + Math.random().toString(36).substring(2, 7);
 
-  // 关键修复：只推进“已最终确认(final)”文本长度，避免 interim 被提前消费导致漏字
-  processedLengthRef.current = lastFinalSessionStringRef.current.length;
+  // Paraformer 的 sentence_end 通常滞后于用户的自然停顿，finalize 触发时 finalText
+  // 还可能是空。所以这里推进到当前会话整段文本（含 interim），把已展示给用户的内容
+  // 完整标记为已消费，避免下一条气泡复读上一段。
+  processedLengthRef.current = lastSessionStringRef.current.length;
 
     setActiveEn("");
     setActiveZh("");
@@ -1338,81 +2444,140 @@ export default function App() {
   activeConfidenceRef.current = 1;
     lastTranslatedEnRef.current = "";
 
-    Promise.allSettled([polishWithAI(textToFinalize), translateTextBasic(textToFinalize)])
-      .then((results) => {
-        const aiResult = results[0];
-        const basicResult = results[1];
-        const basicZh =
-          basicResult.status === "fulfilled" && basicResult.value
-            ? String(basicResult.value)
-            : "";
+    // ---- 懒加载 qwen-turbo 基线：仅当 polish 在 POLISH_BASELINE_DELAY_MS 内还没出第一个 ZH delta，
+    //      或质量门控/polish 自身失败需要兜底时才启动。fast-polish 路径完全跳过这次调用。
+    let baselinePromise = null;
+    let firstDeltaSeen = false;
+    let baselineTimerCleared = false;
 
-        let finalSegments = [];
-        let degradedByQualityGate = false;
+    const ensureBaseline = () => {
+      if (!baselinePromise) {
+        baselinePromise = translateRealtimeFast(textToFinalize).catch((err) => {
+          console.warn("baseline translate failed:", err);
+          return "";
+        });
+      }
+      return baselinePromise;
+    };
 
-        if (aiResult.status === "fulfilled") {
-          const qualityCheck = evaluateAiPolishQuality({
-            rawEn: textToFinalize,
-            aiSegments: aiResult.value,
-            basicZh,
-          });
+    const baselineTimer = setTimeout(() => {
+      baselineTimerCleared = true;
+      if (!firstDeltaSeen) ensureBaseline();
+    }, POLISH_BASELINE_DELAY_MS);
 
-          if (qualityCheck.ok) {
-            finalSegments = aiResult.value;
-          } else {
-            degradedByQualityGate = true;
-            console.warn("AI polish quality gate fallback:", qualityCheck.reason);
-          }
-        } else {
-          console.warn("AI Polish failed:", aiResult.reason);
-          degradedByQualityGate = true;
+    const cancelBaselineTimer = () => {
+      if (baselineTimerCleared) return;
+      baselineTimerCleared = true;
+      clearTimeout(baselineTimer);
+    };
+
+    const onPolishStream = (partialSegments) => {
+      if (!partialSegments || partialSegments.length === 0) return;
+      const head = partialSegments[0];
+      const liveZh = String(head?.zh || "").trim();
+      if (!liveZh) return;
+
+      if (!firstDeltaSeen) {
+        firstDeltaSeen = true;
+        cancelBaselineTimer();
+      }
+
+      const liveSpeaker = String(head?.speaker || "").trim();
+
+      setTranscripts((prev) => {
+        const idx = prev.findIndex((t) => t.id === id);
+        if (idx === -1) return prev;
+        const cur = prev[idx];
+        if (
+          cur.zh === liveZh &&
+          (!liveSpeaker || cur.speaker === liveSpeaker) &&
+          !cur.isTranslating &&
+          cur.isStreamingPolish
+        ) {
+          return prev;
+        }
+        const updated = [...prev];
+        updated[idx] = {
+          ...cur,
+          zh: liveZh,
+          speaker: liveSpeaker || cur.speaker,
+          isTranslating: false,
+          isStreamingPolish: true,
+        };
+        return updated;
+      });
+    };
+
+    const applyFinalSegments = (finalSegments, isPolished) => {
+      setTranscripts((prev) => {
+        const index = prev.findIndex((t) => t.id === id);
+        if (index === -1) return prev;
+
+        const newItems = finalSegments.map((seg, idx) => ({
+          id: `${id}-split-${idx}`,
+          speaker: seg.speaker || "👩‍🏫 主讲人",
+          en: smartPunctuateEnglish(seg.en || textToFinalize, true),
+          zh: seg.zh || "...",
+          confidence: blockConfidence,
+          lowConfidence: blockConfidence < 0.65,
+          isTranslating: false,
+          isStreamingPolish: false,
+          isPolished,
+          fromTab: isTabCapture,
+          createdAt: blockCreatedAt,
+        }));
+
+        const updatedTranscripts = [...prev];
+        updatedTranscripts.splice(index, 1, ...newItems);
+        return updatedTranscripts;
+      });
+    };
+
+    polishWithAI(textToFinalize, { onUpdate: onPolishStream, contextHistory })
+      .then(async (aiSegments) => {
+        cancelBaselineTimer();
+
+        // 仅在 baseline 已启动时等待它（用于质量门控长度对比）；否则跳过这次外部调用。
+        const baselineZh = baselinePromise ? await baselinePromise : "";
+
+        const qualityCheck = evaluateAiPolishQuality({
+          rawEn: textToFinalize,
+          aiSegments,
+          basicZh: baselineZh,
+        });
+
+        if (qualityCheck.ok) {
+          applyFinalSegments(aiSegments, true);
+          return;
         }
 
-        if (!finalSegments.length) {
-          finalSegments = [
+        console.warn("AI polish quality gate fallback:", qualityCheck.reason);
+        const fallback = baselineZh || (await ensureBaseline());
+        applyFinalSegments(
+          [
             {
-              speaker: degradedByQualityGate ? "🛡️ 质量守卫(机译保底)" : "⚠️ AI超时降级",
+              speaker: "🛡️ 质量守卫(机译保底)",
               en: textToFinalize,
-              zh: basicZh || "[基础翻译异常]",
+              zh: fallback || "[基础翻译异常]",
             },
-          ];
-        }
-
-        // 核心修复：用 AI 返回的数组动态分裂并替换原本的单一气泡
-        setTranscripts((prev) => {
-          const index = prev.findIndex((t) => t.id === id);
-          if (index === -1) return prev;
-
-          // 将数组中的每一个段落转化为独立的方框条目
-          const newItems = finalSegments.map((seg, idx) => ({
-            id: `${id}-split-${idx}`, // 生成新的防冲突 ID
-            speaker: seg.speaker || "👩‍🏫 主讲人",
-            en: smartPunctuateEnglish(seg.en || textToFinalize, true),
-            zh: seg.zh || basicZh || "...",
-            confidence: blockConfidence,
-            lowConfidence: blockConfidence < 0.65,
-            isTranslating: false,
-            isPolished: !degradedByQualityGate,
-            fromTab: isTabCapture,
-          }));
-
-          const updatedTranscripts = [...prev];
-          // 利用 splice 将原本的 1 个“识别中”条目，无缝替换为 N 个已精调拆分好的条目
-          updatedTranscripts.splice(index, 1, ...newItems);
-          return updatedTranscripts;
-        });
+          ],
+          false
+        );
       })
-      .catch((error) => {
-        console.warn("Polish pipeline failed:", error);
-        translateTextBasic(textToFinalize).then((basicZh) => {
-          setTranscripts((prev) =>
-            prev.map((t) =>
-              t.id === id
-                ? { ...t, speaker: "⚠️ AI超时降级", zh: basicZh + " (机译兜底)", isTranslating: false, isPolished: false }
-                : t
-            )
-          );
-        });
+      .catch(async (error) => {
+        cancelBaselineTimer();
+        console.warn("AI Polish failed:", error);
+        const fallback = await ensureBaseline();
+        applyFinalSegments(
+          [
+            {
+              speaker: "⚠️ AI超时降级",
+              en: textToFinalize,
+              zh: fallback || "[基础翻译异常]",
+            },
+          ],
+          false
+        );
       });
   }, []);
 
@@ -1432,14 +2597,14 @@ export default function App() {
         const textToTranslate = currentEn;
 
         try {
-          const zh = await translateTextBasic(textToTranslate);
-          if (currentBlockId === activeBlockIdRef.current) {
+          const zh = await translateRealtimeFast(textToTranslate);
+          if (currentBlockId === activeBlockIdRef.current && zh) {
             setActiveZh(zh);
             activeZhRef.current = zh;
             lastTranslatedEnRef.current = textToTranslate;
           }
         } catch (error) {
-          console.error("Real-time basic translation error", error);
+          console.error("Real-time translation error", error);
         } finally {
           isTranslatingRef.current = false;
         }
@@ -1448,64 +2613,30 @@ export default function App() {
     return () => clearInterval(intervalId);
   }, [listeningMode, isPaused]);
 
-  const initSpeechRecognition = () => {
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setIsSupported(false);
-      setErrorMsg("您的浏览器不支持语音识别 API。");
-      return null;
-    }
+  // 通用的转录增量更新逻辑：mic 模式（webkitSpeechRecognition）和 tab 模式
+  // (Paraformer) 都通过它写入活动文本、推进静音定时器。
+  const applyTranscriptUpdate = useCallback(
+    ({ fullText, finalText, confidence }) => {
+      if (isPausedRef.current) return;
 
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-  recognition.maxAlternatives = 5;
-
-    recognition.onstart = () => {
-      setListeningMode(targetModeRef.current === "tab" ? "tab" : "mic");
-      setIsPaused(false);
-      isPausedRef.current = false;
-      setErrorMsg("");
-    };
-
-    recognition.onresult = (event) => {
-      if (isPausedRef.current) return; 
-
-      let currentSessionFullText = "";
-      let currentSessionFinalText = "";
-      let latestConfidence = 0;
-      for (let i = 0; i < event.results.length; ++i) {
-        const result = event.results[i];
-        const transcript = pickBestTranscriptAlternative(result);
-        if (!transcript) continue;
-
-        latestConfidence = Math.max(
-          latestConfidence,
-          pickBestAlternativeConfidence(result)
-        );
-
-        currentSessionFullText +=
-          (currentSessionFullText ? " " : "") + transcript;
-
-        if (result.isFinal) {
-          currentSessionFinalText +=
-            (currentSessionFinalText ? " " : "") + transcript;
-        }
-      }
-      lastSessionStringRef.current = currentSessionFullText;
-      lastFinalSessionStringRef.current = currentSessionFinalText;
+      lastSessionStringRef.current = fullText || "";
+      lastFinalSessionStringRef.current = finalText || "";
 
       const safeProcessedLength = Math.min(
         processedLengthRef.current,
-        currentSessionFullText.length
+        (fullText || "").length
       );
-      const activeNewTextRaw = currentSessionFullText.substring(
-        safeProcessedLength
-      );
+      // 上一条 finalize 后，Paraformer 才把上一句 sentence_end 补上，可能让消费点
+      // 后面残留 ". " / "， " 等首字符；统一吃掉，避免 active 气泡显示孤立标点。
+      const activeNewTextRaw = (fullText || "")
+        .substring(safeProcessedLength)
+        .replace(/^[\s.,;:!?。，；：！？]+/, "");
       const activeNewText = smartPunctuateEnglish(activeNewTextRaw, false);
-      const safeConfidence = clamp(latestConfidence || activeConfidenceRef.current || 0, 0, 1);
+      const safeConfidence = clamp(
+        confidence || activeConfidenceRef.current || 0,
+        0,
+        1
+      );
 
       setActiveEn(activeNewText);
       setActiveConfidence(safeConfidence);
@@ -1519,51 +2650,36 @@ export default function App() {
           finalizeCurrentBlock();
         }, adaptiveThreshold);
       }
-    };
+    },
+    [finalizeCurrentBlock]
+  );
 
-    recognition.onerror = (event) => {
-      if (event.error === "not-allowed") {
-        setErrorMsg("麦克风权限被拒绝。");
-        shouldListenRef.current = false;
-        setListeningMode("none");
-      }
-    };
-
-    recognition.onend = () => {
-      if (activeEnRef.current.trim()) finalizeCurrentBlock();
-
-      processedLengthRef.current = 0;
-      lastSessionStringRef.current = "";
-      lastFinalSessionStringRef.current = "";
-
-      if (shouldListenRef.current && !isPausedRef.current) {
-        try {
-          if (targetModeRef.current === "tab" && systemAudioTrackRef.current) {
-            recognition.start(systemAudioTrackRef.current);
-          } else if (targetModeRef.current === "mic" && micProcessedTrackRef.current) {
-            recognition.start(micProcessedTrackRef.current);
-          } else {
-            recognition.start();
-          }
-        } catch (e) {
-          setListeningMode("none");
-        }
-      } else if (!shouldListenRef.current) {
-        setListeningMode("none");
-      }
-    };
-    return recognition;
-  };
-
+  // 浏览器最低能力检测：mic / tab 两条路都要 getUserMedia + WebSocket + AudioWorklet
   useEffect(() => {
-    recognitionRef.current = initSpeechRecognition();
+    const ok =
+      typeof window !== "undefined" &&
+      typeof window.WebSocket !== "undefined" &&
+      navigator?.mediaDevices?.getUserMedia &&
+      typeof window.AudioContext !== "undefined";
+    if (!ok) {
+      setIsSupported(false);
+      setUnsupportedReason("当前浏览器缺少音频或 WebSocket 能力，请使用最新版 Chrome / Edge。");
+    }
+  }, []);
+
+  // 卸载时确保收尾：停 Paraformer 会话 + 释放系统音频和麦克风资源
+  useEffect(() => {
     return () => {
       shouldListenRef.current = false;
-      if (recognitionRef.current) recognitionRef.current.stop();
+      const session = paraformerSessionRef.current;
+      paraformerSessionRef.current = null;
+      if (session) {
+        session.stop().catch(() => {});
+      }
       stopSystemAudioCapture();
       stopMicCaptureEnhancer();
     };
-  }, [finalizeCurrentBlock, stopMicCaptureEnhancer, stopSystemAudioCapture]);
+  }, [stopMicCaptureEnhancer, stopSystemAudioCapture]);
 
   const autoSaveCurrentSessionWithSummary = useCallback(async (options = {}) => {
     const {
@@ -1702,6 +2818,77 @@ export default function App() {
     summaryResult,
   ]);
 
+  const stopParaformerSession = useCallback(async () => {
+    const session = paraformerSessionRef.current;
+    if (!session) return;
+    paraformerSessionRef.current = null;
+    setAsrStatus("idle");
+    setAsrErrorReason("");
+    try {
+      await session.stop();
+    } catch (e) {
+      console.warn("Paraformer stop error:", e);
+    }
+  }, []);
+
+  // 创建并启动一个 Paraformer 会话，把它绑到 paraformerSessionRef 上。
+  // tab / mic 两个入口共用，确保会话生命周期与 onUpdate 路径一致。
+  const startParaformerForMode = useCallback(
+    async (audioTrack, mode) => {
+      // 复位 session 累计标记，避免和上一次会话的 processedLength 串起来
+      processedLengthRef.current = 0;
+      lastSessionStringRef.current = "";
+      lastFinalSessionStringRef.current = "";
+
+      setAsrStatus("connecting");
+      setAsrErrorReason("");
+
+      const session = new ParaformerSession({
+        wsUrl: PARAFORMER_WS_URL,
+        audioTrack,
+        languageHints: ["en"],
+        vocabularyId: getStoredVocabularyId() || undefined,
+        onUpdate: ({ fullText, finalText, confidence }) => {
+          applyTranscriptUpdate({ fullText, finalText, confidence });
+        },
+        onStatus: ({ phase, attempt }) => {
+          if (phase === "started") {
+            setAsrStatus("live");
+            setAsrErrorReason("");
+          }
+          if (phase === "reconnecting") {
+            setAsrStatus("connecting");
+            pushToast({
+              level: "warning",
+              text: `识别连接中断，正在自动重连 (${attempt}/${3})…`,
+              ttl: 4000,
+            });
+          }
+        },
+        onError: (err) => {
+          console.error("Paraformer error:", err);
+          const label = mode === "tab" ? "系统音频识别" : "麦克风识别";
+          const reason = err && err.message ? err.message : String(err);
+          setAsrStatus("error");
+          setAsrErrorReason(reason);
+          pushToast({ level: "error", text: `${label}异常：${reason}`, ttl: 7000 });
+        },
+      });
+      paraformerSessionRef.current = session;
+
+      try {
+        await session.start();
+        return session;
+      } catch (err) {
+        setAsrStatus("error");
+        setAsrErrorReason(err && err.message ? err.message : String(err));
+        await stopParaformerSession();
+        throw err;
+      }
+    },
+    [applyTranscriptUpdate, pushToast, stopParaformerSession]
+  );
+
   const stopTabMode = useCallback(async () => {
     const stopDurationSec = recordingTime;
     shouldListenRef.current = false;
@@ -1711,11 +2898,9 @@ export default function App() {
       finalizeCurrentBlock();
     }
 
-    try {
-      recognitionRef.current?.stop();
-    } catch (e) {}
-
+    await stopParaformerSession();
     stopSystemAudioCapture();
+
     if (transcriptsRef.current.length > 0 || activeEnRef.current.trim()) {
       await autoSaveCurrentSessionWithSummary({
         showCompletionModal: true,
@@ -1724,23 +2909,39 @@ export default function App() {
       });
     }
 
+    // 复位 mic 模式恢复时需要的 session 累计标记
+    processedLengthRef.current = 0;
+    lastSessionStringRef.current = "";
+    lastFinalSessionStringRef.current = "";
+
     setListeningMode("none");
     setIsPaused(false);
     isPausedRef.current = false;
-  }, [autoSaveCurrentSessionWithSummary, finalizeCurrentBlock, recordingTime, stopSystemAudioCapture]);
+  }, [
+    autoSaveCurrentSessionWithSummary,
+    finalizeCurrentBlock,
+    recordingTime,
+    stopParaformerSession,
+    stopSystemAudioCapture,
+  ]);
 
   const startTabMode = useCallback(async () => {
-    if (!recognitionRef.current) return;
-
     if (!navigator?.mediaDevices?.getDisplayMedia) {
       alert("当前浏览器不支持系统音频采集，请升级 Chrome/Edge。\n建议改用麦克风模式。");
+      return;
+    }
+
+    if (!PARAFORMER_WS_URL) {
+      alert(
+        "未配置 Paraformer WebSocket 中继地址。\n请设置环境变量 REACT_APP_PARAFORMER_WS_URL 后重新部署，或先暂用麦克风模式。"
+      );
       return;
     }
 
     try {
       if (listeningMode === "mic") {
         shouldListenRef.current = false;
-        recognitionRef.current.stop();
+        await stopParaformerSession();
         stopMicCaptureEnhancer();
       }
 
@@ -1769,41 +2970,41 @@ export default function App() {
       shouldListenRef.current = true;
       setRecordingTime(0);
       setIsAutoScroll(true);
-      setListeningMode("tab");
-  setActiveView("home");
+      setActiveView("home");
 
       try {
-        // 优先尝试通过系统音频轨道启动（部分浏览器实验支持）
-        recognitionRef.current.start(audioTrack);
+        await startParaformerForMode(audioTrack, "tab");
       } catch (err) {
-        try {
-          // 兜底：退回标准 start，至少保证识别引擎进入运行态
-          recognitionRef.current.start();
-          setErrorMsg("当前浏览器可能不支持直接识别系统音频轨道，已启用兼容模式。建议使用 Chrome 标签页并确认勾选共享音频。");
-        } catch (fallbackErr) {
-          stopSystemAudioCapture();
-          shouldListenRef.current = false;
-          targetModeRef.current = "mic";
-          setListeningMode("none");
-          alert("系统音频识别启动失败。请在弹窗中选择 Chrome 标签页/窗口并勾选共享音频后重试。");
-        }
+        console.error("Paraformer 启动失败:", err);
+        stopSystemAudioCapture();
+        shouldListenRef.current = false;
+        targetModeRef.current = "mic";
+        setListeningMode("none");
+        alert(
+          `Paraformer 系统音频识别启动失败：${err && err.message ? err.message : err}\n请检查中继 Worker 与 DASHSCOPE_API_KEY 是否就绪。`
+        );
+        return;
       }
 
-      // 双保险：若 1.2s 后仍未进入识别运行态，尝试一次标准启动
-      setTimeout(() => {
-        if (shouldListenRef.current && targetModeRef.current === "tab" && listeningMode === "none") {
-          try {
-            recognitionRef.current.start();
-          } catch (e) {}
-        }
-      }, 1200);
+      setListeningMode("tab");
+      setIsPaused(false);
+      isPausedRef.current = false;
+      setErrorMsg("");
     } catch (err) {
       if (err?.name !== "AbortError") {
         console.error("系统音频模式启动失败:", err);
         setErrorMsg("启动系统音频模式失败，请重试。");
       }
     }
-  }, [listeningMode, stopMicCaptureEnhancer, stopSystemAudioCapture, stopTabMode]);
+  }, [
+    listeningMode,
+    setErrorMsg,
+    startParaformerForMode,
+    stopMicCaptureEnhancer,
+    stopParaformerSession,
+    stopSystemAudioCapture,
+    stopTabMode,
+  ]);
 
   const togglePip = async () => {
     if (pipWindow) {
@@ -1946,24 +3147,19 @@ export default function App() {
   }, [transcripts, activeEn, activeZh, isAutoScroll]);
 
   const toggleMicMode = async () => {
-    if (!recognitionRef.current) return;
-
     if (listeningMode === "mic") {
       const stopDurationSec = recordingTime;
       shouldListenRef.current = false;
-      
+
       if (isPausedRef.current) {
         setListeningMode("none");
         setIsPaused(false);
         isPausedRef.current = false;
       }
-      
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {}
 
+      await stopParaformerSession();
       stopMicCaptureEnhancer();
-      
+
       if (activeEnRef.current.trim()) finalizeCurrentBlock();
 
       if (transcriptsRef.current.length > 0 || activeEnRef.current.trim()) {
@@ -1976,25 +3172,42 @@ export default function App() {
     } else {
       if (listeningMode === "tab") await stopTabMode();
 
-      const enhancedTrack = await prepareEnhancedMicCapture(selectedDeviceId);
-
-      shouldListenRef.current = true;
-    targetModeRef.current = "mic";
-    setActiveView("home");
-      setRecordingTime(0); 
-      // 开启时默认将页面拽到底部
-      setIsAutoScroll(true);
-      
-      try {
-        if (enhancedTrack) {
-          recognitionRef.current.start(enhancedTrack);
-        } else {
-          recognitionRef.current.start();
-          setErrorMsg("已启用兼容收音模式。若远距离收音仍偏弱，建议提高麦克风输入增益或靠近声源。");
-        }
-      } catch (e) {
-        console.error("启动录音失败", e);
+      if (!PARAFORMER_WS_URL) {
+        alert(
+          "未配置 Paraformer WebSocket 中继地址。\n请设置环境变量 REACT_APP_PARAFORMER_WS_URL 后重新部署。"
+        );
+        return;
       }
+
+      const enhancedTrack = await prepareEnhancedMicCapture(selectedDeviceId);
+      if (!enhancedTrack) {
+        setErrorMsg("无法获取麦克风音频，请检查浏览器权限或换一个输入设备。");
+        return;
+      }
+
+      targetModeRef.current = "mic";
+      shouldListenRef.current = true;
+      setActiveView("home");
+      setRecordingTime(0);
+      setIsAutoScroll(true);
+
+      try {
+        await startParaformerForMode(enhancedTrack, "mic");
+      } catch (err) {
+        console.error("Paraformer 启动失败:", err);
+        stopMicCaptureEnhancer();
+        shouldListenRef.current = false;
+        setListeningMode("none");
+        alert(
+          `Paraformer 麦克风识别启动失败：${err && err.message ? err.message : err}\n请检查中继 Worker 与 DASHSCOPE_API_KEY 是否就绪。`
+        );
+        return;
+      }
+
+      setListeningMode("mic");
+      setIsPaused(false);
+      isPausedRef.current = false;
+      setErrorMsg("");
     }
   };
 
@@ -2018,27 +3231,74 @@ export default function App() {
     if (isPaused) {
       setIsPaused(false);
       isPausedRef.current = false;
-      if (listeningMode === "mic" || listeningMode === "tab") {
-        try {
-          if (listeningMode === "tab" && systemAudioTrackRef.current) {
-            recognitionRef.current.start(systemAudioTrackRef.current);
-          } else if (listeningMode === "mic" && micProcessedTrackRef.current) {
-            recognitionRef.current.start(micProcessedTrackRef.current);
-          } else {
-            recognitionRef.current.start();
-          }
-        } catch (e) {}
-      }
+      paraformerSessionRef.current?.resume();
     } else {
       setIsPaused(true);
       isPausedRef.current = true;
-      if (listeningMode === "mic" || listeningMode === "tab") {
-        try {
-          recognitionRef.current.stop();
-        } catch (e) {}
-      }
+      // 暂停只挂起音频上行；Paraformer 会话保持打开，避免重复 task-started。
+      paraformerSessionRef.current?.pause();
     }
   };
+
+  // ---- 全局快捷键 ---------------------------------------------------------
+  // 用 ref 拿最新闭包，避免每次重新绑定 listener
+  const shortcutHandlersRef = useRef({});
+  shortcutHandlersRef.current = {
+    listeningMode,
+    togglePause,
+    toggleMicMode,
+    startTabMode,
+    stopTabMode,
+  };
+
+  useEffect(() => {
+    const isFromInput = (target) => {
+      if (!target) return false;
+      const tag = target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+      if (target.isContentEditable) return true;
+      return false;
+    };
+
+    const onKeyDown = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (isFromInput(e.target)) return;
+
+      const h = shortcutHandlersRef.current;
+
+      switch (e.code) {
+        case "Space": {
+          if (h.listeningMode === "none") return;
+          e.preventDefault();
+          h.togglePause();
+          break;
+        }
+        case "KeyM": {
+          e.preventDefault();
+          h.toggleMicMode();
+          break;
+        }
+        case "KeyT": {
+          e.preventDefault();
+          if (h.listeningMode === "tab") h.stopTabMode();
+          else h.startTabMode();
+          break;
+        }
+        case "Escape": {
+          if (h.listeningMode === "none") return;
+          e.preventDefault();
+          if (h.listeningMode === "mic") h.toggleMicMode();
+          else if (h.listeningMode === "tab") h.stopTabMode();
+          break;
+        }
+        default:
+          return;
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const clearTranscripts = () => {
     setTranscripts([]);
@@ -2076,16 +3336,42 @@ export default function App() {
     window.localStorage.setItem(GLOSSARY_STORAGE_KEY, JSON.stringify(nextPairs));
     setGlossaryError("");
     setActiveView("home");
+
+    // 后台异步把术语同步成 Paraformer 热词词典；本地正则纠错已立刻生效，
+    // 这一步影响下一次 ASR 会话的声学层偏置。
+    syncGlossaryToParaformerVocabulary(nextPairs)
+      .then((res) => {
+        if (res?.changed) {
+          pushToast({
+            level: "success",
+            text: res.vocabularyId
+              ? "热词词典已同步到 Paraformer，下次开启同传即生效。"
+              : "热词词典已清空。",
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn("vocabulary sync failed:", err);
+        pushToast({
+          level: "warn",
+          text: `热词同步到 Paraformer 失败：${err.message}（本地纠错已生效，可稍后重试）`,
+          ttl: 7000,
+        });
+      });
   };
 
   const openModelConfigModal = () => {
     setModelSuccessMsg("");
     setModelDraft(runtimeModelName);
+    setRealtimeModelDraft(runtimeRealtimeModelName);
+    setSummaryModelDraft(runtimeSummaryModelName);
     setActiveView("modelConfig");
   };
 
   const handleSaveModelConfig = () => {
     setGlobalModelName(modelDraft);
+    setGlobalRealtimeModelName(realtimeModelDraft);
+    setGlobalSummaryModelName(summaryModelDraft);
     setModelSuccessMsg("模型配置已保存并立即生效！");
     setTimeout(() => {
       setModelSuccessMsg("");
@@ -2099,6 +3385,10 @@ export default function App() {
     setGlossaryDraft("");
     setGlossaryError("");
     window.localStorage.removeItem(GLOSSARY_STORAGE_KEY);
+
+    syncGlossaryToParaformerVocabulary([]).catch((err) => {
+      console.warn("vocabulary clear failed:", err);
+    });
   };
 
   const openSavedSessions = async () => {
@@ -2252,7 +3542,7 @@ export default function App() {
         <div className="bg-white p-8 rounded-2xl shadow-xl max-w-md text-center border border-red-100">
           <AlertCircle className="w-12 h-12 text-red-500 mx-auto mb-4" />
           <h2 className="text-xl font-bold text-gray-800 mb-2">浏览器不支持</h2>
-          <p className="text-gray-600">{errorMsg}</p>
+          <p className="text-gray-600">{unsupportedReason}</p>
         </div>
       </div>
     );
@@ -2288,23 +3578,23 @@ export default function App() {
       : 0;
 
   return (
-    <div className="h-screen bg-slate-50 flex font-sans relative overflow-hidden">
+    <div className="h-screen flex font-sans relative overflow-hidden text-slate-100">
       <aside
         style={{ width: `${isSidebarCollapsed ? 72 : sidebarWidth}px` }}
-        className="h-full bg-white border-r border-slate-200 shadow-sm shrink-0 relative"
+        className="ct-sidebar h-full shrink-0 relative"
       >
         <div className="h-full flex flex-col">
-          <div className={`border-b border-slate-100 ${isSidebarCollapsed ? "px-2 py-3" : "px-4 py-4"}`}>
+          <div className={`border-b border-white/10 ${isSidebarCollapsed ? "px-2 py-3" : "px-4 py-4"}`}>
             <div className="flex items-center justify-between gap-2">
               {!isSidebarCollapsed && (
                 <div>
-                  <h2 className="text-lg font-bold text-slate-800">ClassTrans Pro</h2>
-                  <p className="text-xs text-slate-500 mt-1">课堂控制台</p>
+                  <h2 className="text-lg font-bold text-slate-100 tracking-tight">ClassTrans Pro</h2>
+                  <p className="text-xs text-slate-400 mt-1">课堂控制台</p>
                 </div>
               )}
               <button
                 onClick={toggleSidebarCollapse}
-                className="h-8 w-8 rounded-lg border border-slate-200 text-slate-500 hover:text-indigo-600 hover:border-indigo-200 hover:bg-indigo-50 flex items-center justify-center"
+                className="h-8 w-8 rounded-lg border border-white/10 text-slate-400 hover:text-indigo-300 hover:border-indigo-400/40 hover:bg-indigo-500/10 flex items-center justify-center transition-colors"
                 title={isSidebarCollapsed ? "展开侧栏" : "收起侧栏"}
               >
                 {isSidebarCollapsed ? <ChevronsRight className="w-4 h-4" /> : <ChevronsLeft className="w-4 h-4" />}
@@ -2317,8 +3607,8 @@ export default function App() {
               onClick={() => setActiveView("home")}
               className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
                 activeView === "home"
-                  ? "bg-indigo-50 text-indigo-700 border-indigo-200"
-                  : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
+                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
               }`}
               title="首页（同传）"
             >
@@ -2328,7 +3618,7 @@ export default function App() {
 
             <button
               onClick={pickSessionFolder}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100 transition-colors`}
+              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border bg-emerald-500/12 text-emerald-300 border-emerald-400/30 hover:bg-emerald-500/20 transition-colors`}
               title={sessionFolderName ? `保存文件夹：${sessionFolderName}` : "保存文件夹"}
             >
               <FolderOpen className="w-4 h-4 shrink-0" />
@@ -2339,8 +3629,8 @@ export default function App() {
               onClick={openSavedSessions}
               className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
                 activeView === "saved"
-                  ? "bg-indigo-50 text-indigo-700 border-indigo-200"
-                  : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
+                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
               }`}
               title="查看已保存"
             >
@@ -2352,8 +3642,8 @@ export default function App() {
               onClick={openGlossaryModal}
               className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
                 activeView === "glossary"
-                  ? "bg-indigo-50 text-indigo-700 border-indigo-200"
-                  : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
+                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
               }`}
               title="术语词典"
             >
@@ -2365,18 +3655,31 @@ export default function App() {
               onClick={openModelConfigModal}
               className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
                 activeView === "modelConfig"
-                  ? "bg-indigo-50 text-indigo-700 border-indigo-200"
-                  : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
+                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
               }`}
               title="配置模型"
             >
               <Cpu className="w-4 h-4 shrink-0" />
               {!isSidebarCollapsed && <span>配置模型</span>}
             </button>
+
+            <button
+              onClick={() => setActiveView("usage")}
+              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
+                activeView === "usage"
+                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
+                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
+              }`}
+              title="AI 用量"
+            >
+              <Activity className="w-4 h-4 shrink-0" />
+              {!isSidebarCollapsed && <span>AI 用量</span>}
+            </button>
           </div>
 
           {!isSidebarCollapsed && (
-            <div className="px-3 py-3 border-t border-slate-100 text-xs text-slate-500">
+            <div className="px-3 py-3 border-t border-white/10 text-xs text-slate-400">
               {sessionFolderName
                 ? `当前目录：${sessionFolderName}`
                 : "当前为临时转录模式（未选择保存目录）"}
@@ -2387,32 +3690,32 @@ export default function App() {
         {!isSidebarCollapsed && (
           <div
             onMouseDown={startSidebarResize}
-            className="absolute top-0 right-0 h-full w-1.5 cursor-col-resize hover:bg-indigo-200/70 transition-colors"
+            className="absolute top-0 right-0 h-full w-1.5 cursor-col-resize hover:bg-indigo-400/30 transition-colors"
             title="拖拽调整侧栏宽度"
           />
         )}
       </aside>
 
       <div className="flex-1 flex flex-col min-w-0 relative overflow-hidden">
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-10 shadow-sm shrink-0">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
+      <header className="ct-header sticky top-0 z-10 shrink-0">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
           <div className="flex items-center space-x-3 w-full lg:w-auto justify-center lg:justify-start">
-            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-inner relative overflow-hidden shrink-0">
-              <Globe className="w-6 h-6 text-white relative z-10" />
-              <div className="absolute inset-0 bg-gradient-to-tr from-indigo-600 to-purple-500 z-0"></div>
+            <div className="w-10 h-10 rounded-xl flex items-center justify-center relative overflow-hidden shrink-0 border border-white/10 shadow-[0_6px_20px_-6px_rgba(99,102,241,0.5)]">
+              <div className="absolute inset-0 bg-gradient-to-tr from-indigo-500 to-purple-500 z-0"></div>
+              <Globe className="w-5 h-5 text-white relative z-10" />
             </div>
             <div>
-              <h1 className="text-lg font-bold text-slate-800 leading-tight flex items-center">
+              <h1 className="text-lg font-bold text-slate-100 leading-tight flex items-center tracking-tight">
                 ClassTrans{" "}
-                <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-purple-600 ml-1">
+                <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-300 to-purple-300 ml-1">
                   Pro
                 </span>
               </h1>
-              <p className="text-xs text-slate-500 font-medium">
+              <p className="text-xs text-slate-400 font-medium">
                 同传翻译 · 智能纪要
               </p>
               {!sessionFolderHandle && (
-                <p className="text-[11px] text-amber-600 font-medium mt-0.5">
+                <p className="text-[11px] text-amber-300 font-medium mt-0.5">
                   当前为临时转录模式（未绑定保存文件夹）
                 </p>
               )}
@@ -2427,7 +3730,7 @@ export default function App() {
                   fetchDevices();
                   setIsDeviceMenuOpen(!isDeviceMenuOpen);
                 }}
-                className="flex items-center space-x-1 px-3 py-1.5 bg-slate-100 text-slate-600 rounded-lg text-xs font-medium hover:bg-slate-200 transition-colors max-w-[150px] truncate border border-slate-200"
+                className="flex items-center space-x-1 px-3 py-1.5 bg-white/[0.06] text-slate-300 rounded-lg text-xs font-medium hover:bg-white/[0.10] transition-colors max-w-[150px] truncate border border-white/10"
                 title="选择录音设备"
               >
                 <Settings className="w-3 h-3 shrink-0" />
@@ -2436,9 +3739,9 @@ export default function App() {
               </button>
 
               {isDeviceMenuOpen && (
-                <div className="absolute top-full left-0 mt-1 w-64 bg-white border border-slate-100 rounded-xl shadow-lg z-50 py-1 max-h-64 overflow-y-auto">
+                <div className="absolute top-full left-0 mt-1 w-64 ct-glass-strong rounded-xl shadow-2xl z-50 py-1 max-h-64 overflow-y-auto">
                   {devices.length === 0 ? (
-                    <div className="px-4 py-3 text-xs text-slate-500">
+                    <div className="px-4 py-3 text-xs text-slate-400">
                       未检测到麦克风，请检查权限
                     </div>
                   ) : (
@@ -2446,10 +3749,10 @@ export default function App() {
                       <button
                         key={device.deviceId}
                         onClick={() => handleDeviceChange(device.deviceId)}
-                        className={`w-full text-left px-4 py-2 text-xs hover:bg-indigo-50 hover:text-indigo-700 transition-colors truncate ${
+                        className={`w-full text-left px-4 py-2 text-xs hover:bg-indigo-500/15 hover:text-indigo-200 transition-colors truncate ${
                           selectedDeviceId === device.deviceId
-                            ? "bg-indigo-50/50 text-indigo-600 font-semibold"
-                            : "text-slate-700"
+                            ? "bg-indigo-500/15 text-indigo-200 font-semibold"
+                            : "text-slate-300"
                         }`}
                       >
                         {device.label ||
@@ -2464,7 +3767,7 @@ export default function App() {
             {transcripts.length > 0 && (
               <button
                 onClick={handleGenerateSummary}
-                className="flex items-center space-x-1 p-2 bg-purple-50 text-purple-600 hover:bg-purple-100 rounded-lg transition-colors text-sm font-medium border border-purple-100"
+                className="flex items-center space-x-1 p-2 bg-purple-500/12 text-purple-200 hover:bg-purple-500/20 rounded-lg transition-colors text-sm font-medium border border-purple-400/30"
                 title="AI 一键生成课堂纪要"
               >
                 <FileText className="w-4 h-4" />
@@ -2472,12 +3775,12 @@ export default function App() {
               </button>
             )}
 
-            <div className="h-6 w-px bg-slate-200 mx-1 hidden sm:block"></div>
+            <div className="h-6 w-px bg-white/10 mx-1 hidden sm:block"></div>
 
             {transcripts.length > 0 && (
               <button
                 onClick={handleManualSaveSession}
-                className="p-2 text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 rounded-lg transition-colors flex items-center justify-center border border-transparent hover:border-emerald-100"
+                className="p-2 text-slate-400 hover:text-emerald-300 hover:bg-emerald-500/12 rounded-lg transition-colors flex items-center justify-center border border-transparent hover:border-emerald-400/30"
                 title="保存当前同传到所选文件夹"
               >
                 <Save className="w-4 h-4" />
@@ -2488,8 +3791,8 @@ export default function App() {
               onClick={togglePip}
               className={`p-2 rounded-lg transition-colors flex items-center justify-center border ${
                 pipWindow
-                  ? "bg-indigo-100 text-indigo-700 border-indigo-200"
-                  : "text-slate-500 border-transparent hover:text-slate-700 hover:bg-slate-100 hover:border-slate-200"
+                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
+                  : "text-slate-400 border-transparent hover:text-slate-100 hover:bg-white/[0.06] hover:border-white/10"
               }`}
               title={pipWindow ? "关闭悬浮气泡字幕" : "开启悬浮气泡字幕"}
             >
@@ -2498,7 +3801,7 @@ export default function App() {
 
             <button
               onClick={clearTranscripts}
-              className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors border border-transparent hover:border-rose-100"
+              className="p-2 text-slate-500 hover:text-rose-300 hover:bg-rose-500/12 rounded-lg transition-colors border border-transparent hover:border-rose-400/30"
               title="清空所有记录"
             >
               <Trash2 className="w-4 h-4" />
@@ -2507,18 +3810,19 @@ export default function App() {
             {listeningMode === "none" ? (
               <button
                 onClick={startTabMode}
-                className="flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-purple-600 text-white hover:bg-purple-700 hover:shadow-md"
-                title="系统音频录制：点击后在弹窗选择 Chrome 标签页 或 窗口"
+                className="ct-btn-tab flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all"
+                title="系统音频录制（快捷键 T）：点击后在弹窗选择 Chrome 标签页 或 窗口"
               >
                 <Headphones className="w-4 h-4" />
                 <span>系统音频</span>
+                <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-white/20 text-[10px] font-mono rounded border border-white/30">T</kbd>
               </button>
             ) : (
               <div className="flex items-center space-x-2 shrink-0">
-                <div className="flex items-center justify-center px-3 py-1.5 bg-slate-800 text-white rounded-lg text-sm font-mono font-bold tracking-wider shadow-inner border border-slate-700 ml-1">
+                <div className="flex items-center justify-center px-3 py-1.5 bg-black/40 text-slate-100 rounded-lg text-sm font-mono font-bold tracking-wider border border-white/10 ml-1">
                   <span
                     className={`w-2 h-2 rounded-full mr-2 ${
-                      isPaused ? "bg-amber-400" : "bg-rose-500 animate-pulse"
+                      isPaused ? "bg-amber-300" : "bg-rose-400 animate-pulse"
                     }`}
                   ></span>
                   {formatTime(recordingTime)}
@@ -2527,27 +3831,33 @@ export default function App() {
                 {isPaused ? (
                   <button
                     onClick={togglePause}
-                    className="flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-emerald-500 text-white hover:bg-emerald-600 hover:shadow-md"
+                    title="继续收音（Space）"
+                    className="ct-btn-success flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm"
                   >
                     <Play className="w-4 h-4 fill-current" />
                     <span className="hidden sm:inline">继续收音</span>
+                    <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-white/20 text-[10px] font-mono rounded border border-white/30">Space</kbd>
                   </button>
                 ) : (
                   <button
                     onClick={togglePause}
-                    className="flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-amber-100 text-amber-700 hover:bg-amber-200 border border-amber-200"
+                    title="暂时挂起（Space）"
+                    className="ct-btn-warn flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm"
                   >
                     <Pause className="w-4 h-4 fill-current" />
                     <span className="hidden sm:inline">暂时挂起</span>
+                    <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-amber-300/15 text-[10px] font-mono rounded border border-amber-300/40">Space</kbd>
                   </button>
                 )}
-                
+
                 <button
                   onClick={listeningMode === "mic" ? toggleMicMode : stopTabMode}
-                  className="flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-rose-100 text-rose-700 hover:bg-rose-200 border border-rose-200"
+                  title="彻底停止（Esc）"
+                  className="ct-btn-danger flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm"
                 >
                   <Square className="w-4 h-4 fill-current" />
                   <span className="hidden sm:inline">彻底停止</span>
+                  <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-rose-300/15 text-[10px] font-mono rounded border border-rose-300/40">Esc</kbd>
                 </button>
               </div>
             )}
@@ -2555,41 +3865,159 @@ export default function App() {
 
             <div className="shrink-0">
               {listeningMode === "none" ? (
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={handleMicEntryClick}
-                    className="flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-md"
-                    title="点击选择麦克风设备"
-                  >
-                    <Mic className="w-4 h-4" />
-                    <span>选择麦克风</span>
-                  </button>
-                  <button
-                    onClick={toggleMicMode}
-                    className="flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all shadow-sm bg-emerald-600 text-white hover:bg-emerald-700 hover:shadow-md"
-                    title="点击开始语音转录"
-                  >
-                    <Play className="w-4 h-4" />
-                    <span>开始语音转录</span>
-                  </button>
-                </div>
+                <button
+                  onClick={toggleMicMode}
+                  className="ct-btn-success flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm"
+                  title="开始语音转录（快捷键 M）。设备从左侧下拉菜单选择。"
+                >
+                  <Play className="w-4 h-4" />
+                  <span>开始语音转录</span>
+                  <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-white/20 text-[10px] font-mono rounded border border-white/30">M</kbd>
+                </button>
               ) : null}
             </div>
           </div>
         </div>
       </header>
 
-      {errorMsg && (
-        <div className="max-w-4xl mx-auto w-full px-4 mt-4 shrink-0">
-          <div className="bg-rose-50 border-l-4 border-rose-500 p-4 rounded-r-lg flex items-start">
-            <AlertCircle className="w-5 h-5 text-rose-500 mt-0.5 mr-3 flex-shrink-0" />
-            <p className="text-sm text-rose-700">{errorMsg}</p>
+      {toasts.length > 0 && (
+        <div className="fixed top-4 right-4 z-[60] flex flex-col gap-2 w-[min(22rem,calc(100vw-2rem))] pointer-events-none">
+          {toasts.map((t) => {
+            const styles =
+              t.level === "error"
+                ? "bg-rose-50/95 border-rose-200 text-rose-800"
+                : t.level === "warn"
+                ? "bg-amber-50/95 border-amber-200 text-amber-800"
+                : t.level === "success"
+                ? "bg-emerald-50/95 border-emerald-200 text-emerald-800"
+                : "bg-indigo-50/95 border-indigo-200 text-indigo-800";
+            return (
+              <div
+                key={t.id}
+                className={`ct-toast pointer-events-auto rounded-xl shadow-lg border px-4 py-3 flex items-start gap-3 backdrop-blur-sm ${styles}`}
+                role={t.level === "error" ? "alert" : "status"}
+              >
+                {(t.level === "error" || t.level === "warn") && (
+                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 opacity-80" />
+                )}
+                {t.level === "success" && (
+                  <Sparkles className="w-4 h-4 mt-0.5 shrink-0 opacity-80" />
+                )}
+                <p className="text-sm leading-relaxed flex-1 break-words">{t.text}</p>
+                <button
+                  onClick={() => dismissToast(t.id)}
+                  className="opacity-50 hover:opacity-90 -mr-1 -mt-1 px-1 leading-none text-lg"
+                  aria-label="关闭"
+                >
+                  ×
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <PipelineStatusCard
+        capture={{
+          icon: listeningMode === "tab" ? Headphones : Mic,
+          label:
+            listeningMode === "tab"
+              ? "系统音频"
+              : listeningMode === "mic"
+              ? "麦克风"
+              : "未收音",
+          state:
+            listeningMode === "none"
+              ? "idle"
+              : isPaused
+              ? "paused"
+              : "active",
+        }}
+        captureHint={
+          listeningMode === "none"
+            ? "未启动收音"
+            : isPaused
+            ? "已暂停（Space 恢复）"
+            : "正在收音"
+        }
+        asr={{
+          icon:
+            asrStatus === "error"
+              ? AlertCircle
+              : asrStatus === "connecting"
+              ? Loader2
+              : Activity,
+          label:
+            asrStatus === "live"
+              ? isPaused
+                ? "识别已暂停"
+                : "Paraformer"
+              : asrStatus === "connecting"
+              ? "连接中…"
+              : asrStatus === "error"
+              ? "识别异常"
+              : "未识别",
+          state:
+            asrStatus === "live"
+              ? isPaused
+                ? "paused"
+                : "active"
+              : asrStatus === "connecting"
+              ? "warn"
+              : asrStatus === "error"
+              ? "error"
+              : "idle",
+        }}
+        asrHint={
+          asrStatus === "error"
+            ? `识别异常：${asrErrorReason}`
+            : asrStatus === "connecting"
+            ? "正在握手 Paraformer 任务"
+            : asrStatus === "live"
+            ? isPaused
+              ? "暂停：音频帧不再上行"
+              : "Paraformer 实时识别中"
+            : "未识别"
+        }
+        polish={{
+          icon: Sparkles,
+          label: transcripts.some((t) => t.isTranslating || t.isStreamingPolish)
+            ? "AI 润色中"
+            : "润色就绪",
+          state: transcripts.some((t) => t.isTranslating || t.isStreamingPolish)
+            ? "active"
+            : "idle",
+        }}
+        realtime={{
+          icon: Globe,
+          label: listeningMode !== "none" && !isPaused ? "实时机翻" : "实时机翻",
+          state:
+            listeningMode !== "none" && !isPaused ? "active" : "idle",
+        }}
+      />
+
+      {activeView === "home" && homeBuckets.length >= 2 && (
+        <div className="hidden lg:flex fixed right-3 top-24 z-30 flex-col max-h-[50vh] w-[68px] bg-white/85 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-md p-1.5 gap-0.5 overflow-hidden">
+          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider text-center pb-1 border-b border-slate-100">
+            时间轴
+          </div>
+          <div className="flex-1 overflow-y-auto flex flex-col gap-0.5 pt-1">
+            {homeBuckets.map((b) => (
+              <button
+                key={b.startMs}
+                onClick={() => scrollToBucket(b.startMs)}
+                title={`${formatHHMM(b.startMs)} – ${formatHHMM(b.startMs + HOME_BUCKET_MS)} · ${b.count} 段`}
+                className="text-[11px] font-mono text-slate-500 hover:text-indigo-700 hover:bg-indigo-50 rounded-md px-1.5 py-1 transition-colors text-center"
+              >
+                {formatHHMM(b.startMs)}
+              </button>
+            ))}
           </div>
         </div>
       )}
 
       {isFinalizingSession && (
-        <div className="max-w-4xl mx-auto w-full px-4 mt-4 shrink-0">
+        <div className="max-w-6xl mx-auto w-full px-6 mt-4 shrink-0">
           <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-4">
             <div className="flex items-center justify-between text-sm font-semibold text-indigo-700 mb-2">
               <span>
@@ -2610,89 +4038,112 @@ export default function App() {
       )}
 
       {/* 注意：给 main 添加了 ref 和 onScroll 监听 */}
-      <main 
+      <main
         ref={mainRef}
         onScroll={handleMainScroll}
-        className="flex-1 max-w-4xl mx-auto w-full px-4 py-6 flex flex-col gap-4 overflow-y-auto"
+        className="flex-1 max-w-6xl mx-auto w-full px-6 py-8 flex flex-col gap-4 overflow-y-auto"
       >
         {activeView === "home" && (
           <>
         {transcripts.length === 0 && !activeEn && listeningMode === "none" && (
-          <div className="flex-1 flex flex-col items-center justify-center text-slate-400 opacity-60 mt-10 md:mt-20">
-            <Mic className="w-16 h-16 mb-4 stroke-[1.5] text-indigo-400" />
-            <p className="text-lg text-slate-600 font-medium">
+          <div className="flex-1 flex flex-col items-center justify-center mt-10 md:mt-20">
+            <div className="relative">
+              <div className="absolute inset-0 rounded-full bg-indigo-500/20 blur-2xl"></div>
+              <Mic className="w-16 h-16 mb-4 stroke-[1.5] text-indigo-300 relative" />
+            </div>
+            <p className="text-lg text-slate-200 font-medium tracking-wide mt-2">
               选择麦克风，点击右上角开始上课
             </p>
-            <div className="text-sm mt-4 text-center max-w-md bg-white p-4 rounded-xl border border-slate-100 shadow-sm leading-relaxed">
-              <strong className="text-slate-700">💡 如何翻译网课视频？</strong>
-              <br />
-              0. 可直接开始临时转录；若希望自动存档，再点顶部
-              <strong className="text-emerald-600">「选择保存文件夹」</strong>。
-              <br />
-              1. 推荐点
-              <strong className="text-purple-600">「系统音频」</strong>，在弹窗中选择
-              <strong className="text-purple-600">「Chrome 标签页」</strong>或
-              <strong className="text-purple-600">「窗口」</strong>并勾选共享音频。
-              <br />
-              2. 左侧下拉框选择{" "}
-              <strong className="text-indigo-500">
-                立体声混音/Stereo Mix
-              </strong>{" "}
-              或使用虚拟声卡（如 VB-Cable）。
-              <br />
-              3. 或者最简单的方法：直接用手机外放声音，让电脑麦克风听见即可！
+            <div className="ct-card text-sm mt-6 text-left max-w-md p-5 leading-relaxed text-slate-300">
+              <div className="text-slate-100 font-semibold mb-2">💡 如何翻译网课视频？</div>
+              <ol className="list-decimal pl-5 space-y-1.5">
+                <li>
+                  可直接开始临时转录；若希望自动存档，再点顶部
+                  <strong className="text-emerald-300">「选择保存文件夹」</strong>。
+                </li>
+                <li>
+                  推荐点
+                  <strong className="text-purple-300">「系统音频」</strong>，在弹窗中选择
+                  <strong className="text-purple-300">「Chrome 标签页」</strong>或
+                  <strong className="text-purple-300">「窗口」</strong>并勾选共享音频。
+                </li>
+                <li>
+                  左侧下拉框选择
+                  <strong className="text-indigo-300"> 立体声混音/Stereo Mix </strong>
+                  或使用虚拟声卡（如 VB-Cable）。
+                </li>
+                <li>
+                  或者最简单的方法：直接用手机外放声音，让电脑麦克风听见即可！
+                </li>
+              </ol>
             </div>
           </div>
         )}
 
-        {transcripts.map((item) => (
+        {homeRows.map((row) => {
+          if (row.kind === "separator") {
+            return (
+              <div
+                key={row.key}
+                id={`ct-bucket-${row.bucketStart}`}
+                className="flex items-center gap-3 my-1 shrink-0 scroll-mt-24"
+              >
+                <div className="flex-1 h-px bg-white/10" />
+                <div className="text-[11px] font-mono text-slate-400 tracking-wider px-3 py-0.5 rounded-full bg-white/[0.04] border border-white/10">
+                  {formatHHMM(row.bucketStart)} – {formatHHMM(row.bucketStart + HOME_BUCKET_MS)}
+                </div>
+                <div className="flex-1 h-px bg-white/10" />
+              </div>
+            );
+          }
+          const item = row.item;
+          return (
           <div
             key={item.id}
-            className={`bg-white rounded-2xl p-5 shadow-sm border transition-all hover:shadow-md shrink-0 ${
+            className={`ct-card p-5 shrink-0 ${
               item.isPolished
-                ? "border-purple-100/60 shadow-purple-900/5"
+                ? "ct-card-polished"
                 : item.lowConfidence
-                ? "border-amber-200 bg-amber-50/30"
-                : "border-slate-100"
+                ? "ct-card-low-confidence"
+                : ""
             }`}
           >
-            {/* 新增：显示已入库记录的发言人标签 */}
-            <div className="flex items-center text-xs font-semibold text-slate-500 mb-2 space-x-2">
-              <div className="flex items-center bg-slate-100 px-2.5 py-1 rounded-md border border-slate-200/60">
-                <User className="w-3 h-3 mr-1 text-slate-400" />
+            <div className="flex items-center text-xs font-semibold mb-2 space-x-2">
+              <div className="ct-speaker-pill">
+                <User className="w-3 h-3 opacity-70" />
                 {item.speaker || "👩‍🏫 主讲人"}
               </div>
             </div>
-            
-            <div className="flex items-start mb-2">
+
+            <div className="flex items-start mb-2 gap-3">
               <div
-                className={`text-sm md:text-base font-medium pr-8 leading-relaxed font-sans ${
+                className={`text-sm md:text-base font-medium pr-2 leading-relaxed font-sans flex-1 ${
                   item.isPolished || item.fromTab
-                    ? "text-slate-600"
-                    : "text-slate-400"
+                    ? "ct-subtitle-en-polished"
+                    : "ct-subtitle-en"
                 }`}
               >
                 {item.en}
               </div>
-              <div className="ml-auto flex flex-col sm:flex-row items-end sm:items-center space-y-1 sm:space-y-0 sm:space-x-2">
+              <div className="ml-auto flex flex-col sm:flex-row items-end sm:items-center gap-1 sm:gap-2 shrink-0">
                 {item.lowConfidence && (
-                  <div className="flex-shrink-0 flex items-center text-xs font-semibold text-amber-700 bg-amber-100 px-2 py-1 rounded-md border border-amber-200">
-                    <AlertCircle className="w-3 h-3 mr-1" /> 低置信度
+                  <div className="ct-tag ct-tag-warn">
+                    <AlertCircle className="w-3 h-3" /> 低置信度
                   </div>
                 )}
                 {item.isPolished && (
-                  <div className="flex-shrink-0 flex items-center text-xs font-semibold text-purple-500 bg-purple-50 px-2 py-1 rounded-md border border-purple-100">
-                    <Sparkles className="w-3 h-3 mr-1" /> AI精调
+                  <div className="ct-tag ct-tag-polish">
+                    <Sparkles className="w-3 h-3" /> AI 精调
                   </div>
                 )}
               </div>
             </div>
 
-            <div className="relative min-h-[1.5rem]">
+            <div className="relative min-h-[1.75rem]">
               {item.isTranslating ? (
-                <div className="flex items-center space-x-2 text-purple-500 text-sm mt-1">
+                <div className="flex items-center space-x-2 text-violet-300 text-sm mt-1">
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span className="opacity-60 line-through mr-2 text-slate-400">
+                  <span className="opacity-50 line-through mr-2 text-slate-500">
                     {item.zh !== "..." && !item.zh.startsWith("[")
                       ? item.zh
                       : ""}
@@ -2705,72 +4156,63 @@ export default function App() {
                 </div>
               ) : (
                 <div
-                  className={`text-lg md:text-xl font-bold leading-relaxed tracking-wide ${
-                    item.isPolished || item.fromTab
-                      ? "text-slate-800"
-                      : "text-slate-600"
+                  className={`text-lg md:text-2xl font-bold leading-relaxed tracking-wide ct-subtitle-zh ${
+                    item.isStreamingPolish ? "ct-subtitle-zh-streaming" : ""
                   } ${
-                    // 修复 6：容错保护主界面的渲染崩溃问题
                     (item.en || "").includes("⚠️")
-                      ? "text-rose-600 text-sm font-medium"
+                      ? "text-rose-300 text-sm font-medium"
                       : ""
                   }`}
                 >
-                  {item.zh}
+                  {item.isStreamingPolish ? (
+                    <StreamingText value={item.zh} animate withCursor />
+                  ) : (
+                    item.zh
+                  )}
                 </div>
               )}
             </div>
           </div>
-        ))}
+          );
+        })}
 
         {(listeningMode === "mic" || listeningMode === "tab") && (activeEn || isPaused) && (
           <div
-            className={`bg-white rounded-2xl p-5 shadow-sm border-2 transition-all relative overflow-hidden shrink-0 ${
-              isPaused
-                ? "bg-amber-50/50 border-amber-200"
-                : activeConfidence < 0.65
-                ? "bg-amber-50/40 border-amber-200"
-                : "bg-indigo-50/40 border-indigo-100"
-            }`}
+            className={`ct-card-active p-5 shrink-0 ${isPaused ? "is-paused" : ""}`}
           >
-            {!isPaused && (
-              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500/0 via-indigo-400/30 to-indigo-500/0 animate-[pulse_2s_ease-in-out_infinite]"></div>
-            )}
-
-            {/* 正在收音时，固定显示分析中 */}
-            <div className="flex items-center text-xs font-bold text-indigo-500 mb-2 space-x-2">
-              <div className="flex items-center bg-indigo-100/60 px-2.5 py-1 rounded-md border border-indigo-200/60">
-                <User className="w-3 h-3 mr-1" />
+            <div className="flex items-center text-xs font-bold mb-2 space-x-2">
+              <div className="ct-tag ct-tag-info">
+                <User className="w-3 h-3" />
                 {listeningMode === "tab" ? "🎧 系统音频解析中..." : "🕵️ 语境分析中..."}
               </div>
             </div>
 
-            <div className="text-slate-500 text-sm md:text-base font-medium mb-2 pr-8 leading-relaxed font-sans">
+            <div className="text-slate-300 text-sm md:text-base font-medium mb-2 pr-8 leading-relaxed font-sans">
               <div>
                 {activeEn}
                 {!isPaused && (
-                  <span className="inline-block w-1.5 h-4 ml-1 align-middle bg-indigo-400 animate-pulse"></span>
+                  <span className="inline-block w-1.5 h-4 ml-1 align-middle bg-indigo-300 animate-pulse rounded-sm"></span>
                 )}
               </div>
               {!isPaused && activeEn && activeConfidence < 0.65 && (
-                <div className="mt-2 inline-flex items-center text-xs font-semibold text-amber-700 bg-amber-100 px-2 py-1 rounded-md border border-amber-200">
-                  <AlertCircle className="w-3 h-3 mr-1" /> 当前片段噪声较高，建议靠近麦克风
+                <div className="mt-2 inline-flex items-center ct-tag ct-tag-warn">
+                  <AlertCircle className="w-3 h-3" /> 当前片段噪声较高，建议靠近麦克风
                 </div>
               )}
             </div>
 
-            <div className="relative min-h-[1.5rem]">
+            <div className="relative min-h-[1.75rem]">
               {isPaused ? (
-                <div className="flex items-center space-x-2 text-amber-600 text-sm font-medium">
+                <div className="flex items-center space-x-2 text-amber-300 text-sm font-medium">
                   <Pause className="w-4 h-4" />
-                  <span>{listeningMode === "tab" ? "系统音频解析已挂起" : "录音已挂起，点击右上角继续"}</span>
+                  <span>{listeningMode === "tab" ? "系统音频解析已挂起" : "录音已挂起，按 Space 继续"}</span>
                 </div>
               ) : activeZh ? (
-                <div className="text-indigo-900 text-lg md:text-xl font-bold leading-relaxed tracking-wide transition-all duration-300">
+                <div className="text-indigo-100 text-lg md:text-2xl font-bold leading-relaxed tracking-wide transition-all duration-300 ct-subtitle-zh ct-subtitle-zh-streaming">
                   {activeZh}
                 </div>
               ) : (
-                <div className="flex items-center space-x-2 text-indigo-400 text-sm font-medium">
+                <div className="flex items-center space-x-2 text-indigo-300 text-sm font-medium">
                   <Loader2 className="w-4 h-4 animate-spin" />
                   <span>实时极速机译跟进中...</span>
                 </div>
@@ -2784,28 +4226,28 @@ export default function App() {
         )}
 
         {activeView === "saved" && (
-          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex min-h-[70vh]">
-            <div className="w-72 border-r border-slate-100 bg-slate-50 flex flex-col shrink-0">
-              <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
-                <h3 className="font-bold text-slate-800 text-sm">已保存会话</h3>
+          <div className="ct-panel overflow-hidden flex min-h-[78vh]">
+            <div className="w-72 border-r border-white/10 bg-white/[0.02] flex flex-col shrink-0">
+              <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
+                <h3 className="font-bold text-slate-100 text-sm">已保存会话</h3>
                 <button
                   onClick={openSavedSessions}
-                  className="text-xs px-2 py-1 rounded-md border border-slate-200 text-slate-600 hover:bg-slate-100"
+                  className="text-xs px-2.5 py-1 rounded-md border border-white/10 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
                 >
                   刷新
                 </button>
               </div>
-              <div className="px-3 py-2 border-b border-slate-100 bg-white">
+              <div className="px-3 py-2 border-b border-white/10">
                 <input
                   value={savedSessionsQuery}
                   onChange={(e) => setSavedSessionsQuery(e.target.value)}
                   placeholder="搜索标题 / 关键词"
-                  className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                  className="ct-input w-full text-xs px-3 py-2"
                 />
               </div>
               <div className="overflow-y-auto flex-1">
                 {filteredSavedSessions.length === 0 ? (
-                  <p className="text-xs text-slate-500 px-4 py-5">
+                  <p className="text-xs text-slate-400 px-4 py-5">
                     {allSavedSessions.length === 0 ? "暂无已保存会话。" : "未匹配到相关会话。"}
                   </p>
                 ) : (
@@ -2813,13 +4255,17 @@ export default function App() {
                     <button
                       key={session.fileName}
                       onClick={() => setSelectedSavedSession(session)}
-                      className={`w-full text-left px-4 py-3 border-b border-slate-100 hover:bg-indigo-50 transition-colors ${
+                      className={`w-full text-left px-4 py-3 border-b border-white/5 transition-colors ${
                         selectedSavedSession?.fileName === session.fileName
-                          ? "bg-indigo-50"
-                          : "bg-transparent"
+                          ? "bg-indigo-500/12"
+                          : "bg-transparent hover:bg-white/[0.04]"
                       }`}
                     >
-                      <div className="text-xs font-semibold text-slate-700 truncate">
+                      <div className={`text-xs font-semibold truncate ${
+                        selectedSavedSession?.fileName === session.fileName
+                          ? "text-indigo-200"
+                          : "text-slate-200"
+                      }`}>
                         {session.title}
                         {session.isTemporary ? "（临时）" : ""}
                       </div>
@@ -2833,31 +4279,31 @@ export default function App() {
             </div>
 
             <div className="flex-1 flex flex-col min-w-0">
-              <div className="px-6 py-4 border-b border-slate-100 bg-white">
-                <h3 className="font-bold text-slate-800">
+              <div className="px-6 py-4 border-b border-white/10">
+                <h3 className="font-bold text-slate-100 text-base">
                   {selectedSavedSession?.title || "请选择左侧会话"}
                 </h3>
                 {selectedSavedSession && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 mt-1">
-                    <p className="text-xs text-slate-500">
+                  <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
+                    <p className="text-xs text-slate-400">
                       {new Date(selectedSavedSession.createdAt).toLocaleString()} · {selectedSavedSession.transcripts.length} 条转录
                     </p>
                     <div className="flex items-center gap-2">
                       <button
                         onClick={() => exportSavedSessionToWord(selectedSavedSession)}
-                        className="text-xs px-2.5 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700"
+                        className="ct-btn-primary text-xs px-3 py-1.5 rounded-md font-semibold"
                       >
                         导出 Word
                       </button>
                       <button
                         onClick={() => exportSavedSessionToPdf(selectedSavedSession)}
-                        className="text-xs px-2.5 py-1.5 rounded-md bg-slate-700 text-white hover:bg-slate-800"
+                        className="ct-btn-ghost text-xs px-3 py-1.5 rounded-md font-semibold"
                       >
                         导出 PDF
                       </button>
                       <button
                         onClick={() => handleDeleteSavedSession(selectedSavedSession)}
-                        className="text-xs px-2.5 py-1.5 rounded-md bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100"
+                        className="ct-btn-danger text-xs px-3 py-1.5 rounded-md font-semibold"
                       >
                         删除
                       </button>
@@ -2868,13 +4314,13 @@ export default function App() {
 
               <div className="flex-1 overflow-y-auto p-6 space-y-5">
                 {!selectedSavedSession ? (
-                  <div className="text-sm text-slate-500">选择一条会话后，这里会展示转录内容与课堂纪要。</div>
+                  <div className="text-sm text-slate-400">选择一条会话后，这里会展示转录内容与课堂纪要。</div>
                 ) : (
                   <>
-                    <div className="bg-indigo-50/60 border border-indigo-100 rounded-xl p-4">
-                      <h4 className="font-semibold text-indigo-900 mb-2">课堂纪要</h4>
+                    <div className="rounded-2xl border border-indigo-400/20 bg-indigo-500/[0.06] p-5">
+                      <h4 className="font-semibold text-indigo-200 mb-2">课堂纪要</h4>
                       <div
-                        className="text-sm text-slate-700 leading-relaxed break-words [&_h1]:text-xl [&_h1]:font-bold [&_h1]:text-slate-900 [&_h1]:mt-3 [&_h1]:mb-2 [&_h2]:text-lg [&_h2]:font-semibold [&_h2]:text-slate-900 [&_h2]:mt-3 [&_h2]:mb-2 [&_h3]:text-base [&_h3]:font-semibold [&_h3]:text-slate-900 [&_h3]:mt-2 [&_h3]:mb-1 [&_p]:my-2 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-1 [&_blockquote]:border-l-4 [&_blockquote]:border-indigo-300 [&_blockquote]:bg-white/70 [&_blockquote]:px-3 [&_blockquote]:py-2 [&_blockquote]:rounded-r-md [&_code]:bg-slate-200 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:font-mono [&_pre]:bg-slate-900 [&_pre]:text-slate-100 [&_pre]:p-3 [&_pre]:rounded-lg [&_pre]:overflow-x-auto [&_pre]:my-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_hr]:my-3 [&_a]:text-indigo-700 [&_a]:underline"
+                        className="text-sm text-slate-200 leading-relaxed break-words [&_h1]:text-xl [&_h1]:font-bold [&_h1]:text-slate-100 [&_h1]:mt-3 [&_h1]:mb-2 [&_h2]:text-lg [&_h2]:font-semibold [&_h2]:text-slate-100 [&_h2]:mt-3 [&_h2]:mb-2 [&_h3]:text-base [&_h3]:font-semibold [&_h3]:text-slate-100 [&_h3]:mt-2 [&_h3]:mb-1 [&_p]:my-2 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-1 [&_blockquote]:border-l-4 [&_blockquote]:border-indigo-400 [&_blockquote]:bg-white/[0.03] [&_blockquote]:px-3 [&_blockquote]:py-2 [&_blockquote]:rounded-r-md [&_code]:bg-white/10 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:font-mono [&_pre]:bg-black/40 [&_pre]:text-slate-100 [&_pre]:p-3 [&_pre]:rounded-lg [&_pre]:overflow-x-auto [&_pre]:my-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_hr]:my-3 [&_hr]:border-white/10 [&_a]:text-indigo-300 [&_a]:underline"
                         dangerouslySetInnerHTML={{
                           __html: renderMarkdownToSafeHtml(
                             selectedSavedSession.summary || "（该会话未保存纪要）"
@@ -2884,15 +4330,18 @@ export default function App() {
                     </div>
 
                     <div className="space-y-3">
-                      <h4 className="font-semibold text-slate-800">转录内容</h4>
+                      <h4 className="font-semibold text-slate-100">转录内容</h4>
                       {selectedSavedSession.transcripts.length === 0 ? (
-                        <p className="text-sm text-slate-500">（该会话暂无转录内容）</p>
+                        <p className="text-sm text-slate-400">（该会话暂无转录内容）</p>
                       ) : (
                         selectedSavedSession.transcripts.map((item, idx) => (
-                          <div key={`${selectedSavedSession.fileName}-${idx}`} className="border border-slate-100 rounded-xl p-4 bg-white">
-                            <div className="text-xs text-slate-500 font-semibold mb-2">{item.speaker || "👩‍🏫 主讲人"}</div>
-                            <div className="text-sm text-slate-600 leading-relaxed">{item.en}</div>
-                            <div className="text-base text-slate-900 font-semibold mt-2 leading-relaxed">{item.zh}</div>
+                          <div key={`${selectedSavedSession.fileName}-${idx}`} className="ct-card p-4">
+                            <div className="ct-speaker-pill mb-2">
+                              <User className="w-3 h-3 opacity-70" />
+                              {item.speaker || "👩‍🏫 主讲人"}
+                            </div>
+                            <div className="ct-subtitle-en text-sm leading-relaxed">{item.en}</div>
+                            <div className="ct-subtitle-zh text-base font-semibold mt-2 leading-relaxed">{item.zh}</div>
                           </div>
                         ))
                       )}
@@ -2905,13 +4354,13 @@ export default function App() {
         )}
 
         {activeView === "glossary" && (
-          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-4 min-h-[70vh]">
-            <h2 className="text-lg font-bold text-indigo-900">课堂术语词典</h2>
-            <p className="text-sm text-slate-600 leading-relaxed">
-              每行一条规则，格式：<span className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">原词 =&gt; 纠正词</span>。
-              保存后会立刻作用于实时英文识别。
+          <div className="ct-panel p-6 space-y-4 min-h-[78vh]">
+            <h2 className="text-lg font-bold text-slate-100 tracking-tight">课堂术语词典</h2>
+            <p className="text-sm text-slate-300 leading-relaxed">
+              每行一条规则，格式：<span className="font-mono bg-white/[0.06] text-slate-200 px-1.5 py-0.5 rounded border border-white/10">原词 =&gt; 纠正词</span>。
+              保存后会立刻作用于实时英文识别，并异步同步到 Paraformer 热词词典。
             </p>
-            <p className="text-xs text-slate-500">已启用自定义术语：{customGlossaryPairs.length} 条</p>
+            <p className="text-xs text-slate-400">已启用自定义术语：{customGlossaryPairs.length} 条</p>
 
             <textarea
               value={glossaryDraft}
@@ -2919,12 +4368,12 @@ export default function App() {
                 setGlossaryDraft(e.target.value);
                 if (glossaryError) setGlossaryError("");
               }}
-              className="w-full min-h-[360px] rounded-xl border border-slate-200 p-4 text-sm leading-relaxed font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              className="ct-textarea w-full min-h-[360px] p-4 text-sm leading-relaxed font-mono"
               placeholder={["chat g p t => ChatGPT", "open ai => OpenAI", "type script => TypeScript"].join("\n")}
             />
 
             {glossaryError && (
-              <div className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+              <div className="text-sm rounded-lg px-3 py-2 ct-tag-error" style={{ display: "block" }}>
                 {glossaryError}
               </div>
             )}
@@ -2932,13 +4381,13 @@ export default function App() {
             <div className="flex flex-wrap gap-2 justify-between">
               <button
                 onClick={handleClearGlossary}
-                className="text-sm px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100"
+                className="ct-btn-ghost text-sm px-4 py-2 rounded-lg font-semibold"
               >
                 清空自定义词典
               </button>
               <button
                 onClick={handleSaveGlossary}
-                className="text-sm px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+                className="ct-btn-primary text-sm px-4 py-2 rounded-lg font-semibold"
               >
                 保存并应用
               </button>
@@ -2947,23 +4396,62 @@ export default function App() {
         )}
 
         {activeView === "modelConfig" && (
-          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-4 min-h-[70vh]">
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-5 min-h-[70vh]">
             <h2 className="text-lg font-bold text-indigo-900">配置 AI 模型</h2>
             <p className="text-sm text-slate-600 leading-relaxed">
-              在这里可以配置自定义的 AI 模型名称。输入模型名称并保存，后续的转录将立刻使用新模型进行翻译和润色。
+              三个调用点各自可换模型。可以分别填入有免费额度的不同模型名，分摊到不同账户 / 不同免费配额上。保存后立即生效。
             </p>
-            <p className="text-xs text-slate-500">当前正在使用的模型：<span className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">{runtimeModelName}</span></p>
 
-            <input
-              type="text"
-              value={modelDraft}
-              onChange={(e) => {
-                setModelDraft(e.target.value);
-                if (modelSuccessMsg) setModelSuccessMsg("");
-              }}
-              className="w-full rounded-xl border border-slate-200 p-4 text-sm leading-relaxed font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
-              placeholder="例如: qwen3.5-122b-a10b"
-            />
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
+                <span>润色模型 <span className="text-slate-400 font-normal">（用于 finalize 后段的 polish 流式输出）</span></span>
+                <span className="text-[11px] text-slate-400">当前：<span className="font-mono">{runtimeModelName}</span></span>
+              </label>
+              <input
+                type="text"
+                value={modelDraft}
+                onChange={(e) => {
+                  setModelDraft(e.target.value);
+                  if (modelSuccessMsg) setModelSuccessMsg("");
+                }}
+                className="w-full rounded-xl border border-slate-200 p-3 text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                placeholder={`例如: ${DEFAULT_POLISH_MODEL}`}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
+                <span>实时机翻模型 <span className="text-slate-400 font-normal">（活气泡的快速 ZH 跟进 + finalize 兜底）</span></span>
+                <span className="text-[11px] text-slate-400">当前：<span className="font-mono">{runtimeRealtimeModelName || DEFAULT_REALTIME_MODEL}</span></span>
+              </label>
+              <input
+                type="text"
+                value={realtimeModelDraft}
+                onChange={(e) => {
+                  setRealtimeModelDraft(e.target.value);
+                  if (modelSuccessMsg) setModelSuccessMsg("");
+                }}
+                className="w-full rounded-xl border border-slate-200 p-3 text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                placeholder={`例如: ${DEFAULT_REALTIME_MODEL}`}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
+                <span>课堂纪要模型 <span className="text-slate-400 font-normal">（停止时生成总结；留空 = 跟随润色模型）</span></span>
+                <span className="text-[11px] text-slate-400">当前：<span className="font-mono">{runtimeSummaryModelName || `${runtimeModelName}（继承）`}</span></span>
+              </label>
+              <input
+                type="text"
+                value={summaryModelDraft}
+                onChange={(e) => {
+                  setSummaryModelDraft(e.target.value);
+                  if (modelSuccessMsg) setModelSuccessMsg("");
+                }}
+                className="w-full rounded-xl border border-slate-200 p-3 text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                placeholder="留空 = 复用润色模型"
+              />
+            </div>
 
             {modelSuccessMsg && (
               <div className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
@@ -2976,10 +4464,14 @@ export default function App() {
                 onClick={handleSaveModelConfig}
                 className="text-sm px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
               >
-                保存并应用新模型
+                保存并应用
               </button>
             </div>
           </div>
+        )}
+
+        {activeView === "usage" && (
+          <UsageView log={aiUsageLog} onClear={() => clearUsageLog()} />
         )}
       </main>
 

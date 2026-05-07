@@ -1,0 +1,11 @@
+name = "classtrans-asr-relay"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+# DASHSCOPE_API_KEY must be set as a secret:
+#   wrangler secret put DASHSCOPE_API_KEY
+#
+# ALLOWED_ORIGINS is optional; comma-separated list of exact Origin values
+# the relay will accept. Leave empty to allow any origin (dev only).
+[vars]
+ALLOWED_ORIGINS = ""
