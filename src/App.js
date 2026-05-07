@@ -667,35 +667,35 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 const getAdaptivePauseThreshold = (text) => {
   const cleanText = (text || "").trim();
-  if (!cleanText) return 1700;
+  if (!cleanText) return 2800;
 
   const wordCount = cleanText.split(/\s+/).filter(Boolean).length;
-  let threshold = 1700;
+  let threshold = 2800;
 
   // 短句更容易是“思考停顿”，延迟一点再截断，降低漏字率
-  if (wordCount <= 4) threshold += 700;
-  else if (wordCount <= 8) threshold += 350;
-  else if (wordCount >= 20) threshold -= 250;
+  if (wordCount <= 4) threshold += 1200;
+  else if (wordCount <= 8) threshold += 600;
+  else if (wordCount >= 20) threshold -= 300;
 
   // 若明显已成句，适当提前截断，减少延迟
-  if (/[.!?…]$/.test(cleanText)) threshold -= 450;
-  else if (/[,;:]$/.test(cleanText)) threshold += 250;
+  if (/[.!?…]$/.test(cleanText)) threshold -= 600;
+  else if (/[,;:]$/.test(cleanText)) threshold += 500;
 
   // 快速连续语流更容易被过早切段，适当延后截断，降低跨块吞字
   if (wordCount >= 12 && !/[.!?…]$/.test(cleanText)) {
-    threshold += 450;
+    threshold += 700;
   }
 
   const tailToken = cleanText.split(/\s+/).pop() || "";
   // 末词太短通常仍在抖动更新阶段（例如 "a", "to"），延后收口
   if (!/[.!?…]$/.test(cleanText) && tailToken.length > 0 && tailToken.length <= 2) {
-    threshold += 350;
+    threshold += 500;
   }
 
   // 超长 active 文本避免无限等待
-  if (cleanText.length > 160) threshold -= 350;
+  if (cleanText.length > 200) threshold -= 500;
 
-  return clamp(threshold, 1200, 3400);
+  return clamp(threshold, 2200, 5500);
 };
 
 const normalizeComparableText = (text) =>
