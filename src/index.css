@@ -75,6 +75,192 @@ body {
   background-attachment: fixed;
 }
 
+/* ========================================================================
+   Light theme overrides
+   ======================================================================== */
+
+:root[data-theme="light"] {
+  --ct-bg-deep: #f8fafc;
+  --ct-bg-deeper: #e2e8f0;
+
+  --ct-glass-1: rgba(15, 23, 42, 0.025);
+  --ct-glass-2: rgba(15, 23, 42, 0.045);
+  --ct-glass-3: rgba(15, 23, 42, 0.07);
+
+  --ct-card-bg: rgba(255, 255, 255, 0.85);
+  --ct-card-bg-strong: rgba(255, 255, 255, 0.94);
+
+  --ct-border-faint: rgba(15, 23, 42, 0.05);
+  --ct-border-soft: rgba(15, 23, 42, 0.10);
+  --ct-border-strong: rgba(15, 23, 42, 0.18);
+
+  --ct-text-1: #0f172a;
+  --ct-text-2: #1e293b;
+  --ct-text-3: #475569;
+  --ct-text-4: #64748b;
+  --ct-text-5: #94a3b8;
+
+  --ct-accent: #4f46e5;
+  --ct-accent-strong: #4338ca;
+  --ct-accent-soft: rgba(99, 102, 241, 0.22);
+  --ct-accent-bg: rgba(99, 102, 241, 0.10);
+  --ct-accent-violet: #6d28d9;
+  --ct-accent-cyan: #0891b2;
+
+  --ct-success: #047857;
+  --ct-success-bg: rgba(16, 185, 129, 0.10);
+  --ct-warn: #b45309;
+  --ct-warn-bg: rgba(251, 191, 36, 0.12);
+  --ct-error: #be123c;
+  --ct-error-bg: rgba(244, 63, 94, 0.08);
+
+  --ct-shadow-1: 0 4px 14px -4px rgba(15, 23, 42, 0.08);
+  --ct-shadow-2: 0 12px 32px -8px rgba(15, 23, 42, 0.14);
+  --ct-shadow-glow-indigo: 0 0 0 1px rgba(99, 102, 241, 0.25), 0 12px 32px rgba(99, 102, 241, 0.18);
+}
+
+:root[data-theme="light"] body {
+  background-image:
+    radial-gradient(1200px circle at 8% -10%, rgba(99, 102, 241, 0.10), transparent 55%),
+    radial-gradient(900px circle at 100% 25%, rgba(168, 85, 247, 0.08), transparent 55%),
+    radial-gradient(1100px circle at 50% 115%, rgba(56, 189, 248, 0.10), transparent 60%);
+}
+
+:root[data-theme="light"] ::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.03);
+}
+:root[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.12);
+}
+:root[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.22);
+}
+
+:root[data-theme="light"] ::selection {
+  background: rgba(99, 102, 241, 0.30);
+  color: #1e1b4b;
+}
+
+/* Re-skin specific glass surfaces that have hardcoded RGBA values */
+:root[data-theme="light"] .ct-header {
+  background: rgba(255, 255, 255, 0.78);
+}
+:root[data-theme="light"] .ct-sidebar {
+  background: rgba(255, 255, 255, 0.78);
+}
+:root[data-theme="light"] .ct-pipeline-card {
+  background: rgba(255, 255, 255, 0.86);
+}
+:root[data-theme="light"] .ct-card-active {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.14), rgba(168, 85, 247, 0.07));
+}
+:root[data-theme="light"] .ct-card-low-confidence {
+  background: rgba(251, 191, 36, 0.12);
+}
+:root[data-theme="light"] .ct-input,
+:root[data-theme="light"] .ct-textarea {
+  background: rgba(255, 255, 255, 0.85);
+  color: var(--ct-text-1);
+}
+
+/* ----------------------------------------------------------------------
+   Tailwind utility overrides (only what the JSX actually uses).
+   Selectors with brackets need escaping.
+   ---------------------------------------------------------------------- */
+
+/* text colors */
+:root[data-theme="light"] .text-slate-100 { color: #0f172a; }
+:root[data-theme="light"] .text-slate-200 { color: #1e293b; }
+:root[data-theme="light"] .text-slate-300 { color: #334155; }
+:root[data-theme="light"] .text-slate-400 { color: #64748b; }
+:root[data-theme="light"] .text-slate-500 { color: #94a3b8; }
+:root[data-theme="light"] .text-indigo-100 { color: #312e81; }
+:root[data-theme="light"] .text-indigo-200 { color: #3730a3; }
+:root[data-theme="light"] .text-indigo-300 { color: #4338ca; }
+:root[data-theme="light"] .text-purple-200,
+:root[data-theme="light"] .text-purple-300 { color: #6b21a8; }
+:root[data-theme="light"] .text-emerald-200,
+:root[data-theme="light"] .text-emerald-300 { color: #047857; }
+:root[data-theme="light"] .text-amber-300 { color: #b45309; }
+:root[data-theme="light"] .text-rose-300 { color: #be123c; }
+:root[data-theme="light"] .text-rose-400 { color: #e11d48; }
+:root[data-theme="light"] .text-violet-300 { color: #6b21a8; }
+
+/* white-on-dark surface tints flip to dark-on-light */
+:root[data-theme="light"] .bg-white\/\[0\.02\] { background-color: rgba(15, 23, 42, 0.02); }
+:root[data-theme="light"] .bg-white\/\[0\.03\] { background-color: rgba(15, 23, 42, 0.03); }
+:root[data-theme="light"] .bg-white\/\[0\.04\] { background-color: rgba(15, 23, 42, 0.035); }
+:root[data-theme="light"] .bg-white\/\[0\.06\] { background-color: rgba(15, 23, 42, 0.05); }
+:root[data-theme="light"] .bg-white\/\[0\.08\] { background-color: rgba(15, 23, 42, 0.07); }
+:root[data-theme="light"] .bg-white\/\[0\.10\] { background-color: rgba(15, 23, 42, 0.08); }
+:root[data-theme="light"] .bg-white\/5 { background-color: rgba(15, 23, 42, 0.04); }
+:root[data-theme="light"] .bg-white\/10 { background-color: rgba(15, 23, 42, 0.07); }
+
+/* dark surface fills become light, with darker text */
+:root[data-theme="light"] .bg-black\/20 { background-color: rgba(15, 23, 42, 0.04); }
+:root[data-theme="light"] .bg-black\/40 {
+  background-color: rgba(15, 23, 42, 0.06);
+  color: #0f172a;
+}
+:root[data-theme="light"] .bg-black\/55 { background-color: rgba(15, 23, 42, 0.08); }
+:root[data-theme="light"] .bg-slate-900\/40 { background-color: rgba(255, 255, 255, 0.85); }
+:root[data-theme="light"] .bg-slate-900\/55 { background-color: rgba(255, 255, 255, 0.92); }
+:root[data-theme="light"] .bg-slate-800 {
+  background-color: #f1f5f9;
+  color: #0f172a;
+}
+:root[data-theme="light"] .bg-slate-700 {
+  background-color: #e2e8f0;
+  color: #0f172a;
+}
+
+/* borders */
+:root[data-theme="light"] .border-white\/5 { border-color: rgba(15, 23, 42, 0.06); }
+:root[data-theme="light"] .border-white\/10 { border-color: rgba(15, 23, 42, 0.10); }
+:root[data-theme="light"] .border-white\/20 { border-color: rgba(15, 23, 42, 0.14); }
+:root[data-theme="light"] .border-white\/30 { border-color: rgba(15, 23, 42, 0.20); }
+:root[data-theme="light"] .border-slate-700 { border-color: rgba(15, 23, 42, 0.14); }
+
+/* hover variants used by ghost/menu buttons */
+:root[data-theme="light"] .hover\:bg-white\/\[0\.04\]:hover { background-color: rgba(15, 23, 42, 0.04); }
+:root[data-theme="light"] .hover\:bg-white\/\[0\.06\]:hover { background-color: rgba(15, 23, 42, 0.06); }
+:root[data-theme="light"] .hover\:bg-white\/\[0\.08\]:hover { background-color: rgba(15, 23, 42, 0.08); }
+:root[data-theme="light"] .hover\:bg-white\/10:hover { background-color: rgba(15, 23, 42, 0.10); }
+:root[data-theme="light"] .hover\:border-white\/10:hover { border-color: rgba(15, 23, 42, 0.10); }
+:root[data-theme="light"] .hover\:text-slate-100:hover { color: #0f172a; }
+:root[data-theme="light"] .hover\:text-slate-200:hover { color: #1e293b; }
+
+/* indigo / accent kbd hint pills inside dark buttons need legible bg */
+:root[data-theme="light"] .bg-white\/20 { background-color: rgba(15, 23, 42, 0.18); }
+
+/* keep recognition timer dot legible on light */
+:root[data-theme="light"] .bg-rose-400 { background-color: #f43f5e; }
+:root[data-theme="light"] .bg-amber-300 { background-color: #f59e0b; }
+
+/* toast text colors that overlap with light body */
+:root[data-theme="light"] .ct-toast-info { color: #1e1b4b; }
+:root[data-theme="light"] .ct-toast-success { color: #064e3b; }
+:root[data-theme="light"] .ct-toast-warn { color: #78350f; }
+:root[data-theme="light"] .ct-toast-error { color: #881337; }
+
+/* subtle tweak to streaming text glow so it shows on light */
+:root[data-theme="light"] .ct-subtitle-zh-streaming {
+  text-shadow: 0 0 12px rgba(99, 102, 241, 0.18);
+}
+
+/* word-edit popover surface */
+:root[data-theme="light"] .ct-word-popover {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(15, 23, 42, 0.16);
+  box-shadow: 0 24px 60px -12px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(99, 102, 241, 0.18);
+}
+
+/* word-edit hover highlight (slightly darker accent on light) */
+:root[data-theme="light"] .ct-word-edit:hover {
+  background-color: rgba(99, 102, 241, 0.14);
+  color: #4338ca;
+}
+
 code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
 }
@@ -394,6 +580,30 @@ code {
   outline: none;
   border-color: var(--ct-accent-strong);
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+}
+
+/* ========================================================================
+   Inline word editor: hover a word in any finalized transcript bubble to
+   highlight it; click opens the correction popover.
+   ======================================================================== */
+.ct-word-edit {
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 0 1px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.ct-word-edit:hover {
+  background-color: rgba(99, 102, 241, 0.22);
+  color: #c7d2fe;
+}
+
+.ct-word-popover {
+  background: rgba(10, 14, 26, 0.95);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid var(--ct-border-strong);
+  border-radius: var(--ct-radius-xl);
+  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(99, 102, 241, 0.18);
 }
 
 /* ========================================================================

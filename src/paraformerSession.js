@@ -44,6 +44,14 @@ const WATCHDOG_TIMEOUT_MS = 45_000;
 // stop, we proactively tear down and rebuild the full pipeline every 14 min.
 const PROACTIVE_ROTATION_MS = 14 * 60 * 1000;
 
+// Once rotation is due, we wait for the App's canRotateNow() to return true
+// (= user is in a natural pause / no active utterance) before swapping the
+// pipeline. Check every 5 s. If the user keeps talking past this ceiling,
+// rotate anyway — better a small mid-utterance hiccup than a silent task
+// timeout.
+const ROTATION_DEFER_CHECK_INTERVAL_MS = 5_000;
+const ROTATION_HARD_CEILING_MS = 3 * 60 * 1000;
+
 // Auto-reconnect: if the relay drops mid-session (e.g. CF runtime update),
 // we transparently re-establish the connection so the user doesn't notice.
 const MAX_RECONNECT_ATTEMPTS = 3;
@@ -87,6 +95,7 @@ export class ParaformerSession {
     onUpdate,
     onError,
     onStatus,
+    canRotateNow,
   }) {
     if (!wsUrl) throw new Error("ParaformerSession: wsUrl is required");
     if (!audioTrack) throw new Error("ParaformerSession: audioTrack is required");
@@ -100,6 +109,7 @@ export class ParaformerSession {
     this.onUpdate = typeof onUpdate === "function" ? onUpdate : () => {};
     this.onError = typeof onError === "function" ? onError : () => {};
     this.onStatus = typeof onStatus === "function" ? onStatus : () => {};
+    this.canRotateNow = typeof canRotateNow === "function" ? canRotateNow : () => true;
 
     this.ws = null;
     this.taskId = null;
@@ -114,6 +124,8 @@ export class ParaformerSession {
     this._silenceTimer = null;
     this._watchdogTimer = null;
     this._rotationTimer = null;
+    this._rotationCheckTimer = null;
+    this._rotationDueAt = 0;
     this._lastAudioSentAt = 0;
     this._lastResultAt = 0;
     this._reconnectAttempt = 0;
@@ -195,9 +207,23 @@ export class ParaformerSession {
 
       const onOpen = () => {
         cleanup();
-        ws.addEventListener("message", (ev) => this._handleMessage(ev));
-        ws.addEventListener("close", (ev) => this._handleClose(ev));
-        ws.addEventListener("error", () => this._handleSocketError());
+        // Stale-handler guard: when we rotate / reconnect, the old WS's close
+        // event can arrive after we've already moved on to a new WS. Without
+        // this check, the old close event re-enters _handleClose with the
+        // current flags (e.g. _isRenewing already cleared) and triggers a
+        // bogus "relay closed" + reconnect cascade against the live session.
+        ws.addEventListener("message", (ev) => {
+          if (ws !== this.ws) return;
+          this._handleMessage(ev);
+        });
+        ws.addEventListener("close", (ev) => {
+          if (ws !== this.ws) return;
+          this._handleClose(ev);
+        });
+        ws.addEventListener("error", () => {
+          if (ws !== this.ws) return;
+          this._handleSocketError();
+        });
         this._startHeartbeat();
         this._startWatchdog();
         resolve();
@@ -376,7 +402,7 @@ export class ParaformerSession {
     if (evt === "task-finished") {
       if (this._isRenewing || this._isReconnecting) return; // already handling
       console.log("ParaformerSession: task-finished received, renewing task");
-      this._renewTask();
+      this._renewTask("task-finished");
       return;
     }
   }
@@ -474,13 +500,8 @@ export class ParaformerSession {
           `ParaformerSession: watchdog fired – no results for ${Math.round(elapsed / 1000)}s, ` +
           `audioCtx=${ctxState}, ws=${wsState}, lastAudio=${Math.round(audioAge / 1000)}s ago`
         );
-        this.onStatus({
-          phase: "reconnecting",
-          attempt: 0,
-          reason: `watchdog: no results ${Math.round(elapsed / 1000)}s, ctx=${ctxState}`,
-        });
         this._clearWatchdog();
-        this._renewTask();
+        this._renewTask("watchdog");
       }
     }, 10_000); // check every 10 s
   }
@@ -534,12 +555,15 @@ export class ParaformerSession {
   // This is more reliable than trying to reuse the existing WS, because
   // DashScope may have silently abandoned the upstream connection.
 
-  async _renewTask() {
+  async _renewTask(reason = "rotation") {
     if (this.stopped || this._isRenewing) return;
     this._isRenewing = true;
 
-    console.log("ParaformerSession: renewing task (full reconnect)");
-    this.onStatus({ phase: "reconnecting", attempt: 0 });
+    console.log(`ParaformerSession: renewing task (reason=${reason})`);
+    // reason: "rotation" (planned) → App suppresses toast; "task-finished" /
+    // "watchdog" → App still shows a soft notice. "drop" handled by
+    // _attemptReconnect with its own trigger.
+    this.onStatus({ phase: "reconnecting", attempt: 0, reason });
 
     this._clearHeartbeat();
     this._clearWatchdog();
@@ -565,6 +589,15 @@ export class ParaformerSession {
       this._sendRunTask();
       await this._awaitTaskStarted();
 
+      // The new task numbers sentences from 0 again. If we kept the old
+      // sentences[] entries with the same ids, _applySentence would replace
+      // them mid-array and fullText would collapse, leaving the App's
+      // processedLength stranded past the new (much shorter) fullText.
+      this.sentences = [];
+      // Tell the consumer to realign its cumulative-text bookkeeping. App.js
+      // listens for empty fullText after non-empty and resets processedLength.
+      this.onUpdate({ fullText: "", finalText: "", confidence: 0 });
+
       this._isRenewing = false;
       this._reconnectAttempt = 0;
       this._lastResultAt = Date.now();
@@ -583,11 +616,51 @@ export class ParaformerSession {
 
   _startRotationTimer() {
     this._clearRotationTimer();
+    this._rotationDueAt = 0;
     this._rotationTimer = setTimeout(() => {
-      if (this.stopped || this.paused || this._isRenewing || this._isReconnecting) return;
-      console.log("ParaformerSession: proactive rotation timer fired");
-      this._renewTask();
+      if (this.stopped || this._isRenewing || this._isReconnecting) return;
+      // Mark rotation due; the deferred-rotation loop will swap the pipeline
+      // on the next moment the App reports a natural pause (or the hard
+      // ceiling, whichever comes first).
+      this._rotationDueAt = Date.now();
+      console.log("ParaformerSession: rotation due, waiting for safe window");
+      this._startRotationDeferLoop();
     }, PROACTIVE_ROTATION_MS);
+  }
+
+  _startRotationDeferLoop() {
+    this._clearRotationCheckTimer();
+    const tick = () => {
+      if (this.stopped || this._isRenewing || this._isReconnecting) {
+        this._clearRotationCheckTimer();
+        return;
+      }
+      if (!this._rotationDueAt) {
+        this._clearRotationCheckTimer();
+        return;
+      }
+      const dueAge = Date.now() - this._rotationDueAt;
+      let safe = true;
+      try { safe = !!this.canRotateNow(); } catch (e) { safe = true; }
+
+      if (safe || dueAge >= ROTATION_HARD_CEILING_MS) {
+        console.log(
+          `ParaformerSession: rotating (safeWindow=${safe}, deferred=${Math.round(dueAge / 1000)}s)`
+        );
+        this._clearRotationCheckTimer();
+        this._renewTask();
+      }
+    };
+    // First check immediately; subsequent every interval.
+    tick();
+    this._rotationCheckTimer = setInterval(tick, ROTATION_DEFER_CHECK_INTERVAL_MS);
+  }
+
+  _clearRotationCheckTimer() {
+    if (this._rotationCheckTimer) {
+      clearInterval(this._rotationCheckTimer);
+      this._rotationCheckTimer = null;
+    }
   }
 
   _clearRotationTimer() {
@@ -595,6 +668,8 @@ export class ParaformerSession {
       clearTimeout(this._rotationTimer);
       this._rotationTimer = null;
     }
+    this._clearRotationCheckTimer();
+    this._rotationDueAt = 0;
   }
 
   // --- auto-reconnect -------------------------------------------------------
@@ -619,7 +694,11 @@ export class ParaformerSession {
       `ParaformerSession: reconnect attempt ${this._reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms (${trigger} code=${code})`
     );
 
-    this.onStatus({ phase: "reconnecting", attempt: this._reconnectAttempt });
+    this.onStatus({
+      phase: "reconnecting",
+      attempt: this._reconnectAttempt,
+      reason: trigger === "task-renew-failed" ? "renew-failed" : "drop",
+    });
 
     await new Promise((r) => setTimeout(r, delay));
 
@@ -642,6 +721,11 @@ export class ParaformerSession {
       await this._openWebSocket();
       this._sendRunTask();
       await this._awaitTaskStarted();
+
+      // New task → new sentence_id space. Drop accumulated sentences and
+      // signal the App to reset processedLength (see _renewTask comment).
+      this.sentences = [];
+      this.onUpdate({ fullText: "", finalText: "", confidence: 0 });
 
       // Success – reset counter.
       this._reconnectAttempt = 0;

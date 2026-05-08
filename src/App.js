@@ -24,9 +24,15 @@ import {
   ChevronsRight,
   Cpu,
   Activity,
+  Pencil,
+  Check,
+  X,
+  Sun,
+  Moon,
 } from "lucide-react";
 import { ParaformerSession } from "./paraformerSession";
 
+const THEME_STORAGE_KEY = "classtrans.uiTheme.v1";
 const PARAFORMER_WS_URL = process.env.REACT_APP_PARAFORMER_WS_URL || "";
 
 // ============================================================================
@@ -542,7 +548,10 @@ const renderMarkdownToSafeHtml = (markdownText) => {
     }
 
     if (!trimmed) {
-      closeList();
+      // 不在空行处直接 closeList：AI 生成的有序列表常常带空行分隔
+      // （"1. xxx\n\n2. yyy"），强行关闭会让每个 <ol> 各自从 1 重新计数，
+      // 渲染出 "1, 1, 1" / "1, 2, 1, 2" 的错乱编号。
+      // 真正的段落结束由下一行的非列表内容触发 closeList。
       continue;
     }
 
@@ -1049,6 +1058,65 @@ const PipContent = ({ transcripts, activeEn, activeZh }) => {
     }
   }, [transcripts, activeEn, activeZh, isAutoScroll]);
 
+  const cardBase = {
+    backdropFilter: "blur(14px) saturate(140%)",
+    WebkitBackdropFilter: "blur(14px) saturate(140%)",
+    borderRadius: "18px",
+    padding: "14px 18px",
+    marginBottom: "14px",
+    flexShrink: 0,
+    transition: "border-color 200ms ease, box-shadow 200ms ease",
+  };
+  const speakerPillStyle = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "6px",
+    backgroundColor: "rgba(255,255,255,0.06)",
+    color: "#cbd5e1",
+    fontSize: "0.7rem",
+    padding: "3px 9px",
+    borderRadius: "8px",
+    border: "1px solid rgba(255,255,255,0.10)",
+    fontWeight: 600,
+    letterSpacing: "0.2px",
+  };
+  const tagStyle = (variant) => {
+    const palette = {
+      polish: { bg: "rgba(168,85,247,0.10)", color: "#c4b5fd", border: "rgba(168,85,247,0.30)" },
+      warn: { bg: "rgba(251,191,36,0.13)", color: "#fcd34d", border: "rgba(251,191,36,0.30)" },
+    }[variant] || { bg: "rgba(255,255,255,0.06)", color: "#cbd5e1", border: "rgba(255,255,255,0.10)" };
+    return {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "4px",
+      padding: "2px 7px",
+      borderRadius: "6px",
+      fontSize: "0.65rem",
+      fontWeight: 700,
+      backgroundColor: palette.bg,
+      color: palette.color,
+      border: `1px solid ${palette.border}`,
+    };
+  };
+  const enTextStyle = (item) => ({
+    color: item.isPolished || item.fromTab ? "#cbd5e1" : "#94a3b8",
+    fontSize: "0.95rem",
+    lineHeight: 1.55,
+    marginBottom: "6px",
+    fontFamily: "sans-serif",
+    flex: 1,
+    minWidth: 0,
+  });
+  const zhTextStyle = {
+    color: "#f1f5f9",
+    fontSize: "1.55rem",
+    fontWeight: 700,
+    lineHeight: 1.5,
+    fontFamily: '"PingFang SC", "Microsoft YaHei", system-ui, sans-serif',
+    letterSpacing: "0.5px",
+    textShadow: "0 0 18px rgba(165,180,252,0.18)",
+  };
+
   return (
     <div
       ref={containerRef}
@@ -1056,91 +1124,91 @@ const PipContent = ({ transcripts, activeEn, activeZh }) => {
       style={{
         display: "flex",
         flexDirection: "column",
-        padding: "20px",
+        padding: "18px 20px",
         boxSizing: "border-box",
         height: "100vh",
         overflowY: "auto",
         overflowX: "hidden",
-        backgroundColor: "#0f172a",
         position: "relative",
       }}
     >
       <div style={{ flex: 1, minHeight: "20px" }}></div>
-      {transcripts.map((item) => (
-        <div
-          key={item.id}
-          style={{
-            backgroundColor: "#1e293b",
-            borderRadius: "16px",
-            padding: "16px 20px",
-            marginBottom: "16px",
-            boxShadow:
-              "0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -1px rgba(0, 0, 0, 0.06)",
-            border: item.en.includes("⚠️")
-              ? "1px solid #e11d48"
-              : "1px solid rgba(255, 255, 255, 0.05)",
-            flexShrink: 0,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", marginBottom: "8px" }}>
-            <span style={{ backgroundColor: "rgba(255,255,255,0.1)", color: "#cbd5e1", fontSize: "0.75rem", padding: "2px 8px", borderRadius: "12px", display: "flex", alignItems: "center", gap: "4px" }}>
-              <User size={12} />
-              {item.speaker || "👩‍🏫 主讲人"}
-            </span>
+      {transcripts.map((item) => {
+        const isError = (item.en || "").includes("⚠️");
+        const cardStyle = {
+          ...cardBase,
+          backgroundColor: item.lowConfidence
+            ? "rgba(120, 53, 15, 0.20)"
+            : item.isPolished
+            ? "rgba(15, 23, 42, 0.62)"
+            : "rgba(15, 23, 42, 0.55)",
+          border: isError
+            ? "1px solid rgba(225, 29, 72, 0.55)"
+            : item.lowConfidence
+            ? "1px solid rgba(251,191,36,0.30)"
+            : item.isPolished
+            ? "1px solid rgba(196,181,253,0.28)"
+            : "1px solid rgba(255,255,255,0.10)",
+          boxShadow: item.isPolished
+            ? "0 0 0 1px rgba(196,181,253,0.08), 0 12px 36px -8px rgba(99,102,241,0.18)"
+            : "0 4px 16px -4px rgba(0,0,0,0.45)",
+        };
+        return (
+          <div key={item.id} style={cardStyle}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", marginBottom: "8px" }}>
+              <span style={speakerPillStyle}>
+                <User size={12} />
+                {item.speaker || "👩‍🏫 主讲人"}
+              </span>
+              <div style={{ display: "flex", gap: "5px" }}>
+                {item.lowConfidence && (
+                  <span style={tagStyle("warn")}>⚠ 低置信</span>
+                )}
+                {item.isPolished && (
+                  <span style={tagStyle("polish")}>✨ AI 精调</span>
+                )}
+              </div>
+            </div>
+            <div style={enTextStyle(item)}>{item.en}</div>
+            <div style={zhTextStyle}>{item.zh}</div>
           </div>
-          <div
-            style={{
-              color: "#94a3b8",
-              fontSize: "1rem",
-              lineHeight: "1.5",
-              marginBottom: "8px",
-              fontFamily: "sans-serif",
-            }}
-          >
-            {item.en}
-          </div>
-          <div
-            style={{
-              color: "#f8fafc",
-              fontSize: "1.4rem",
-              fontWeight: "bold",
-              lineHeight: "1.5",
-              fontFamily: '"PingFang SC", "Microsoft YaHei", sans-serif',
-              letterSpacing: "0.5px",
-            }}
-          >
-            {item.zh}
-          </div>
-        </div>
-      ))}
+        );
+      })}
 
       {(activeEn || activeZh) && (
         <div
+          className="pip-card-active"
           style={{
-            backgroundColor: "rgba(79, 70, 229, 0.15)",
-            borderRadius: "16px",
-            padding: "16px 20px",
-            marginBottom: "16px",
-            border: "1px solid rgba(79, 70, 229, 0.4)",
-            boxShadow: "0 4px 12px rgba(79, 70, 229, 0.1)",
-            flexShrink: 0,
+            ...cardBase,
+            position: "relative",
+            overflow: "hidden",
+            backgroundImage:
+              "linear-gradient(135deg, rgba(99,102,241,0.14), rgba(168,85,247,0.06))",
+            border: "1px solid rgba(99,102,241,0.34)",
+            boxShadow:
+              "0 0 0 1px rgba(99,102,241,0.16), 0 12px 36px rgba(99,102,241,0.20)",
           }}
         >
           <div style={{ display: "flex", alignItems: "center", marginBottom: "8px" }}>
-            <span style={{ backgroundColor: "rgba(129, 140, 248, 0.2)", color: "#a5b4fc", fontSize: "0.75rem", padding: "2px 8px", borderRadius: "12px", display: "flex", alignItems: "center", gap: "4px" }}>
+            <span
+              style={{
+                ...speakerPillStyle,
+                backgroundColor: "rgba(129,140,248,0.18)",
+                color: "#a5b4fc",
+                border: "1px solid rgba(129,140,248,0.40)",
+              }}
+            >
               <User size={12} />
-              🕵️ 分析中...
+              🕵️ 语境分析中…
             </span>
           </div>
           <div
             style={{
+              ...enTextStyle({ isPolished: false, fromTab: false }),
               color: "#a5b4fc",
-              fontSize: "1rem",
-              lineHeight: "1.5",
-              marginBottom: "8px",
-              fontFamily: "sans-serif",
               display: "flex",
               alignItems: "center",
+              gap: "8px",
             }}
           >
             <span
@@ -1148,31 +1216,22 @@ const PipContent = ({ transcripts, activeEn, activeZh }) => {
                 display: "inline-block",
                 width: "6px",
                 height: "6px",
+                flexShrink: 0,
                 backgroundColor: "#818cf8",
                 borderRadius: "50%",
-                marginRight: "8px",
-                animation: "pulse 2s infinite",
+                animation: "pulse 1.6s ease-in-out infinite",
               }}
             ></span>
-            {activeEn}
+            <span style={{ flex: 1 }}>{activeEn}</span>
           </div>
-          <div
-            style={{
-              color: "#ffffff",
-              fontSize: "1.4rem",
-              fontWeight: "bold",
-              lineHeight: "1.5",
-              fontFamily: '"PingFang SC", "Microsoft YaHei", sans-serif',
-              letterSpacing: "0.5px",
-            }}
-          >
-            {activeZh || "..."}
+          <div style={{ ...zhTextStyle, color: "#ffffff" }}>
+            {activeZh || "…"}
+            <span className="pip-stream-cursor" aria-hidden></span>
           </div>
         </div>
       )}
-      <div ref={bottomRef} style={{ height: "40px", flexShrink: 0 }} />
+      <div ref={bottomRef} style={{ height: "32px", flexShrink: 0 }} />
 
-      {/* 画中画悬浮返回按钮 */}
       {!isAutoScroll && (
         <div
           onClick={() => {
@@ -1181,25 +1240,29 @@ const PipContent = ({ transcripts, activeEn, activeZh }) => {
           }}
           style={{
             position: "fixed",
-            bottom: "20px",
+            bottom: "18px",
             left: "50%",
             transform: "translateX(-50%)",
-            backgroundColor: "rgba(79, 70, 229, 0.95)",
+            backgroundColor: "rgba(99,102,241,0.85)",
             color: "white",
-            padding: "10px 20px",
-            borderRadius: "30px",
+            padding: "8px 16px",
+            borderRadius: "999px",
             cursor: "pointer",
-            fontSize: "14px",
-            fontWeight: "bold",
-            boxShadow: "0 4px 15px rgba(0,0,0,0.4)",
+            fontSize: "12px",
+            fontWeight: 700,
+            backdropFilter: "blur(14px)",
+            WebkitBackdropFilter: "blur(14px)",
+            border: "1px solid rgba(255,255,255,0.20)",
+            boxShadow: "0 12px 30px -6px rgba(99,102,241,0.55)",
             zIndex: 50,
             display: "flex",
             alignItems: "center",
             gap: "6px",
             fontFamily: "sans-serif",
+            letterSpacing: "0.2px",
           }}
         >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
           返回最新同传
         </div>
       )}
@@ -1254,6 +1317,64 @@ const buildTranscriptRowsAndBuckets = (transcripts) => {
 // StreamingText：把流入的文本拆成"已稳定段 + 新增段"，新增段触发 CSS 渐入动画。
 // 兼容回退（value 缩短或重置）：清空段队列重新开始。
 // ============================================================================
+// ============================================================================
+// 单词级可编辑文本：把英文文本拆成 word / 非 word 两类 token，给 word token
+// 加点击/悬停态，触发外部传入的 onWordClick(e, wordIndex, word)。
+// ============================================================================
+const WORD_TOKEN_RE = /[A-Za-z][A-Za-z0-9'’-]*|[^A-Za-z\s]+|\s+/g;
+
+const tokenizeForWordEdit = (text) => {
+  const str = String(text || "");
+  const tokens = [];
+  WORD_TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = WORD_TOKEN_RE.exec(str)) !== null) {
+    tokens.push({ text: m[0], isWord: /^[A-Za-z]/.test(m[0]) });
+  }
+  return tokens;
+};
+
+const replaceWordAt = (text, wordIdx, newWord) => {
+  const tokens = tokenizeForWordEdit(text);
+  let count = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    if (!tokens[i].isWord) continue;
+    if (count === wordIdx) {
+      tokens[i] = { ...tokens[i], text: newWord };
+      break;
+    }
+    count++;
+  }
+  return tokens.map((t) => t.text).join("");
+};
+
+const WordEditableText = ({ text, onWordClick, disabled }) => {
+  const tokens = tokenizeForWordEdit(text);
+  if (disabled || !onWordClick) {
+    return <>{text}</>;
+  }
+  let wordCounter = 0;
+  return (
+    <>
+      {tokens.map((t, i) => {
+        if (!t.isWord) return <React.Fragment key={i}>{t.text}</React.Fragment>;
+        const wordIdx = wordCounter++;
+        return (
+          <span
+            key={i}
+            className="ct-word-edit"
+            onClick={(e) => onWordClick(e, wordIdx, t.text)}
+            role="button"
+            tabIndex={-1}
+          >
+            {t.text}
+          </span>
+        );
+      })}
+    </>
+  );
+};
+
 const StreamingText = ({ value, animate, withCursor }) => {
   const [segments, setSegments] = useState(() => {
     const initial = String(value || "");
@@ -1301,31 +1422,32 @@ const StreamingText = ({ value, animate, withCursor }) => {
 // ============================================================================
 // 管线状态卡：固定右下角，显示收音 / 识别 / 润色 / 实时机翻 四段管线的当前状态
 // ============================================================================
-const PIPELINE_PILL_BASE =
-  "flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold border transition-colors";
-const PIPELINE_PILL_STYLES = {
-  idle: "bg-slate-50 border-slate-200 text-slate-400",
-  active: "bg-indigo-50 border-indigo-200 text-indigo-700",
-  paused: "bg-amber-50 border-amber-200 text-amber-700",
-  warn: "bg-amber-50 border-amber-200 text-amber-700",
-  error: "bg-rose-50 border-rose-200 text-rose-700",
+const PIPELINE_PILL_STATE_CLASS = {
+  idle: "ct-pipeline-pill-idle",
+  active: "ct-pipeline-pill-active",
+  paused: "ct-pipeline-pill-paused",
+  warn: "ct-pipeline-pill-warn",
+  error: "ct-pipeline-pill-error",
 };
 
 const PipelineStatusPill = ({ icon: Icon, label, state, hint }) => {
-  const styleKey = PIPELINE_PILL_STYLES[state] ? state : "idle";
+  const styleKey = PIPELINE_PILL_STATE_CLASS[state] ? state : "idle";
   return (
-    <div className={`${PIPELINE_PILL_BASE} ${PIPELINE_PILL_STYLES[styleKey]}`} title={hint || label}>
+    <div
+      className={`ct-pipeline-pill ${PIPELINE_PILL_STATE_CLASS[styleKey]}`}
+      title={hint || label}
+    >
       <Icon className="w-3.5 h-3.5" />
       <span>{label}</span>
       <span
         className={`ml-1 inline-block w-1.5 h-1.5 rounded-full ${
           styleKey === "active"
-            ? "bg-indigo-500"
+            ? "bg-indigo-300"
             : styleKey === "paused" || styleKey === "warn"
-            ? "bg-amber-500"
+            ? "bg-amber-300"
             : styleKey === "error"
-            ? "bg-rose-500"
-            : "bg-slate-300"
+            ? "bg-rose-300"
+            : "bg-slate-500"
         }`}
       />
     </div>
@@ -1342,11 +1464,11 @@ const PipelineStatusCard = ({ capture, asr, polish, realtime, captureHint, asrHi
 
   return (
     <div
-      className="fixed bottom-5 right-5 z-40 bg-white/85 backdrop-blur-md border border-slate-200 rounded-2xl shadow-lg px-3 py-2.5 flex flex-col gap-1.5"
+      className="ct-pipeline-card fixed bottom-5 right-5 z-40 px-3 py-2.5 flex flex-col gap-1.5"
       role="status"
       aria-live="polite"
     >
-      <div className="flex items-center gap-1.5 px-1 pb-1 text-[10px] uppercase tracking-wider text-slate-400 font-bold">
+      <div className="flex items-center gap-1.5 px-1 pb-1 text-[10px] uppercase tracking-wider text-slate-500 font-bold">
         管线状态
       </div>
       <PipelineStatusPill
@@ -1464,14 +1586,14 @@ const HourlyStackedChart = ({ buckets, modelOrder, nowMs }) => {
               x2={width - paddingRight}
               y1={y}
               y2={y}
-              stroke="#e2e8f0"
+              stroke="rgba(255,255,255,0.08)"
               strokeWidth="1"
             />
             <text
               x={paddingLeft - 6}
               y={y + 3}
               fontSize="9"
-              fill="#94a3b8"
+              fill="#64748b"
               textAnchor="end"
               fontFamily="monospace"
             >
@@ -1488,10 +1610,10 @@ const HourlyStackedChart = ({ buckets, modelOrder, nowMs }) => {
           x2={paddingLeft + nowBucketIdx * colWidth}
           y1={paddingTop}
           y2={paddingTop + chartHeight}
-          stroke="#6366f1"
+          stroke="#a5b4fc"
           strokeWidth="1"
           strokeDasharray="2 2"
-          opacity="0.5"
+          opacity="0.7"
         />
       )}
 
@@ -1535,7 +1657,7 @@ const HourlyStackedChart = ({ buckets, modelOrder, nowMs }) => {
             x={x}
             y={height - 6}
             fontSize="9"
-            fill="#94a3b8"
+            fill="#64748b"
             textAnchor="middle"
             fontFamily="monospace"
           >
@@ -1604,41 +1726,41 @@ const UsageView = ({ log, onClear }) => {
   const buckets = computeHourlyBuckets(entries, todayStart, 24);
 
   return (
-    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-6 min-h-[70vh]">
+    <div className="ct-panel p-6 space-y-6 min-h-[78vh]">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <h2 className="text-lg font-bold text-indigo-900">AI 用量统计</h2>
-          <p className="text-xs text-slate-500 mt-1">
+          <h2 className="text-lg font-bold text-slate-100 tracking-tight">AI 用量统计</h2>
+          <p className="text-xs text-slate-400 mt-1">
             统计每次 LLM 调用的 token 消耗（本地仅保留最近 {USAGE_LOG_MAX_ENTRIES} 条）。Paraformer 语音识别按音频时长计费，不在此处统计。
           </p>
         </div>
         <button
           onClick={onClear}
-          className="text-xs px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+          className="ct-btn-ghost text-xs px-3 py-2 rounded-lg font-semibold"
         >
           清空记录
         </button>
       </div>
 
       {/* 今日 hero 卡片 */}
-      <div className="rounded-2xl border border-indigo-100 bg-gradient-to-br from-indigo-50/70 to-violet-50/40 p-5">
+      <div className="rounded-2xl border border-indigo-400/25 bg-gradient-to-br from-indigo-500/10 to-violet-500/[0.04] p-5">
         <div className="flex items-baseline justify-between gap-3 flex-wrap">
           <div>
-            <div className="text-[11px] text-indigo-700 font-bold uppercase tracking-wider">
+            <div className="text-[11px] text-indigo-300 font-bold uppercase tracking-wider">
               今日总用量
             </div>
             <div className="flex items-baseline gap-2 mt-1">
-              <span className="text-4xl font-bold text-indigo-900 tabular-nums">
+              <span className="text-4xl font-bold text-indigo-100 tabular-nums">
                 {todayTotal.toLocaleString()}
               </span>
-              <span className="text-sm text-indigo-600 font-semibold">
+              <span className="text-sm text-indigo-300 font-semibold">
                 tokens · {todayEntries.length} 次调用
               </span>
             </div>
           </div>
-          <div className="text-right text-xs text-slate-500">
-            <div>累计：<span className="font-mono text-slate-700">{grandTotal.toLocaleString()}</span> tokens</div>
-            <div>涉及模型：<span className="font-mono text-slate-700">{Object.keys(totalsByModel).length}</span></div>
+          <div className="text-right text-xs text-slate-400">
+            <div>累计：<span className="font-mono text-slate-200">{grandTotal.toLocaleString()}</span> tokens</div>
+            <div>涉及模型：<span className="font-mono text-slate-200">{Object.keys(totalsByModel).length}</span></div>
           </div>
         </div>
 
@@ -1654,10 +1776,10 @@ const UsageView = ({ log, onClear }) => {
                       className="inline-block w-2.5 h-2.5 rounded-sm shrink-0"
                       style={{ backgroundColor: colorForModel(model) }}
                     />
-                    <span className="font-mono text-indigo-900 w-40 truncate">
+                    <span className="font-mono text-indigo-100 w-40 truncate">
                       {model}
                     </span>
-                    <div className="flex-1 h-2 bg-indigo-100/60 rounded-full overflow-hidden">
+                    <div className="flex-1 h-2 bg-white/[0.06] rounded-full overflow-hidden">
                       <div
                         className="h-full"
                         style={{
@@ -1666,10 +1788,10 @@ const UsageView = ({ log, onClear }) => {
                         }}
                       />
                     </div>
-                    <span className="font-mono text-indigo-800 w-20 text-right tabular-nums">
+                    <span className="font-mono text-slate-200 w-20 text-right tabular-nums">
                       {t.total.toLocaleString()}
                     </span>
-                    <span className="text-indigo-500 w-10 text-right tabular-nums">
+                    <span className="text-indigo-300 w-10 text-right tabular-nums">
                       {pct.toFixed(0)}%
                     </span>
                   </div>
@@ -1677,19 +1799,19 @@ const UsageView = ({ log, onClear }) => {
               })}
           </div>
         ) : (
-          <div className="mt-4 text-sm text-indigo-700/70">
+          <div className="mt-4 text-sm text-indigo-200/70">
             今天还没有调用。开始一次同传或生成纪要即可看到数据。
           </div>
         )}
       </div>
 
       {/* 24h 堆叠柱状图 */}
-      <div className="rounded-xl border border-slate-200 overflow-hidden">
-        <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-3">
-          <span className="text-xs font-semibold text-slate-600">
+      <div className="rounded-xl border border-white/10 overflow-hidden bg-white/[0.02]">
+        <div className="px-4 py-2 bg-white/[0.03] border-b border-white/10 flex items-center justify-between gap-3">
+          <span className="text-xs font-semibold text-slate-200">
             今日 24 小时 token 走势（按模型堆叠）
           </span>
-          <span className="text-[10px] font-mono text-slate-400">
+          <span className="text-[10px] font-mono text-slate-500">
             {new Date(todayStart).toLocaleDateString()}
           </span>
         </div>
@@ -1705,7 +1827,7 @@ const UsageView = ({ log, onClear }) => {
                   <div
                     key={model}
                     className={`flex items-center gap-1.5 text-[11px] ${
-                      isToday ? "text-slate-700" : "text-slate-400"
+                      isToday ? "text-slate-200" : "text-slate-500"
                     }`}
                   >
                     <span
@@ -1713,7 +1835,7 @@ const UsageView = ({ log, onClear }) => {
                       style={{ backgroundColor: colorForModel(model) }}
                     />
                     <span className="font-mono">{model}</span>
-                    {!isToday && <span className="text-slate-400">(历史)</span>}
+                    {!isToday && <span className="text-slate-500">(历史)</span>}
                   </div>
                 );
               })}
@@ -1728,10 +1850,10 @@ const UsageView = ({ log, onClear }) => {
           {Object.entries(totalsByType).map(([type, t]) => (
             <div
               key={type}
-              className="rounded-full bg-indigo-50 text-indigo-700 border border-indigo-100 px-3 py-1 text-xs"
+              className="ct-tag ct-tag-info"
             >
               <span className="font-semibold">{USAGE_TYPE_LABELS[type] || type}</span>
-              <span className="text-indigo-500 mx-1">·</span>
+              <span className="opacity-60 mx-1">·</span>
               <span>{t.calls} 次 / {t.total.toLocaleString()} tokens</span>
             </div>
           ))}
@@ -1740,12 +1862,12 @@ const UsageView = ({ log, onClear }) => {
 
       {/* 按模型聚合（累计） */}
       {Object.keys(totalsByModel).length > 0 && (
-        <div className="rounded-xl border border-slate-200 overflow-hidden">
-          <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+        <div className="rounded-xl border border-white/10 overflow-hidden bg-white/[0.02]">
+          <div className="px-4 py-2 bg-white/[0.03] border-b border-white/10 text-xs font-semibold text-slate-200">
             按模型聚合（累计）
           </div>
           <table className="w-full text-sm">
-            <thead className="text-xs text-slate-500 bg-white">
+            <thead className="text-xs text-slate-400 bg-white/[0.02]">
               <tr>
                 <th className="text-left px-4 py-2 font-medium">模型</th>
                 <th className="text-right px-4 py-2 font-medium">调用</th>
@@ -1758,18 +1880,18 @@ const UsageView = ({ log, onClear }) => {
               {Object.entries(totalsByModel)
                 .sort((a, b) => b[1].total - a[1].total)
                 .map(([model, t]) => (
-                  <tr key={model} className="border-t border-slate-100">
-                    <td className="px-4 py-2 font-mono text-slate-700 flex items-center gap-2">
+                  <tr key={model} className="border-t border-white/5">
+                    <td className="px-4 py-2 font-mono text-slate-200 flex items-center gap-2">
                       <span
                         className="inline-block w-2.5 h-2.5 rounded-sm"
                         style={{ backgroundColor: colorForModel(model) }}
                       />
                       {model}
                     </td>
-                    <td className="px-4 py-2 text-right text-slate-600">{t.calls}</td>
-                    <td className="px-4 py-2 text-right text-slate-600">{t.prompt.toLocaleString()}</td>
-                    <td className="px-4 py-2 text-right text-slate-600">{t.completion.toLocaleString()}</td>
-                    <td className="px-4 py-2 text-right font-semibold text-slate-800">{t.total.toLocaleString()}</td>
+                    <td className="px-4 py-2 text-right text-slate-300">{t.calls}</td>
+                    <td className="px-4 py-2 text-right text-slate-300">{t.prompt.toLocaleString()}</td>
+                    <td className="px-4 py-2 text-right text-slate-300">{t.completion.toLocaleString()}</td>
+                    <td className="px-4 py-2 text-right font-semibold text-slate-100">{t.total.toLocaleString()}</td>
                   </tr>
                 ))}
             </tbody>
@@ -1777,17 +1899,17 @@ const UsageView = ({ log, onClear }) => {
         </div>
       )}
 
-      <div className="rounded-xl border border-slate-200 overflow-hidden">
-        <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+      <div className="rounded-xl border border-white/10 overflow-hidden bg-white/[0.02]">
+        <div className="px-4 py-2 bg-white/[0.03] border-b border-white/10 text-xs font-semibold text-slate-200">
           最近调用（倒序）
         </div>
         {reversed.length === 0 ? (
-          <div className="px-4 py-8 text-center text-sm text-slate-500">
+          <div className="px-4 py-8 text-center text-sm text-slate-400">
             还没有记录。开始一次同传或生成纪要后这里会出现 token 消耗。
           </div>
         ) : (
           <table className="w-full text-sm">
-            <thead className="text-xs text-slate-500 bg-white">
+            <thead className="text-xs text-slate-400 bg-white/[0.02]">
               <tr>
                 <th className="text-left px-4 py-2 font-medium">时间</th>
                 <th className="text-left px-4 py-2 font-medium">类型</th>
@@ -1801,24 +1923,24 @@ const UsageView = ({ log, onClear }) => {
               {reversed.map((entry, idx) => (
                 <tr
                   key={`${entry.timestamp}-${idx}`}
-                  className="border-t border-slate-100"
+                  className="border-t border-white/5"
                 >
-                  <td className="px-4 py-2 text-slate-600 whitespace-nowrap">
+                  <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
                     {formatUsageTimestamp(entry.timestamp)}
                   </td>
-                  <td className="px-4 py-2 text-slate-700">
+                  <td className="px-4 py-2 text-slate-200">
                     {USAGE_TYPE_LABELS[entry.type] || entry.type}
                   </td>
-                  <td className="px-4 py-2 font-mono text-xs text-slate-600">
+                  <td className="px-4 py-2 font-mono text-xs text-slate-300">
                     {entry.model}
                   </td>
-                  <td className="px-4 py-2 text-right text-slate-500">
+                  <td className="px-4 py-2 text-right text-slate-400">
                     {Number(entry.promptTokens || 0).toLocaleString()}
                   </td>
-                  <td className="px-4 py-2 text-right text-slate-500">
+                  <td className="px-4 py-2 text-right text-slate-400">
                     {Number(entry.completionTokens || 0).toLocaleString()}
                   </td>
-                  <td className="px-4 py-2 text-right font-semibold text-slate-700">
+                  <td className="px-4 py-2 text-right font-semibold text-slate-100">
                     {Number(entry.totalTokens || 0).toLocaleString()}
                   </td>
                 </tr>
@@ -1929,6 +2051,34 @@ export default function App() {
   const [temporarySessions, setTemporarySessions] = useState([]);
   const [selectedSavedSession, setSelectedSavedSession] = useState(null);
   const [savedSessionsQuery, setSavedSessionsQuery] = useState("");
+  const [titleDraft, setTitleDraft] = useState(null); // null = not editing
+  // Inline word-correction popover. shape: { x, y, originalWord, draft, scope, payload }
+  const [wordEditPopover, setWordEditPopover] = useState(null);
+
+  // UI theme: "dark" (default) | "light" — persisted to localStorage and
+  // applied as data-theme="..." on the <html> element so the CSS variable
+  // overrides + Tailwind utility overrides in index.css take effect.
+  const [theme, setTheme] = useState(() => {
+    try {
+      const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+      return stored === "light" ? "light" : "dark";
+    } catch (e) {
+      return "dark";
+    }
+  });
+  useEffect(() => {
+    if (typeof document !== "undefined") {
+      document.documentElement.setAttribute("data-theme", theme);
+    }
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch (e) {}
+  }, [theme]);
+  const toggleTheme = useCallback(() => {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+  }, []);
+  // Whole-bubble editor draft. shape: { scope, key, payload, enDraft, zhDraft }
+  const [bubbleEditDraft, setBubbleEditDraft] = useState(null);
   const [sessionCompletionModal, setSessionCompletionModal] = useState({
     open: false,
     durationSec: 0,
@@ -2141,6 +2291,11 @@ export default function App() {
           item &&
           item.en &&
           item.zh &&
+          // 排除尚未 polish 完成的占位 / 流式块，避免把"AI 深度纠错与润色中..."
+          // 或半截渐入的 ZH 文本写进存档
+          !item.isTranslating &&
+          !item.isStreamingPolish &&
+          !/识别中/.test(String(item.speaker || "")) &&
           !item.en.includes("⚠️") &&
           !item.en.includes("🔊") &&
           item.zh !== "..."
@@ -2619,16 +2774,26 @@ export default function App() {
     ({ fullText, finalText, confidence }) => {
       if (isPausedRef.current) return;
 
-      lastSessionStringRef.current = fullText || "";
+      const next = fullText || "";
+      const prev = lastSessionStringRef.current;
+      // Session reset signal: ParaformerSession clears its sentence buffer on
+      // task renewal / reconnect and emits an empty fullText. Realign our
+      // cumulative-text bookkeeping so the new task's sentence_id=0 onwards
+      // doesn't get hidden behind a stale processedLength from the old task.
+      if (next === "" && prev.length > 0) {
+        processedLengthRef.current = 0;
+      }
+
+      lastSessionStringRef.current = next;
       lastFinalSessionStringRef.current = finalText || "";
 
       const safeProcessedLength = Math.min(
         processedLengthRef.current,
-        (fullText || "").length
+        next.length
       );
       // 上一条 finalize 后，Paraformer 才把上一句 sentence_end 补上，可能让消费点
       // 后面残留 ". " / "， " 等首字符；统一吃掉，避免 active 气泡显示孤立标点。
-      const activeNewTextRaw = (fullText || "")
+      const activeNewTextRaw = next
         .substring(safeProcessedLength)
         .replace(/^[\s.,;:!?。，；：！？]+/, "");
       const activeNewText = smartPunctuateEnglish(activeNewTextRaw, false);
@@ -2690,10 +2855,13 @@ export default function App() {
 
     const isAiPolishPending = (item) => {
       if (!item) return false;
+      // 占位气泡仍在等 polish 第一波 ZH delta
       if (item.isTranslating) return true;
+      // 流式 polish 已开始喷字、但尚未 splice 落定（applyFinalSegments 未跑）
+      if (item.isStreamingPolish) return true;
       const speaker = String(item.speaker || "");
       const enText = String(item.en || "");
-      // 防止出现状态不同步：即使 isTranslating 被错误置为 false，仍以“识别中”作为未完成信号
+      // 防止状态不同步：即使两个 flag 都被错置为 false，仍以"识别中" / 残留标签作为未完成信号
       return /识别中/.test(speaker) || /<\/?[^>]+>/.test(enText);
     };
 
@@ -2705,20 +2873,35 @@ export default function App() {
       return { done, total };
     };
 
-    const waitForPolishCompletion = async (timeoutMs = 22000, pollMs = 250) => {
-      // 先让最近一次 finalize 的 setState 落地，避免“还未入队就开始检查”的竞态
+    const waitForPolishCompletion = async (pollMs = 250) => {
+      // 先让最近一次 finalize 的 setState 落地，避免"还未入队就开始检查"的竞态
       await new Promise((resolve) => setTimeout(resolve, 120));
 
       updatePolishProgress();
 
+      // 超时按未完成块数动态估算：每块最多等 6s（覆盖 polish + qwen-turbo 兜底
+      // + 速率限制重排），整段最少 8s、最多 90s。这样一次性十几个 pending 块
+      // 也不会过早超时，但坏路径不会无限挂起。
+      const pendingAtStart = transcriptsRef.current.filter(isAiPolishPending).length;
+      const timeoutMs = Math.min(90_000, Math.max(8_000, pendingAtStart * 6_000));
+
       const started = Date.now();
       while (Date.now() - started < timeoutMs) {
         updatePolishProgress();
-        const hasPending = transcriptsRef.current.some((item) => item?.isTranslating);
+        const hasPending = transcriptsRef.current.some(isAiPolishPending);
         if (!hasPending) return;
         await new Promise((resolve) => setTimeout(resolve, pollMs));
       }
 
+      // 超时仍有 pending：记录一笔，外层 cleaned filter 仍会按 isAiPolishPending 排除
+      const stillPending = transcriptsRef.current.filter(isAiPolishPending).length;
+      if (stillPending > 0) {
+        console.warn(
+          `autoSaveCurrentSessionWithSummary: ${stillPending} block(s) still pending after ${Math.round(
+            timeoutMs / 1000
+          )}s, proceeding without them`
+        );
+      }
       updatePolishProgress();
     };
 
@@ -2809,6 +2992,24 @@ export default function App() {
     } finally {
       setIsFinalizingSession(false);
       setFinalizingProgress({ done: 0, total: 0, phase: "idle" });
+      // 本次同传已落盘 / 已写入临时列表 → 把首页清空，回首页就是干净下一场的起点。
+      // 完整内容仍可在"已保存"视图回看。
+      setTranscripts([]);
+      setActiveEn("");
+      setActiveZh("");
+      setActiveConfidence(1);
+      activeEnRef.current = "";
+      activeZhRef.current = "";
+      activeConfidenceRef.current = 1;
+      processedLengthRef.current = 0;
+      lastSessionStringRef.current = "";
+      lastFinalSessionStringRef.current = "";
+      lastTranslatedEnRef.current = "";
+      setSummaryResult("");
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
     }
   }, [
     finalizeCurrentBlock,
@@ -2848,21 +3049,32 @@ export default function App() {
         audioTrack,
         languageHints: ["en"],
         vocabularyId: getStoredVocabularyId() || undefined,
+        // Defer rotation while user is mid-utterance. ParaformerSession will
+        // wait for a "safe window" (this returns true) before swapping the
+        // pipeline, with a hard ceiling so it can't defer forever.
+        canRotateNow: () => !activeEnRef.current.trim(),
         onUpdate: ({ fullText, finalText, confidence }) => {
           applyTranscriptUpdate({ fullText, finalText, confidence });
         },
-        onStatus: ({ phase, attempt }) => {
+        onStatus: ({ phase, attempt, reason }) => {
           if (phase === "started") {
             setAsrStatus("live");
             setAsrErrorReason("");
           }
           if (phase === "reconnecting") {
             setAsrStatus("connecting");
-            pushToast({
-              level: "warning",
-              text: `识别连接中断，正在自动重连 (${attempt}/${3})…`,
-              ttl: 4000,
-            });
+            // Planned rotation / DashScope task-finished are part of the
+            // normal long-session cycle. Update the pipeline pill briefly
+            // but don't pop a toast — only true anomalies warrant one.
+            const isQuietRecovery =
+              reason === "rotation" || reason === "task-finished";
+            if (!isQuietRecovery) {
+              pushToast({
+                level: "warn",
+                text: `识别连接中断，正在自动重连 (${attempt}/${3})…`,
+                ttl: 4000,
+              });
+            }
           }
         },
         onError: (err) => {
@@ -3026,17 +3238,75 @@ export default function App() {
       });
 
       const style = pip.document.createElement("style");
-      // 注意这里的修改：将 #pip-mount 设置为 overflow: hidden，把滚动权交还给 PipContent 组件内部，实现智能滚屏
       style.textContent = `
-        body { margin: 0; padding: 0; background-color: #0f172a; overflow: hidden; }
-        #pip-mount { height: 100vh; overflow: hidden; } 
+        :root {
+          --pip-bg: #06080F;
+          --pip-text-1: #f1f5f9;
+          --pip-text-2: #cbd5e1;
+          --pip-text-3: #94a3b8;
+          --pip-text-4: #64748b;
+          --pip-card-bg: rgba(15, 23, 42, 0.55);
+          --pip-border: rgba(255, 255, 255, 0.08);
+          --pip-border-strong: rgba(255, 255, 255, 0.16);
+          --pip-accent: #a5b4fc;
+        }
+        * { box-sizing: border-box; }
+        html, body {
+          margin: 0;
+          padding: 0;
+          background: var(--pip-bg);
+          color: var(--pip-text-1);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+          -webkit-font-smoothing: antialiased;
+          overflow: hidden;
+        }
+        body {
+          background-image:
+            radial-gradient(800px circle at 8% -10%, rgba(99, 102, 241, 0.18), transparent 55%),
+            radial-gradient(700px circle at 100% 110%, rgba(56, 189, 248, 0.10), transparent 60%);
+          background-attachment: fixed;
+        }
+        #pip-mount { height: 100vh; overflow: hidden; }
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4); }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.18); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.30); }
+
         @keyframes pulse {
           0%, 100% { opacity: 1; }
           50% { opacity: .5; }
+        }
+        @keyframes pip-active-sweep {
+          0% { transform: translateX(-100%); }
+          100% { transform: translateX(200%); }
+        }
+        @keyframes pip-cursor-blink {
+          0%, 60% { opacity: 1; }
+          61%, 100% { opacity: 0; }
+        }
+        @keyframes pip-stream-fade {
+          from { opacity: 0; filter: blur(2px); }
+          to { opacity: 1; filter: blur(0); }
+        }
+        .pip-stream-cursor {
+          display: inline-block;
+          width: 2px;
+          height: 1em;
+          vertical-align: -0.15em;
+          margin-left: 4px;
+          background-color: currentColor;
+          border-radius: 1px;
+          animation: pip-cursor-blink 0.9s infinite;
+        }
+        .pip-card-active::before {
+          content: '';
+          position: absolute;
+          inset: 0 0 auto 0;
+          height: 1px;
+          background: linear-gradient(90deg, transparent, rgba(165,180,252,0.85), transparent);
+          background-size: 200% 100%;
+          animation: pip-active-sweep 2.5s linear infinite;
+          pointer-events: none;
         }
       `;
       pip.document.head.appendChild(style);
@@ -3495,6 +3765,428 @@ export default function App() {
     }, 300);
   }, [formatSessionToHtml]);
 
+  // 重置编辑状态当切换到不同会话
+  useEffect(() => {
+    setTitleDraft(null);
+  }, [selectedSavedSession?.fileName]);
+
+  const handleRenameSavedSession = useCallback(
+    async (session, rawTitle) => {
+      const newTitle = String(rawTitle || "").trim();
+      if (!session || !newTitle || newTitle === session.title) {
+        setTitleDraft(null);
+        return;
+      }
+
+      // 临时会话只在内存里改
+      if (session.isTemporary) {
+        setTemporarySessions((prev) =>
+          prev.map((s) =>
+            s.fileName === session.fileName ? { ...s, title: newTitle } : s
+          )
+        );
+        setSelectedSavedSession((prev) =>
+          prev && prev.fileName === session.fileName
+            ? { ...prev, title: newTitle }
+            : prev
+        );
+        setTitleDraft(null);
+        pushToast({ level: "success", text: "会话标题已更新", ttl: 2500 });
+        return;
+      }
+
+      if (!sessionFolderHandle) {
+        setTitleDraft(null);
+        return;
+      }
+
+      try {
+        const permission = await sessionFolderHandle.requestPermission({
+          mode: "readwrite",
+        });
+        if (permission !== "granted") {
+          pushToast({
+            level: "error",
+            text: "未获得文件夹写入权限，无法重命名",
+            ttl: 5000,
+          });
+          setTitleDraft(null);
+          return;
+        }
+
+        const fileHandle = await sessionFolderHandle.getFileHandle(
+          session.fileName
+        );
+        const file = await fileHandle.getFile();
+        const text = await file.text();
+        const data = JSON.parse(text);
+        data.title = newTitle;
+
+        const writable = await fileHandle.createWritable();
+        await writable.write(JSON.stringify(data, null, 2));
+        await writable.close();
+
+        setSavedSessions((prev) =>
+          prev.map((s) =>
+            s.fileName === session.fileName ? { ...s, title: newTitle } : s
+          )
+        );
+        setSelectedSavedSession((prev) =>
+          prev && prev.fileName === session.fileName
+            ? { ...prev, title: newTitle }
+            : prev
+        );
+        pushToast({ level: "success", text: "会话标题已更新", ttl: 2500 });
+      } catch (err) {
+        console.error("重命名会话失败:", err);
+        pushToast({
+          level: "error",
+          text: `重命名失败：${err && err.message ? err.message : err}`,
+          ttl: 5000,
+        });
+      } finally {
+        setTitleDraft(null);
+      }
+    },
+    [pushToast, sessionFolderHandle]
+  );
+
+  // ---- 单词级修正：点词→弹小窗→替换+可选加入词典 ----------------------
+  const openWordEditPopover = useCallback((event, payload) => {
+    const target = event && event.currentTarget;
+    if (!target) return;
+    const rect = target.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.bottom + 6;
+    setWordEditPopover({
+      x,
+      y,
+      originalWord: payload.originalWord,
+      draft: payload.originalWord,
+      scope: payload.scope,
+      payload,
+    });
+  }, []);
+
+  const closeWordEditPopover = useCallback(() => {
+    setWordEditPopover(null);
+  }, []);
+
+  const applyWordReplacementInLive = useCallback((bubbleId, wordIdx, newWord) => {
+    setTranscripts((prev) =>
+      prev.map((item) =>
+        item.id === bubbleId
+          ? { ...item, en: replaceWordAt(item.en, wordIdx, newWord) }
+          : item
+      )
+    );
+  }, []);
+
+  const applyWordReplacementInSaved = useCallback(
+    async (session, bubbleIdx, wordIdx, newWord) => {
+      if (!session) return;
+
+      // 临时会话：仅改内存
+      if (session.isTemporary) {
+        const newTranscripts = (session.transcripts || []).map((item, idx) =>
+          idx === bubbleIdx
+            ? { ...item, en: replaceWordAt(item.en, wordIdx, newWord) }
+            : item
+        );
+        setTemporarySessions((prev) =>
+          prev.map((s) =>
+            s.fileName === session.fileName
+              ? { ...s, transcripts: newTranscripts }
+              : s
+          )
+        );
+        setSelectedSavedSession((prev) =>
+          prev && prev.fileName === session.fileName
+            ? { ...prev, transcripts: newTranscripts }
+            : prev
+        );
+        return;
+      }
+
+      if (!sessionFolderHandle) return;
+      try {
+        const permission = await sessionFolderHandle.requestPermission({
+          mode: "readwrite",
+        });
+        if (permission !== "granted") {
+          pushToast({
+            level: "error",
+            text: "未获得文件夹写入权限，无法保存修正",
+            ttl: 5000,
+          });
+          return;
+        }
+
+        const fileHandle = await sessionFolderHandle.getFileHandle(session.fileName);
+        const file = await fileHandle.getFile();
+        const data = JSON.parse(await file.text());
+        if (!data || !Array.isArray(data.transcripts) || !data.transcripts[bubbleIdx]) {
+          throw new Error("会话文件结构异常");
+        }
+        data.transcripts[bubbleIdx] = {
+          ...data.transcripts[bubbleIdx],
+          en: replaceWordAt(data.transcripts[bubbleIdx].en, wordIdx, newWord),
+        };
+
+        const writable = await fileHandle.createWritable();
+        await writable.write(JSON.stringify(data, null, 2));
+        await writable.close();
+
+        setSavedSessions((prev) =>
+          prev.map((s) =>
+            s.fileName === session.fileName
+              ? { ...s, transcripts: data.transcripts }
+              : s
+          )
+        );
+        setSelectedSavedSession((prev) =>
+          prev && prev.fileName === session.fileName
+            ? { ...prev, transcripts: data.transcripts }
+            : prev
+        );
+      } catch (err) {
+        console.error("保存修正失败:", err);
+        pushToast({
+          level: "error",
+          text: `保存修正失败：${err && err.message ? err.message : err}`,
+          ttl: 5000,
+        });
+      }
+    },
+    [pushToast, sessionFolderHandle]
+  );
+
+  const addCorrectionToGlossary = useCallback(
+    (originalWord, newWord) => {
+      const from = String(originalWord || "").trim();
+      const to = String(newWord || "").trim();
+      if (!from || !to || from === to) return;
+
+      const lowerFrom = from.toLowerCase();
+      const existingIdx = customGlossaryPairs.findIndex(
+        (p) => String(p.from || "").toLowerCase() === lowerFrom
+      );
+      const nextPairs =
+        existingIdx >= 0
+          ? customGlossaryPairs.map((p, i) =>
+              i === existingIdx ? { from: p.from, to } : p
+            )
+          : [...customGlossaryPairs, { from, to }];
+
+      setCustomGlossaryPairs(nextPairs);
+      setRuntimeCustomGlossaryPairs(nextPairs);
+      try {
+        window.localStorage.setItem(
+          GLOSSARY_STORAGE_KEY,
+          JSON.stringify(nextPairs)
+        );
+      } catch (e) {}
+      setGlossaryDraft(
+        nextPairs.map((item) => `${item.from} => ${item.to}`).join("\n")
+      );
+      // 后台异步同步到 Paraformer 热词词典；失败不阻塞用户。
+      syncGlossaryToParaformerVocabulary(nextPairs).catch((err) => {
+        console.warn("vocabulary sync failed:", err);
+      });
+    },
+    [customGlossaryPairs]
+  );
+
+  const commitWordEdit = useCallback(
+    (alsoAddToGlossary) => {
+      if (!wordEditPopover) return;
+      const newWord = String(wordEditPopover.draft || "").trim();
+      const original = wordEditPopover.originalWord;
+      if (!newWord || newWord === original) {
+        closeWordEditPopover();
+        return;
+      }
+
+      const { scope, payload } = wordEditPopover;
+      if (scope === "live") {
+        applyWordReplacementInLive(payload.bubbleId, payload.wordIdx, newWord);
+      } else if (scope === "saved") {
+        // fire and forget; toast on failure
+        applyWordReplacementInSaved(
+          payload.session,
+          payload.bubbleIdx,
+          payload.wordIdx,
+          newWord
+        );
+      }
+
+      if (alsoAddToGlossary) {
+        addCorrectionToGlossary(original, newWord);
+        pushToast({
+          level: "success",
+          text: `已替换并加入词典：${original} → ${newWord}`,
+          ttl: 3500,
+        });
+      } else {
+        pushToast({
+          level: "info",
+          text: `已替换：${original} → ${newWord}`,
+          ttl: 2500,
+        });
+      }
+
+      closeWordEditPopover();
+    },
+    [
+      wordEditPopover,
+      closeWordEditPopover,
+      applyWordReplacementInLive,
+      applyWordReplacementInSaved,
+      addCorrectionToGlossary,
+      pushToast,
+    ]
+  );
+
+  // ---- 整气泡编辑：用户点笔→中英文都进 textarea，自由改 -----------------
+  const openBubbleEditor = useCallback((scope, payload, en, zh) => {
+    const key =
+      scope === "live"
+        ? `live-${payload.bubbleId}`
+        : `saved-${payload.session?.fileName || "?"}-${payload.bubbleIdx}`;
+    setBubbleEditDraft({
+      scope,
+      key,
+      payload,
+      enDraft: String(en || ""),
+      zhDraft: String(zh || ""),
+    });
+  }, []);
+
+  const closeBubbleEditor = useCallback(() => {
+    setBubbleEditDraft(null);
+  }, []);
+
+  const saveBubbleEdit = useCallback(async () => {
+    if (!bubbleEditDraft) return;
+    const newEn = String(bubbleEditDraft.enDraft || "").trim();
+    const newZh = String(bubbleEditDraft.zhDraft || "").trim();
+    if (!newEn && !newZh) {
+      pushToast({ level: "warn", text: "中英文不能都为空", ttl: 3000 });
+      return;
+    }
+
+    if (bubbleEditDraft.scope === "live") {
+      setTranscripts((prev) =>
+        prev.map((item) =>
+          item.id === bubbleEditDraft.payload.bubbleId
+            ? { ...item, en: newEn, zh: newZh }
+            : item
+        )
+      );
+      setBubbleEditDraft(null);
+      pushToast({ level: "success", text: "气泡内容已更新", ttl: 2500 });
+      return;
+    }
+
+    // scope === "saved"
+    const { session, bubbleIdx } = bubbleEditDraft.payload;
+    if (!session) {
+      setBubbleEditDraft(null);
+      return;
+    }
+
+    if (session.isTemporary) {
+      const newTranscripts = (session.transcripts || []).map((t, i) =>
+        i === bubbleIdx ? { ...t, en: newEn, zh: newZh } : t
+      );
+      setTemporarySessions((prev) =>
+        prev.map((s) =>
+          s.fileName === session.fileName
+            ? { ...s, transcripts: newTranscripts }
+            : s
+        )
+      );
+      setSelectedSavedSession((prev) =>
+        prev && prev.fileName === session.fileName
+          ? { ...prev, transcripts: newTranscripts }
+          : prev
+      );
+      setBubbleEditDraft(null);
+      pushToast({ level: "success", text: "气泡内容已更新", ttl: 2500 });
+      return;
+    }
+
+    if (!sessionFolderHandle) {
+      setBubbleEditDraft(null);
+      return;
+    }
+
+    try {
+      const permission = await sessionFolderHandle.requestPermission({
+        mode: "readwrite",
+      });
+      if (permission !== "granted") {
+        pushToast({
+          level: "error",
+          text: "未获得文件夹写入权限，无法保存编辑",
+          ttl: 5000,
+        });
+        return;
+      }
+      const fileHandle = await sessionFolderHandle.getFileHandle(session.fileName);
+      const file = await fileHandle.getFile();
+      const data = JSON.parse(await file.text());
+      if (!data || !Array.isArray(data.transcripts) || !data.transcripts[bubbleIdx]) {
+        throw new Error("会话文件结构异常");
+      }
+      data.transcripts[bubbleIdx] = {
+        ...data.transcripts[bubbleIdx],
+        en: newEn,
+        zh: newZh,
+      };
+      const writable = await fileHandle.createWritable();
+      await writable.write(JSON.stringify(data, null, 2));
+      await writable.close();
+
+      setSavedSessions((prev) =>
+        prev.map((s) =>
+          s.fileName === session.fileName
+            ? { ...s, transcripts: data.transcripts }
+            : s
+        )
+      );
+      setSelectedSavedSession((prev) =>
+        prev && prev.fileName === session.fileName
+          ? { ...prev, transcripts: data.transcripts }
+          : prev
+      );
+      setBubbleEditDraft(null);
+      pushToast({ level: "success", text: "气泡内容已更新", ttl: 2500 });
+    } catch (err) {
+      console.error("保存编辑失败:", err);
+      pushToast({
+        level: "error",
+        text: `保存失败：${err && err.message ? err.message : err}`,
+        ttl: 5000,
+      });
+    }
+  }, [bubbleEditDraft, pushToast, sessionFolderHandle]);
+
+  // 关闭 popover：点其他地方 / 滚动 / Esc
+  useEffect(() => {
+    if (!wordEditPopover) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") closeWordEditPopover();
+    };
+    const onScroll = () => closeWordEditPopover();
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [wordEditPopover, closeWordEditPopover]);
+
   const handleDeleteSavedSession = useCallback(
     async (session) => {
       if (!session) return;
@@ -3675,6 +4367,22 @@ export default function App() {
             >
               <Activity className="w-4 h-4 shrink-0" />
               {!isSidebarCollapsed && <span>AI 用量</span>}
+            </button>
+
+            <button
+              onClick={toggleTheme}
+              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100`}
+              title={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+              aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+            >
+              {theme === "dark" ? (
+                <Sun className="w-4 h-4 shrink-0" />
+              ) : (
+                <Moon className="w-4 h-4 shrink-0" />
+              )}
+              {!isSidebarCollapsed && (
+                <span>{theme === "dark" ? "浅色模式" : "深色模式"}</span>
+              )}
             </button>
           </div>
 
@@ -3883,18 +4591,18 @@ export default function App() {
       {toasts.length > 0 && (
         <div className="fixed top-4 right-4 z-[60] flex flex-col gap-2 w-[min(22rem,calc(100vw-2rem))] pointer-events-none">
           {toasts.map((t) => {
-            const styles =
+            const levelClass =
               t.level === "error"
-                ? "bg-rose-50/95 border-rose-200 text-rose-800"
+                ? "ct-toast-error"
                 : t.level === "warn"
-                ? "bg-amber-50/95 border-amber-200 text-amber-800"
+                ? "ct-toast-warn"
                 : t.level === "success"
-                ? "bg-emerald-50/95 border-emerald-200 text-emerald-800"
-                : "bg-indigo-50/95 border-indigo-200 text-indigo-800";
+                ? "ct-toast-success"
+                : "ct-toast-info";
             return (
               <div
                 key={t.id}
-                className={`ct-toast pointer-events-auto rounded-xl shadow-lg border px-4 py-3 flex items-start gap-3 backdrop-blur-sm ${styles}`}
+                className={`ct-toast ${levelClass} pointer-events-auto rounded-xl shadow-lg px-4 py-3 flex items-start gap-3`}
                 role={t.level === "error" ? "alert" : "status"}
               >
                 {(t.level === "error" || t.level === "warn") && (
@@ -3915,6 +4623,89 @@ export default function App() {
             );
           })}
         </div>
+      )}
+
+      {wordEditPopover && (
+        <>
+          {/* Backdrop click captures outside-click to close. */}
+          <div
+            className="fixed inset-0 z-[80]"
+            onClick={closeWordEditPopover}
+          />
+          <div
+            className="ct-word-popover fixed z-[81] p-3 w-72"
+            style={{
+              left: Math.max(
+                8,
+                Math.min(
+                  (typeof window !== "undefined" ? window.innerWidth : 1024) - 296,
+                  wordEditPopover.x - 144
+                )
+              ),
+              top: Math.min(
+                (typeof window !== "undefined" ? window.innerHeight : 768) - 220,
+                wordEditPopover.y
+              ),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                修正这个词
+              </span>
+              <button
+                onClick={closeWordEditPopover}
+                className="text-slate-500 hover:text-slate-200 -mr-1"
+                aria-label="关闭"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="text-[11px] text-slate-400 mb-1">原词</div>
+            <div className="font-mono text-sm text-slate-300 mb-3 px-2 py-1 rounded bg-white/[0.04] border border-white/10 break-all">
+              {wordEditPopover.originalWord}
+            </div>
+            <div className="text-[11px] text-slate-400 mb-1">替换为</div>
+            <input
+              autoFocus
+              value={wordEditPopover.draft}
+              onChange={(e) =>
+                setWordEditPopover((prev) =>
+                  prev ? { ...prev, draft: e.target.value } : prev
+                )
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  if (e.shiftKey) commitWordEdit(true);
+                  else commitWordEdit(false);
+                }
+              }}
+              className="ct-input w-full text-sm font-mono px-2 py-1.5 mb-3"
+              placeholder="新词"
+            />
+            <div className="flex flex-col gap-1.5">
+              <button
+                onClick={() => commitWordEdit(true)}
+                className="ct-btn-primary text-xs px-3 py-2 rounded-md font-semibold flex items-center justify-center gap-1.5"
+                title="替换并加入词典 (Shift+Enter)"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                替换并加入词典
+              </button>
+              <button
+                onClick={() => commitWordEdit(false)}
+                className="ct-btn-ghost text-xs px-3 py-2 rounded-md font-semibold flex items-center justify-center gap-1.5"
+                title="仅替换此处 (Enter)"
+              >
+                <Check className="w-3.5 h-3.5" />
+                仅替换此处
+              </button>
+            </div>
+            <div className="text-[10px] text-slate-500 mt-2 leading-relaxed">
+              加入词典后，本地正则即时生效，下一次同传时 Paraformer 也会用作热词。
+            </div>
+          </div>
+        </>
       )}
 
       <PipelineStatusCard
@@ -3997,8 +4788,8 @@ export default function App() {
       />
 
       {activeView === "home" && homeBuckets.length >= 2 && (
-        <div className="hidden lg:flex fixed right-3 top-24 z-30 flex-col max-h-[50vh] w-[68px] bg-white/85 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-md p-1.5 gap-0.5 overflow-hidden">
-          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider text-center pb-1 border-b border-slate-100">
+        <div className="ct-pipeline-card hidden lg:flex fixed right-3 top-24 z-30 flex-col max-h-[50vh] w-[68px] p-1.5 gap-0.5 overflow-hidden">
+          <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider text-center pb-1 border-b border-white/10">
             时间轴
           </div>
           <div className="flex-1 overflow-y-auto flex flex-col gap-0.5 pt-1">
@@ -4007,7 +4798,7 @@ export default function App() {
                 key={b.startMs}
                 onClick={() => scrollToBucket(b.startMs)}
                 title={`${formatHHMM(b.startMs)} – ${formatHHMM(b.startMs + HOME_BUCKET_MS)} · ${b.count} 段`}
-                className="text-[11px] font-mono text-slate-500 hover:text-indigo-700 hover:bg-indigo-50 rounded-md px-1.5 py-1 transition-colors text-center"
+                className="text-[11px] font-mono text-slate-400 hover:text-indigo-200 hover:bg-indigo-500/12 rounded-md px-1.5 py-1 transition-colors text-center"
               >
                 {formatHHMM(b.startMs)}
               </button>
@@ -4018,18 +4809,18 @@ export default function App() {
 
       {isFinalizingSession && (
         <div className="max-w-6xl mx-auto w-full px-6 mt-4 shrink-0">
-          <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-4">
-            <div className="flex items-center justify-between text-sm font-semibold text-indigo-700 mb-2">
+          <div className="rounded-xl border border-indigo-400/25 bg-indigo-500/[0.08] backdrop-blur p-4">
+            <div className="flex items-center justify-between text-sm font-semibold text-indigo-200 mb-2">
               <span>
                 {finalizingProgress.phase === "summary"
                   ? "正在生成课堂纪要..."
                   : `正在等待 AI 润色完成（${finalizingProgress.done}/${finalizingProgress.total}）`}
               </span>
-              <span>{finalizingPercent}%</span>
+              <span className="font-mono">{finalizingPercent}%</span>
             </div>
-            <div className="h-2 bg-indigo-100 rounded-full overflow-hidden">
+            <div className="h-2 bg-white/[0.06] rounded-full overflow-hidden">
               <div
-                className="h-full bg-indigo-500 transition-all duration-300"
+                className="h-full bg-gradient-to-r from-indigo-400 to-violet-400 transition-all duration-300"
                 style={{ width: `${finalizingPercent}%` }}
               />
             </div>
@@ -4041,7 +4832,11 @@ export default function App() {
       <main
         ref={mainRef}
         onScroll={handleMainScroll}
-        className="flex-1 max-w-6xl mx-auto w-full px-6 py-8 flex flex-col gap-4 overflow-y-auto"
+        className={`flex-1 mx-auto w-full flex flex-col overflow-y-auto ${
+          activeView === "saved"
+            ? "max-w-none px-4 py-4 gap-3"
+            : "max-w-6xl px-6 py-8 gap-4"
+        }`}
       >
         {activeView === "home" && (
           <>
@@ -4052,24 +4847,26 @@ export default function App() {
               <Mic className="w-16 h-16 mb-4 stroke-[1.5] text-indigo-300 relative" />
             </div>
             <p className="text-lg text-slate-200 font-medium tracking-wide mt-2">
-              选择麦克风，点击右上角开始上课
+              在首页选择麦克风，点击右上角的
+              <strong className="text-emerald-300">【开始上课】</strong>
             </p>
             <div className="ct-card text-sm mt-6 text-left max-w-md p-5 leading-relaxed text-slate-300">
-              <div className="text-slate-100 font-semibold mb-2">💡 如何翻译网课视频？</div>
+              <div className="text-slate-100 font-semibold mb-2">💡 如何转录网课视频？</div>
               <ol className="list-decimal pl-5 space-y-1.5">
                 <li>
                   可直接开始临时转录；若希望自动存档，再点顶部
-                  <strong className="text-emerald-300">「选择保存文件夹」</strong>。
+                  <strong className="text-emerald-300">【选择保存文件夹】</strong>。
                 </li>
                 <li>
                   推荐点
-                  <strong className="text-purple-300">「系统音频」</strong>，在弹窗中选择
-                  <strong className="text-purple-300">「Chrome 标签页」</strong>或
-                  <strong className="text-purple-300">「窗口」</strong>并勾选共享音频。
+                  <strong className="text-purple-300">【系统音频】</strong>，在弹窗中选择
+                  <strong className="text-purple-300">【Chrome 标签页】</strong>或
+                  <strong className="text-purple-300">【窗口】</strong>并勾选
+                  <strong className="text-purple-300">【共享音频】</strong>。
                 </li>
                 <li>
                   左侧下拉框选择
-                  <strong className="text-indigo-300"> 立体声混音/Stereo Mix </strong>
+                  <strong className="text-indigo-300">【立体声混音 / Stereo Mix】</strong>
                   或使用虚拟声卡（如 VB-Cable）。
                 </li>
                 <li>
@@ -4108,70 +4905,157 @@ export default function App() {
                 : ""
             }`}
           >
-            <div className="flex items-center text-xs font-semibold mb-2 space-x-2">
-              <div className="ct-speaker-pill">
-                <User className="w-3 h-3 opacity-70" />
-                {item.speaker || "👩‍🏫 主讲人"}
-              </div>
-            </div>
-
-            <div className="flex items-start mb-2 gap-3">
-              <div
-                className={`text-sm md:text-base font-medium pr-2 leading-relaxed font-sans flex-1 ${
-                  item.isPolished || item.fromTab
-                    ? "ct-subtitle-en-polished"
-                    : "ct-subtitle-en"
-                }`}
-              >
-                {item.en}
-              </div>
-              <div className="ml-auto flex flex-col sm:flex-row items-end sm:items-center gap-1 sm:gap-2 shrink-0">
-                {item.lowConfidence && (
-                  <div className="ct-tag ct-tag-warn">
-                    <AlertCircle className="w-3 h-3" /> 低置信度
+            {(() => {
+              const liveEditKey = `live-${item.id}`;
+              const isEditing =
+                bubbleEditDraft && bubbleEditDraft.key === liveEditKey;
+              const canEdit = !item.isTranslating && !item.isStreamingPolish;
+              return (
+                <>
+                  <div className="flex items-center justify-between text-xs font-semibold mb-2 gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <div className="ct-speaker-pill">
+                        <User className="w-3 h-3 opacity-70" />
+                        {item.speaker || "👩‍🏫 主讲人"}
+                      </div>
+                    </div>
+                    {canEdit && !isEditing && (
+                      <button
+                        onClick={() =>
+                          openBubbleEditor(
+                            "live",
+                            { bubbleId: item.id },
+                            item.en,
+                            item.zh
+                          )
+                        }
+                        className="opacity-40 hover:opacity-100 p-1 rounded-md text-slate-400 hover:text-slate-100 hover:bg-white/[0.06] border border-transparent hover:border-white/10 transition-all shrink-0"
+                        title="编辑这一条转录的中英文"
+                        aria-label="编辑气泡"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
-                )}
-                {item.isPolished && (
-                  <div className="ct-tag ct-tag-polish">
-                    <Sparkles className="w-3 h-3" /> AI 精调
-                  </div>
-                )}
-              </div>
-            </div>
 
-            <div className="relative min-h-[1.75rem]">
-              {item.isTranslating ? (
-                <div className="flex items-center space-x-2 text-violet-300 text-sm mt-1">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  <span className="opacity-50 line-through mr-2 text-slate-500">
-                    {item.zh !== "..." && !item.zh.startsWith("[")
-                      ? item.zh
-                      : ""}
-                  </span>
-                  <span className="font-medium">
-                    {item.fromTab
-                      ? "正在解析原生音频流..."
-                      : "AI 深度纠错与润色中..."}
-                  </span>
-                </div>
-              ) : (
-                <div
-                  className={`text-lg md:text-2xl font-bold leading-relaxed tracking-wide ct-subtitle-zh ${
-                    item.isStreamingPolish ? "ct-subtitle-zh-streaming" : ""
-                  } ${
-                    (item.en || "").includes("⚠️")
-                      ? "text-rose-300 text-sm font-medium"
-                      : ""
-                  }`}
-                >
-                  {item.isStreamingPolish ? (
-                    <StreamingText value={item.zh} animate withCursor />
+                  {isEditing ? (
+                    <div className="space-y-2">
+                      <div>
+                        <div className="text-[11px] text-slate-500 mb-1">英文</div>
+                        <textarea
+                          value={bubbleEditDraft.enDraft}
+                          onChange={(e) =>
+                            setBubbleEditDraft((prev) =>
+                              prev ? { ...prev, enDraft: e.target.value } : prev
+                            )
+                          }
+                          rows={Math.min(6, Math.max(2, Math.ceil((bubbleEditDraft.enDraft || "").length / 80)))}
+                          className="ct-textarea w-full text-sm font-sans p-2 leading-relaxed resize-y"
+                        />
+                      </div>
+                      <div>
+                        <div className="text-[11px] text-slate-500 mb-1">中文</div>
+                        <textarea
+                          value={bubbleEditDraft.zhDraft}
+                          onChange={(e) =>
+                            setBubbleEditDraft((prev) =>
+                              prev ? { ...prev, zhDraft: e.target.value } : prev
+                            )
+                          }
+                          rows={Math.min(6, Math.max(2, Math.ceil((bubbleEditDraft.zhDraft || "").length / 60)))}
+                          className="ct-textarea w-full text-base font-bold p-2 leading-relaxed resize-y"
+                        />
+                      </div>
+                      <div className="flex flex-wrap gap-2 justify-end pt-1">
+                        <button
+                          onClick={closeBubbleEditor}
+                          className="ct-btn-ghost text-xs px-3 py-1.5 rounded-md font-semibold flex items-center gap-1"
+                        >
+                          <X className="w-3.5 h-3.5" /> 取消
+                        </button>
+                        <button
+                          onClick={saveBubbleEdit}
+                          className="ct-btn-primary text-xs px-3 py-1.5 rounded-md font-semibold flex items-center gap-1"
+                        >
+                          <Check className="w-3.5 h-3.5" /> 保存
+                        </button>
+                      </div>
+                    </div>
                   ) : (
-                    item.zh
+                    <>
+                      <div className="flex items-start mb-2 gap-3">
+                        <div
+                          className={`text-sm md:text-base font-medium pr-2 leading-relaxed font-sans flex-1 ${
+                            item.isPolished || item.fromTab
+                              ? "ct-subtitle-en-polished"
+                              : "ct-subtitle-en"
+                          }`}
+                        >
+                          <WordEditableText
+                            text={item.en}
+                            disabled={item.isTranslating || item.isStreamingPolish}
+                            onWordClick={(e, wordIdx, word) =>
+                              openWordEditPopover(e, {
+                                scope: "live",
+                                bubbleId: item.id,
+                                wordIdx,
+                                originalWord: word,
+                              })
+                            }
+                          />
+                        </div>
+                        <div className="ml-auto flex flex-col sm:flex-row items-end sm:items-center gap-1 sm:gap-2 shrink-0">
+                          {item.lowConfidence && (
+                            <div className="ct-tag ct-tag-warn">
+                              <AlertCircle className="w-3 h-3" /> 低置信度
+                            </div>
+                          )}
+                          {item.isPolished && (
+                            <div className="ct-tag ct-tag-polish">
+                              <Sparkles className="w-3 h-3" /> AI 精调
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="relative min-h-[1.75rem]">
+                        {item.isTranslating ? (
+                          <div className="flex items-center space-x-2 text-violet-300 text-sm mt-1">
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            <span className="opacity-50 line-through mr-2 text-slate-500">
+                              {item.zh !== "..." && !item.zh.startsWith("[")
+                                ? item.zh
+                                : ""}
+                            </span>
+                            <span className="font-medium">
+                              {item.fromTab
+                                ? "正在解析原生音频流..."
+                                : "AI 深度纠错与润色中..."}
+                            </span>
+                          </div>
+                        ) : (
+                          <div
+                            className={`text-lg md:text-2xl font-bold leading-relaxed tracking-wide ct-subtitle-zh ${
+                              item.isStreamingPolish ? "ct-subtitle-zh-streaming" : ""
+                            } ${
+                              (item.en || "").includes("⚠️")
+                                ? "text-rose-300 text-sm font-medium"
+                                : ""
+                            }`}
+                          >
+                            {item.isStreamingPolish ? (
+                              <StreamingText value={item.zh} animate withCursor />
+                  ) : (
+                              item.zh
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </>
                   )}
-                </div>
-              )}
-            </div>
+                </>
+              );
+            })()}
           </div>
           );
         })}
@@ -4226,7 +5110,7 @@ export default function App() {
         )}
 
         {activeView === "saved" && (
-          <div className="ct-panel overflow-hidden flex min-h-[78vh]">
+          <div className="ct-panel overflow-hidden flex flex-1 min-h-[calc(100vh-160px)]">
             <div className="w-72 border-r border-white/10 bg-white/[0.02] flex flex-col shrink-0">
               <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
                 <h3 className="font-bold text-slate-100 text-sm">已保存会话</h3>
@@ -4280,9 +5164,60 @@ export default function App() {
 
             <div className="flex-1 flex flex-col min-w-0">
               <div className="px-6 py-4 border-b border-white/10">
-                <h3 className="font-bold text-slate-100 text-base">
-                  {selectedSavedSession?.title || "请选择左侧会话"}
-                </h3>
+                {selectedSavedSession ? (
+                  titleDraft !== null ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        autoFocus
+                        value={titleDraft}
+                        onChange={(e) => setTitleDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            handleRenameSavedSession(selectedSavedSession, titleDraft);
+                          } else if (e.key === "Escape") {
+                            setTitleDraft(null);
+                          }
+                        }}
+                        className="ct-input flex-1 min-w-0 text-base font-bold px-3 py-1.5"
+                        placeholder="会话标题"
+                      />
+                      <button
+                        onClick={() =>
+                          handleRenameSavedSession(selectedSavedSession, titleDraft)
+                        }
+                        className="ct-btn-success p-1.5 rounded-md"
+                        title="保存（Enter）"
+                      >
+                        <Check className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={() => setTitleDraft(null)}
+                        className="ct-btn-ghost p-1.5 rounded-md"
+                        title="取消（Esc）"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="group flex items-center gap-2 min-w-0">
+                      <h3 className="font-bold text-slate-100 text-base truncate">
+                        {selectedSavedSession.title}
+                      </h3>
+                      <button
+                        onClick={() => setTitleDraft(selectedSavedSession.title || "")}
+                        className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-1 rounded-md text-slate-400 hover:text-slate-100 hover:bg-white/[0.06] border border-transparent hover:border-white/10 transition-opacity"
+                        title="重命名会话"
+                        aria-label="重命名会话"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )
+                ) : (
+                  <h3 className="font-bold text-slate-100 text-base">
+                    请选择左侧会话
+                  </h3>
+                )}
                 {selectedSavedSession && (
                   <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
                     <p className="text-xs text-slate-400">
@@ -4334,16 +5269,103 @@ export default function App() {
                       {selectedSavedSession.transcripts.length === 0 ? (
                         <p className="text-sm text-slate-400">（该会话暂无转录内容）</p>
                       ) : (
-                        selectedSavedSession.transcripts.map((item, idx) => (
-                          <div key={`${selectedSavedSession.fileName}-${idx}`} className="ct-card p-4">
-                            <div className="ct-speaker-pill mb-2">
-                              <User className="w-3 h-3 opacity-70" />
-                              {item.speaker || "👩‍🏫 主讲人"}
+                        selectedSavedSession.transcripts.map((item, idx) => {
+                          const savedEditKey = `saved-${selectedSavedSession.fileName}-${idx}`;
+                          const isEditing =
+                            bubbleEditDraft && bubbleEditDraft.key === savedEditKey;
+                          return (
+                            <div key={`${selectedSavedSession.fileName}-${idx}`} className="ct-card p-4">
+                              <div className="flex items-center justify-between gap-2 mb-2">
+                                <div className="ct-speaker-pill">
+                                  <User className="w-3 h-3 opacity-70" />
+                                  {item.speaker || "👩‍🏫 主讲人"}
+                                </div>
+                                {!isEditing && (
+                                  <button
+                                    onClick={() =>
+                                      openBubbleEditor(
+                                        "saved",
+                                        {
+                                          session: selectedSavedSession,
+                                          bubbleIdx: idx,
+                                        },
+                                        item.en,
+                                        item.zh
+                                      )
+                                    }
+                                    className="opacity-40 hover:opacity-100 p-1 rounded-md text-slate-400 hover:text-slate-100 hover:bg-white/[0.06] border border-transparent hover:border-white/10 transition-all shrink-0"
+                                    title="编辑这一条转录的中英文"
+                                    aria-label="编辑气泡"
+                                  >
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+                              </div>
+                              {isEditing ? (
+                                <div className="space-y-2">
+                                  <div>
+                                    <div className="text-[11px] text-slate-500 mb-1">英文</div>
+                                    <textarea
+                                      value={bubbleEditDraft.enDraft}
+                                      onChange={(e) =>
+                                        setBubbleEditDraft((prev) =>
+                                          prev ? { ...prev, enDraft: e.target.value } : prev
+                                        )
+                                      }
+                                      rows={Math.min(6, Math.max(2, Math.ceil((bubbleEditDraft.enDraft || "").length / 80)))}
+                                      className="ct-textarea w-full text-sm font-sans p-2 leading-relaxed resize-y"
+                                    />
+                                  </div>
+                                  <div>
+                                    <div className="text-[11px] text-slate-500 mb-1">中文</div>
+                                    <textarea
+                                      value={bubbleEditDraft.zhDraft}
+                                      onChange={(e) =>
+                                        setBubbleEditDraft((prev) =>
+                                          prev ? { ...prev, zhDraft: e.target.value } : prev
+                                        )
+                                      }
+                                      rows={Math.min(6, Math.max(2, Math.ceil((bubbleEditDraft.zhDraft || "").length / 60)))}
+                                      className="ct-textarea w-full text-base font-bold p-2 leading-relaxed resize-y"
+                                    />
+                                  </div>
+                                  <div className="flex flex-wrap gap-2 justify-end pt-1">
+                                    <button
+                                      onClick={closeBubbleEditor}
+                                      className="ct-btn-ghost text-xs px-3 py-1.5 rounded-md font-semibold flex items-center gap-1"
+                                    >
+                                      <X className="w-3.5 h-3.5" /> 取消
+                                    </button>
+                                    <button
+                                      onClick={saveBubbleEdit}
+                                      className="ct-btn-primary text-xs px-3 py-1.5 rounded-md font-semibold flex items-center gap-1"
+                                    >
+                                      <Check className="w-3.5 h-3.5" /> 保存
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <>
+                                  <div className="ct-subtitle-en text-sm leading-relaxed">
+                                    <WordEditableText
+                                      text={item.en}
+                                      onWordClick={(e, wordIdx, word) =>
+                                        openWordEditPopover(e, {
+                                          scope: "saved",
+                                          session: selectedSavedSession,
+                                          bubbleIdx: idx,
+                                          wordIdx,
+                                          originalWord: word,
+                                        })
+                                      }
+                                    />
+                                  </div>
+                                  <div className="ct-subtitle-zh text-base font-semibold mt-2 leading-relaxed">{item.zh}</div>
+                                </>
+                              )}
                             </div>
-                            <div className="ct-subtitle-en text-sm leading-relaxed">{item.en}</div>
-                            <div className="ct-subtitle-zh text-base font-semibold mt-2 leading-relaxed">{item.zh}</div>
-                          </div>
-                        ))
+                          );
+                        })
                       )}
                     </div>
                   </>
@@ -4396,16 +5418,16 @@ export default function App() {
         )}
 
         {activeView === "modelConfig" && (
-          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-5 min-h-[70vh]">
-            <h2 className="text-lg font-bold text-indigo-900">配置 AI 模型</h2>
-            <p className="text-sm text-slate-600 leading-relaxed">
+          <div className="ct-panel p-6 space-y-5 min-h-[78vh]">
+            <h2 className="text-lg font-bold text-slate-100 tracking-tight">配置 AI 模型</h2>
+            <p className="text-sm text-slate-300 leading-relaxed">
               三个调用点各自可换模型。可以分别填入有免费额度的不同模型名，分摊到不同账户 / 不同免费配额上。保存后立即生效。
             </p>
 
             <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
+              <label className="text-xs font-semibold text-slate-200 flex items-center justify-between">
                 <span>润色模型 <span className="text-slate-400 font-normal">（用于 finalize 后段的 polish 流式输出）</span></span>
-                <span className="text-[11px] text-slate-400">当前：<span className="font-mono">{runtimeModelName}</span></span>
+                <span className="text-[11px] text-slate-400">当前：<span className="font-mono text-slate-200">{runtimeModelName}</span></span>
               </label>
               <input
                 type="text"
@@ -4414,15 +5436,15 @@ export default function App() {
                   setModelDraft(e.target.value);
                   if (modelSuccessMsg) setModelSuccessMsg("");
                 }}
-                className="w-full rounded-xl border border-slate-200 p-3 text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                className="ct-input w-full p-3 text-sm font-mono"
                 placeholder={`例如: ${DEFAULT_POLISH_MODEL}`}
               />
             </div>
 
             <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
+              <label className="text-xs font-semibold text-slate-200 flex items-center justify-between">
                 <span>实时机翻模型 <span className="text-slate-400 font-normal">（活气泡的快速 ZH 跟进 + finalize 兜底）</span></span>
-                <span className="text-[11px] text-slate-400">当前：<span className="font-mono">{runtimeRealtimeModelName || DEFAULT_REALTIME_MODEL}</span></span>
+                <span className="text-[11px] text-slate-400">当前：<span className="font-mono text-slate-200">{runtimeRealtimeModelName || DEFAULT_REALTIME_MODEL}</span></span>
               </label>
               <input
                 type="text"
@@ -4431,15 +5453,15 @@ export default function App() {
                   setRealtimeModelDraft(e.target.value);
                   if (modelSuccessMsg) setModelSuccessMsg("");
                 }}
-                className="w-full rounded-xl border border-slate-200 p-3 text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                className="ct-input w-full p-3 text-sm font-mono"
                 placeholder={`例如: ${DEFAULT_REALTIME_MODEL}`}
               />
             </div>
 
             <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
+              <label className="text-xs font-semibold text-slate-200 flex items-center justify-between">
                 <span>课堂纪要模型 <span className="text-slate-400 font-normal">（停止时生成总结；留空 = 跟随润色模型）</span></span>
-                <span className="text-[11px] text-slate-400">当前：<span className="font-mono">{runtimeSummaryModelName || `${runtimeModelName}（继承）`}</span></span>
+                <span className="text-[11px] text-slate-400">当前：<span className="font-mono text-slate-200">{runtimeSummaryModelName || `${runtimeModelName}（继承）`}</span></span>
               </label>
               <input
                 type="text"
@@ -4448,13 +5470,13 @@ export default function App() {
                   setSummaryModelDraft(e.target.value);
                   if (modelSuccessMsg) setModelSuccessMsg("");
                 }}
-                className="w-full rounded-xl border border-slate-200 p-3 text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                className="ct-input w-full p-3 text-sm font-mono"
                 placeholder="留空 = 复用润色模型"
               />
             </div>
 
             {modelSuccessMsg && (
-              <div className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+              <div className="ct-tag ct-tag-success text-sm rounded-lg px-3 py-2" style={{ display: "block" }}>
                 {modelSuccessMsg}
               </div>
             )}
@@ -4462,7 +5484,7 @@ export default function App() {
             <div className="flex flex-wrap gap-2 justify-end">
               <button
                 onClick={handleSaveModelConfig}
-                className="text-sm px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+                className="ct-btn-primary text-sm px-4 py-2 rounded-lg font-semibold"
               >
                 保存并应用
               </button>
@@ -4500,42 +5522,42 @@ export default function App() {
         )}
 
       {sessionCompletionModal.open && (
-        <div className="absolute inset-0 z-40 bg-slate-900/50 backdrop-blur-[1px] flex items-center justify-center p-4">
-          <div className="w-full max-w-md bg-white rounded-2xl border border-slate-200 shadow-2xl p-6">
-            <h3 className="text-lg font-bold text-slate-900">本次录制已完成</h3>
-            <p className="text-sm text-slate-500 mt-1">
+        <div className="absolute inset-0 z-40 bg-black/55 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md ct-panel p-6">
+            <h3 className="text-lg font-bold text-slate-100 tracking-tight">本次录制已完成</h3>
+            <p className="text-sm text-slate-400 mt-1">
               AI 润色与纪要已处理完成，下面是本次同传统计：
             </p>
 
             <div className="grid grid-cols-2 gap-3 mt-4">
-              <div className="rounded-xl border border-indigo-100 bg-indigo-50/60 px-3 py-2">
-                <p className="text-xs text-indigo-600 font-semibold">录制时长</p>
-                <p className="text-base font-bold text-indigo-900 mt-1">{formatTime(sessionCompletionModal.durationSec)}</p>
+              <div className="rounded-xl border border-indigo-400/25 bg-indigo-500/10 px-3 py-2">
+                <p className="text-xs text-indigo-300 font-semibold">录制时长</p>
+                <p className="text-base font-bold text-indigo-100 mt-1 font-mono">{formatTime(sessionCompletionModal.durationSec)}</p>
               </div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
-                <p className="text-xs text-slate-500 font-semibold">转录块数</p>
-                <p className="text-base font-bold text-slate-900 mt-1">{sessionCompletionModal.transcriptCount}</p>
+              <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2">
+                <p className="text-xs text-slate-400 font-semibold">转录块数</p>
+                <p className="text-base font-bold text-slate-100 mt-1 font-mono">{sessionCompletionModal.transcriptCount}</p>
               </div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
-                <p className="text-xs text-slate-500 font-semibold">英文词数</p>
-                <p className="text-base font-bold text-slate-900 mt-1">{sessionCompletionModal.enWordCount}</p>
+              <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2">
+                <p className="text-xs text-slate-400 font-semibold">英文词数</p>
+                <p className="text-base font-bold text-slate-100 mt-1 font-mono">{sessionCompletionModal.enWordCount}</p>
               </div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
-                <p className="text-xs text-slate-500 font-semibold">中文字数</p>
-                <p className="text-base font-bold text-slate-900 mt-1">{sessionCompletionModal.zhCharCount}</p>
+              <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2">
+                <p className="text-xs text-slate-400 font-semibold">中文字数</p>
+                <p className="text-base font-bold text-slate-100 mt-1 font-mono">{sessionCompletionModal.zhCharCount}</p>
               </div>
             </div>
 
             <div className="mt-5 flex flex-wrap justify-end gap-2">
               <button
                 onClick={() => setSessionCompletionModal((prev) => ({ ...prev, open: false }))}
-                className="px-3.5 py-2 text-sm rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100"
+                className="ct-btn-ghost px-3.5 py-2 text-sm rounded-lg font-semibold"
               >
                 稍后再录
               </button>
               <button
                 onClick={handleStartNextRecording}
-                className="px-4 py-2 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+                className="ct-btn-primary px-4 py-2 text-sm rounded-lg font-semibold"
               >
                 开始下一场录制
               </button>
@@ -4544,10 +5566,10 @@ export default function App() {
         </div>
       )}
 
-      <footer className="text-center py-4 text-xs text-slate-400 flex flex-wrap items-center justify-center gap-2 shrink-0 border-t border-slate-200 bg-slate-50">
+      <footer className="text-center py-4 text-xs text-slate-500 flex flex-wrap items-center justify-center gap-2 shrink-0 border-t border-white/10 bg-black/20 backdrop-blur-sm">
         <span>Dual Mode Translation Engine</span>
-        <span className="hidden sm:inline w-1 h-1 rounded-full bg-slate-300"></span>
-        <span>Aliyun DashScope & Web Speech API</span>
+        <span className="hidden sm:inline w-1 h-1 rounded-full bg-slate-600"></span>
+        <span>Aliyun DashScope & Paraformer Realtime</span>
       </footer>
       </div>
     </div>
