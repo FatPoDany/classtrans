@@ -9,13 +9,11 @@ import {
   Loader2,
   Sparkles,
   PictureInPicture,
-  FileText,
   ChevronDown,
   Settings,
   Pause,
   Play,
   User,
-  Save,
   Headphones,
   Home,
   FolderOpen,
@@ -2472,12 +2470,6 @@ export default function App() {
     }
   }, [loadSavedSessionsFromFolder, setErrorMsg, supportsDirectoryPicker]);
 
-  const ensureSessionFolderSelected = useCallback(async () => {
-    if (sessionFolderHandle) return true;
-    alert("开启同传前，请先选择或新建一个文件夹用于保存本次内容。");
-    return pickSessionFolder();
-  }, [pickSessionFolder, sessionFolderHandle]);
-
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(GLOSSARY_STORAGE_KEY);
@@ -3395,78 +3387,6 @@ export default function App() {
     }
   };
 
-  const getCleanedTranscripts = () => {
-    const filteredTranscripts = [];
-    const normalizeText = (text) => {
-      return text
-        .replace(/[^\w\s\u4e00-\u9fa5]/gi, "")
-        .toLowerCase()
-        .replace(/\s+/g, " ")
-        .trim();
-    };
-
-    for (let i = 0; i < transcripts.length; i++) {
-      const currentItem = transcripts[i];
-      if (
-        currentItem.en.includes("⚠️") ||
-        currentItem.en.includes("🔊") ||
-        currentItem.zh === "..."
-      )
-        continue;
-
-      let isDuplicateOrSubstr = false;
-      for (
-        let j = Math.max(0, filteredTranscripts.length - 3);
-        j < filteredTranscripts.length;
-        j++
-      ) {
-        const prevItem = filteredTranscripts[j];
-        const normCurrEn = normalizeText(currentItem.en);
-        const normPrevEn = normalizeText(prevItem.en);
-
-        if (normCurrEn.includes(normPrevEn) && normPrevEn.length > 5) {
-          filteredTranscripts[j] = currentItem;
-          isDuplicateOrSubstr = true;
-          break;
-        } else if (normPrevEn.includes(normCurrEn) && normCurrEn.length > 5) {
-          isDuplicateOrSubstr = true;
-          break;
-        }
-      }
-      if (!isDuplicateOrSubstr) {
-        filteredTranscripts.push(currentItem);
-      }
-    }
-    return filteredTranscripts;
-  };
-
-  const handleGenerateSummary = async () => {
-    const cleaned = getCleanedTranscripts();
-    if (cleaned.length === 0) {
-      alert("没有足够的记录来生成总结！");
-      return;
-    }
-    setSummaryResult("");
-
-    // 总结时带上发言人信息，帮助 AI 更好地区分上下文逻辑
-    const fullText = cleaned
-      .map((item) => `[${item.speaker || "主讲人"} - 英文]: ${item.en}\n[${item.speaker || "主讲人"} - 中文]: ${item.zh}`)
-      .join("\n\n");
-
-    try {
-      const summary = await generateSummaryWithAI(fullText);
-      setSummaryResult(summary);
-
-      const saved = await saveSessionToFolder(summary);
-      if (saved && sessionFolderHandle) {
-        await loadSavedSessionsFromFolder(sessionFolderHandle);
-      }
-      setActiveView("saved");
-    } catch (err) {
-      console.error(err);
-      setSummaryResult(`⚠️ 生成总结失败：\n${err.message}`);
-    }
-  };
 
   // --------------------------------------------------------------------------
   // 主页面智能滚屏逻辑 (Smart Auto-Scroll)
@@ -3738,17 +3658,6 @@ export default function App() {
     }
     setSelectedSavedSession((prev) => prev || allSavedSessions[0] || null);
     setActiveView("saved");
-  };
-
-  const handleManualSaveSession = async () => {
-    const hasFolder = await ensureSessionFolderSelected();
-    if (!hasFolder) return;
-
-    const ok = await saveSessionToFolder();
-    if (ok && sessionFolderHandle) {
-      await loadSavedSessionsFromFolder(sessionFolderHandle);
-      alert("本次同传记录已保存到所选文件夹。");
-    }
   };
 
   const formatSessionToHtml = useCallback((session) => {
@@ -4633,29 +4542,6 @@ export default function App() {
                 </div>
               )}
             </div>
-
-            {transcripts.length > 0 && (
-              <button
-                onClick={handleGenerateSummary}
-                className="flex items-center space-x-1 p-2 bg-purple-500/12 text-purple-200 hover:bg-purple-500/20 rounded-lg transition-colors text-sm font-medium border border-purple-400/30"
-                title="AI 一键生成课堂纪要"
-              >
-                <FileText className="w-4 h-4" />
-                <span className="hidden lg:inline">生成纪要</span>
-              </button>
-            )}
-
-            <div className="h-6 w-px bg-white/10 mx-1 hidden sm:block"></div>
-
-            {transcripts.length > 0 && (
-              <button
-                onClick={handleManualSaveSession}
-                className="p-2 text-slate-400 hover:text-emerald-300 hover:bg-emerald-500/12 rounded-lg transition-colors flex items-center justify-center border border-transparent hover:border-emerald-400/30"
-                title="保存当前同传到所选文件夹"
-              >
-                <Save className="w-4 h-4" />
-              </button>
-            )}
 
             <button
               onClick={togglePip}
