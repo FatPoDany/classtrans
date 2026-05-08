@@ -29,6 +29,7 @@ import {
   X,
   Sun,
   Moon,
+  RefreshCw,
 } from "lucide-react";
 import { ParaformerSession } from "./paraformerSession";
 
@@ -1028,12 +1029,37 @@ const generateSummaryWithAI = async (fullTextContent) => {
     body: JSON.stringify(payload),
   });
 
-  if (!response.ok) {
-    throw new Error(`Summary request failed: ${response.status}`);
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    data = null;
   }
-  const data = await response.json();
+
+  if (!response.ok) {
+    const upstreamMsg =
+      (data && (data.error?.message || data.error?.code || data.message)) ||
+      `HTTP ${response.status}`;
+    throw new Error(`生成纪要失败：${upstreamMsg}`);
+  }
+
+  if (data && data.error) {
+    const upstreamMsg =
+      typeof data.error === "string"
+        ? data.error
+        : data.error.message || data.error.code || "上游返回错误";
+    throw new Error(`生成纪要失败：${upstreamMsg}`);
+  }
+
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error(
+      "生成纪要失败：模型未返回内容（可能是配额耗尽 / 限流 / 模型名错误）"
+    );
+  }
+
   recordAiUsage({ type: "summary", model: modelName, usage: data?.usage });
-  return data.choices[0].message.content;
+  return content;
 };
 
 // ============================================================================
@@ -2079,6 +2105,7 @@ export default function App() {
   }, []);
   // Whole-bubble editor draft. shape: { scope, key, payload, enDraft, zhDraft }
   const [bubbleEditDraft, setBubbleEditDraft] = useState(null);
+  const [isRegeneratingSummary, setIsRegeneratingSummary] = useState(false);
   const [sessionCompletionModal, setSessionCompletionModal] = useState({
     open: false,
     durationSec: 0,
@@ -4197,6 +4224,97 @@ export default function App() {
     }
   }, [bubbleEditDraft, pushToast, sessionFolderHandle]);
 
+  // ---- 已保存会话：重新生成课堂纪要 ------------------------------------
+  const handleRegenerateSummary = useCallback(
+    async (session) => {
+      if (!session) return;
+      const transcripts = Array.isArray(session.transcripts) ? session.transcripts : [];
+      if (transcripts.length === 0) {
+        pushToast({ level: "warn", text: "该会话没有转录内容，无法生成纪要", ttl: 3000 });
+        return;
+      }
+
+      setIsRegeneratingSummary(true);
+      try {
+        const fullText = transcripts
+          .map(
+            (item) =>
+              `[${item.speaker || "主讲人"} - 英文]: ${item.en}\n[${item.speaker || "主讲人"} - 中文]: ${item.zh}`
+          )
+          .join("\n\n");
+
+        const newSummary = await generateSummaryWithAI(fullText);
+
+        if (session.isTemporary) {
+          setTemporarySessions((prev) =>
+            prev.map((s) =>
+              s.fileName === session.fileName ? { ...s, summary: newSummary } : s
+            )
+          );
+          setSelectedSavedSession((prev) =>
+            prev && prev.fileName === session.fileName
+              ? { ...prev, summary: newSummary }
+              : prev
+          );
+          pushToast({ level: "success", text: "课堂纪要已重新生成", ttl: 3000 });
+          return;
+        }
+
+        if (!sessionFolderHandle) {
+          pushToast({
+            level: "error",
+            text: "未选择保存文件夹，无法持久化新纪要",
+            ttl: 5000,
+          });
+          return;
+        }
+
+        const permission = await sessionFolderHandle.requestPermission({
+          mode: "readwrite",
+        });
+        if (permission !== "granted") {
+          pushToast({
+            level: "error",
+            text: "未获得文件夹写入权限，无法保存新纪要",
+            ttl: 5000,
+          });
+          return;
+        }
+
+        const fileHandle = await sessionFolderHandle.getFileHandle(session.fileName);
+        const file = await fileHandle.getFile();
+        const data = JSON.parse(await file.text());
+        data.summary = newSummary;
+        const writable = await fileHandle.createWritable();
+        await writable.write(JSON.stringify(data, null, 2));
+        await writable.close();
+
+        setSavedSessions((prev) =>
+          prev.map((s) =>
+            s.fileName === session.fileName ? { ...s, summary: newSummary } : s
+          )
+        );
+        setSelectedSavedSession((prev) =>
+          prev && prev.fileName === session.fileName
+            ? { ...prev, summary: newSummary }
+            : prev
+        );
+
+        pushToast({ level: "success", text: "课堂纪要已重新生成并写入文件", ttl: 3000 });
+      } catch (err) {
+        console.error("重新生成纪要失败:", err);
+        pushToast({
+          level: "error",
+          text: err && err.message ? err.message : `生成纪要失败：${err}`,
+          ttl: 7000,
+        });
+      } finally {
+        setIsRegeneratingSummary(false);
+      }
+    },
+    [pushToast, sessionFolderHandle]
+  );
+
   // 关闭 popover：点其他地方 / 滚动 / Esc
   useEffect(() => {
     if (!wordEditPopover) return;
@@ -5263,8 +5381,28 @@ export default function App() {
                     </p>
                     <div className="flex items-center gap-2">
                       <button
+                        onClick={() => handleRegenerateSummary(selectedSavedSession)}
+                        disabled={isRegeneratingSummary}
+                        className={`ct-btn-primary text-xs px-3 py-1.5 rounded-md font-semibold flex items-center gap-1.5 ${
+                          isRegeneratingSummary ? "opacity-60 cursor-not-allowed pointer-events-none" : ""
+                        }`}
+                        title="基于当前转录内容重新生成课堂纪要并写回文件"
+                      >
+                        {isRegeneratingSummary ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            生成中…
+                          </>
+                        ) : (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5" />
+                            重新生成纪要
+                          </>
+                        )}
+                      </button>
+                      <button
                         onClick={() => exportSavedSessionToWord(selectedSavedSession)}
-                        className="ct-btn-primary text-xs px-3 py-1.5 rounded-md font-semibold"
+                        className="ct-btn-ghost text-xs px-3 py-1.5 rounded-md font-semibold"
                       >
                         导出 Word
                       </button>
