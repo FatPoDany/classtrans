@@ -237,11 +237,27 @@ body {
 :root[data-theme="light"] .bg-rose-400 { background-color: #f43f5e; }
 :root[data-theme="light"] .bg-amber-300 { background-color: #f59e0b; }
 
-/* toast text colors that overlap with light body */
-:root[data-theme="light"] .ct-toast-info { color: #1e1b4b; }
-:root[data-theme="light"] .ct-toast-success { color: #064e3b; }
-:root[data-theme="light"] .ct-toast-warn { color: #78350f; }
-:root[data-theme="light"] .ct-toast-error { color: #881337; }
+/* Toast surfaces in light mode: dark backdrops flip to tinted-pastel + dark text */
+:root[data-theme="light"] .ct-toast-info {
+  background: rgba(238, 242, 255, 0.96);
+  border-color: rgba(99, 102, 241, 0.32);
+  color: #312e81;
+}
+:root[data-theme="light"] .ct-toast-success {
+  background: rgba(220, 252, 231, 0.96);
+  border-color: rgba(16, 185, 129, 0.32);
+  color: #064e3b;
+}
+:root[data-theme="light"] .ct-toast-warn {
+  background: rgba(254, 243, 199, 0.96);
+  border-color: rgba(251, 191, 36, 0.36);
+  color: #78350f;
+}
+:root[data-theme="light"] .ct-toast-error {
+  background: rgba(255, 228, 230, 0.96);
+  border-color: rgba(244, 63, 94, 0.36);
+  color: #881337;
+}
 
 /* subtle tweak to streaming text glow so it shows on light */
 :root[data-theme="light"] .ct-subtitle-zh-streaming {

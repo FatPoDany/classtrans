@@ -2106,6 +2106,9 @@ export default function App() {
   const lastTranslatedEnRef = useRef("");
   const isTranslatingRef = useRef(false);
   const silenceTimerRef = useRef(null);
+  // 每个 finalize 块的 polish promise 链都注册到这里；autoSave 时可以
+  // Promise.allSettled 等到全部落地，不再依赖 transcripts 状态轮询。
+  const polishPromisesRef = useRef(new Set());
   const systemAudioStreamRef = useRef(null);
   const systemAudioTrackRef = useRef(null);
   const paraformerSessionRef = useRef(null);
@@ -2163,10 +2166,14 @@ export default function App() {
     }
   };
 
-  // 计时器逻辑
+  // 计时器逻辑：finalizing 期间也停（按下停止后立刻冻结显示）
   useEffect(() => {
     let interval = null;
-    if ((listeningMode === "mic" || listeningMode === "tab") && !isPaused) {
+    if (
+      (listeningMode === "mic" || listeningMode === "tab") &&
+      !isPaused &&
+      !isFinalizingSession
+    ) {
       interval = setInterval(() => {
         setRecordingTime((prev) => prev + 1);
       }, 1000);
@@ -2174,7 +2181,7 @@ export default function App() {
       clearInterval(interval);
     }
     return () => clearInterval(interval);
-  }, [listeningMode, isPaused]);
+  }, [listeningMode, isPaused, isFinalizingSession]);
 
   const formatTime = (totalSeconds) => {
     const m = Math.floor(totalSeconds / 60);
@@ -2688,7 +2695,12 @@ export default function App() {
       });
     };
 
-    polishWithAI(textToFinalize, { onUpdate: onPolishStream, contextHistory })
+    // Track this block's polish chain so autoSave can Promise.allSettled
+    // every in-flight finalize, instead of polling React state with a timeout.
+    const polishWork = polishWithAI(textToFinalize, {
+      onUpdate: onPolishStream,
+      contextHistory,
+    })
       .then(async (aiSegments) => {
         cancelBaselineTimer();
 
@@ -2734,6 +2746,11 @@ export default function App() {
           false
         );
       });
+
+    polishPromisesRef.current.add(polishWork);
+    polishWork.finally(() => {
+      polishPromisesRef.current.delete(polishWork);
+    });
   }, []);
 
   useEffect(() => {
@@ -2873,36 +2890,42 @@ export default function App() {
       return { done, total };
     };
 
-    const waitForPolishCompletion = async (pollMs = 250) => {
-      // 先让最近一次 finalize 的 setState 落地，避免"还未入队就开始检查"的竞态
+    const waitForPolishCompletion = async () => {
+      // 让最近一次 finalize 的注册和 setState 都先落地
       await new Promise((resolve) => setTimeout(resolve, 120));
-
       updatePolishProgress();
 
-      // 超时按未完成块数动态估算：每块最多等 6s（覆盖 polish + qwen-turbo 兜底
-      // + 速率限制重排），整段最少 8s、最多 90s。这样一次性十几个 pending 块
-      // 也不会过早超时，但坏路径不会无限挂起。
-      const pendingAtStart = transcriptsRef.current.filter(isAiPolishPending).length;
-      const timeoutMs = Math.min(90_000, Math.max(8_000, pendingAtStart * 6_000));
-
-      const started = Date.now();
-      while (Date.now() - started < timeoutMs) {
+      // 直接等真实 polish promise 集合，每轮拿一份快照 allSettled。
+      // 期间可能有新的 finalize 进队（active 文本被收口），所以要循环到清空。
+      // 外层硬上限 3 min 兜底，防止某个 polish promise 永挂。
+      const HARD_TIMEOUT_MS = 3 * 60_000;
+      const sessionStarted = Date.now();
+      let safety = 50;
+      while (
+        polishPromisesRef.current.size > 0 &&
+        Date.now() - sessionStarted < HARD_TIMEOUT_MS &&
+        safety-- > 0
+      ) {
+        const snapshot = [...polishPromisesRef.current];
         updatePolishProgress();
-        const hasPending = transcriptsRef.current.some(isAiPolishPending);
-        if (!hasPending) return;
-        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        const remaining = HARD_TIMEOUT_MS - (Date.now() - sessionStarted);
+        await Promise.race([
+          Promise.allSettled(snapshot),
+          new Promise((resolve) => setTimeout(resolve, Math.max(1, remaining))),
+        ]);
+        // 给 React 一个 tick 让 splice 的 setState 落地，再决定是否还有新增
+        await new Promise((resolve) => setTimeout(resolve, 80));
       }
 
-      // 超时仍有 pending：记录一笔，外层 cleaned filter 仍会按 isAiPolishPending 排除
-      const stillPending = transcriptsRef.current.filter(isAiPolishPending).length;
-      if (stillPending > 0) {
+      updatePolishProgress();
+      const leftover = polishPromisesRef.current.size;
+      if (leftover > 0) {
         console.warn(
-          `autoSaveCurrentSessionWithSummary: ${stillPending} block(s) still pending after ${Math.round(
-            timeoutMs / 1000
-          )}s, proceeding without them`
+          `autoSaveCurrentSessionWithSummary: ${leftover} polish promise(s) still in-flight after ${Math.round(
+            HARD_TIMEOUT_MS / 1000
+          )}s hard timeout`
         );
       }
-      updatePolishProgress();
     };
 
     setIsFinalizingSession(true);
@@ -3515,6 +3538,7 @@ export default function App() {
   const shortcutHandlersRef = useRef({});
   shortcutHandlersRef.current = {
     listeningMode,
+    isFinalizingSession,
     togglePause,
     toggleMicMode,
     startTabMode,
@@ -3535,6 +3559,7 @@ export default function App() {
       if (isFromInput(e.target)) return;
 
       const h = shortcutHandlersRef.current;
+      if (h.isFinalizingSession) return; // 收尾期间快捷键全部冻结
 
       switch (e.code) {
         case "Space": {
@@ -4539,8 +4564,11 @@ export default function App() {
                 {isPaused ? (
                   <button
                     onClick={togglePause}
-                    title="继续收音（Space）"
-                    className="ct-btn-success flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm"
+                    disabled={isFinalizingSession}
+                    title={isFinalizingSession ? "正在收尾，请稍候" : "继续收音（Space）"}
+                    className={`ct-btn-success flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm ${
+                      isFinalizingSession ? "opacity-50 cursor-not-allowed pointer-events-none" : ""
+                    }`}
                   >
                     <Play className="w-4 h-4 fill-current" />
                     <span className="hidden sm:inline">继续收音</span>
@@ -4549,8 +4577,11 @@ export default function App() {
                 ) : (
                   <button
                     onClick={togglePause}
-                    title="暂时挂起（Space）"
-                    className="ct-btn-warn flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm"
+                    disabled={isFinalizingSession}
+                    title={isFinalizingSession ? "正在收尾，请稍候" : "暂时挂起（Space）"}
+                    className={`ct-btn-warn flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm ${
+                      isFinalizingSession ? "opacity-50 cursor-not-allowed pointer-events-none" : ""
+                    }`}
                   >
                     <Pause className="w-4 h-4 fill-current" />
                     <span className="hidden sm:inline">暂时挂起</span>
@@ -4560,12 +4591,19 @@ export default function App() {
 
                 <button
                   onClick={listeningMode === "mic" ? toggleMicMode : stopTabMode}
-                  title="彻底停止（Esc）"
-                  className="ct-btn-danger flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm"
+                  disabled={isFinalizingSession}
+                  title={isFinalizingSession ? "正在收尾，请稍候" : "彻底停止（Esc）"}
+                  className={`ct-btn-danger flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm ${
+                    isFinalizingSession ? "opacity-50 cursor-not-allowed pointer-events-none" : ""
+                  }`}
                 >
                   <Square className="w-4 h-4 fill-current" />
-                  <span className="hidden sm:inline">彻底停止</span>
-                  <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-rose-300/15 text-[10px] font-mono rounded border border-rose-300/40">Esc</kbd>
+                  <span className="hidden sm:inline">
+                    {isFinalizingSession ? "收尾中…" : "彻底停止"}
+                  </span>
+                  {!isFinalizingSession && (
+                    <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-rose-300/15 text-[10px] font-mono rounded border border-rose-300/40">Esc</kbd>
+                  )}
                 </button>
               </div>
             )}
