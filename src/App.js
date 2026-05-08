@@ -467,8 +467,27 @@ const parseGlossaryDraft = (draftText) => {
   return { pairs: Array.from(dedupeMap.values()) };
 };
 
+// 模型生成的纪要里经常夹带 &lt; / &gt; / &amp; 这种 HTML 实体（训练语料里
+// 大量包含 escaped HTML），如果直接 escapeHtml 会把 & 二次转成 &amp; 让用户
+// 看到字面 "&lt;html&gt;"。先做一次单层解码，再 escape，保持幂等。
+const HTML_ENTITY_DECODE_MAP = {
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&apos;": "'",
+  "&#39;": "'",
+  "&#x27;": "'",
+  "&amp;": "&",
+};
+
+const decodeHtmlEntitiesOnce = (value) =>
+  String(value ?? "").replace(
+    /&(?:lt|gt|quot|apos|amp|#39|#x27);/gi,
+    (m) => HTML_ENTITY_DECODE_MAP[m.toLowerCase()] || m
+  );
+
 const escapeHtml = (value) =>
-  String(value ?? "")
+  decodeHtmlEntitiesOnce(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
