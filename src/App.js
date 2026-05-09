@@ -748,6 +748,17 @@ const isTranslationTextSuspicious = (text) => {
   );
 };
 
+// 历史会话气泡是否"未经 AI 精调"。优先看显式 isPolished 标志；
+// 早期保存文件没有该字段，则回退到 speaker 启发式：质量门控 / 超时降级
+// 路径会把 speaker 写成"⚠️ AI超时降级"或"🛡️ 质量守卫(机译保底)"。
+const isSavedBubbleUnpolished = (item) => {
+  if (!item) return false;
+  if (item.isPolished === true) return false;
+  if (item.isPolished === false) return true;
+  const speaker = String(item.speaker || "");
+  return /AI\s*超时降级|质量守卫|机译保底/.test(speaker);
+};
+
 const evaluateAiPolishQuality = ({ rawEn, aiSegments, basicZh }) => {
   if (!Array.isArray(aiSegments) || aiSegments.length === 0) {
     return { ok: false, reason: "empty_segments" };
@@ -2123,6 +2134,8 @@ export default function App() {
   // Whole-bubble editor draft. shape: { scope, key, payload, enDraft, zhDraft }
   const [bubbleEditDraft, setBubbleEditDraft] = useState(null);
   const [isRegeneratingSummary, setIsRegeneratingSummary] = useState(false);
+  // 历史会话中正在重新 AI 精调的气泡 key 集合："${fileName}::${bubbleIdx}"
+  const [polishingSavedKeys, setPolishingSavedKeys] = useState(() => new Set());
   const [sessionCompletionModal, setSessionCompletionModal] = useState({
     open: false,
     durationSec: 0,
@@ -2360,6 +2373,8 @@ export default function App() {
           speaker: item.speaker || "👩‍🏫 主讲人",
           en: item.en,
           zh: item.zh,
+          // 持久化精调标记，让历史会话视图能区分"已 AI 精调" vs "机译/降级"
+          isPolished: item.isPolished === true,
         })),
       };
     },
@@ -4243,6 +4258,159 @@ export default function App() {
     [pushToast, sessionFolderHandle]
   );
 
+  // 对历史会话中"未精调"的单条气泡触发 AI 精调；用法与 finalize 阶段一致：
+  // - 取相邻 ≤2 条已成型转录作为术语 / 代词上下文
+  // - 调用 polishWithAI 取得新的 segments
+  // - 走同一套 evaluateAiPolishQuality 质量门控；不通过则保留原文
+  // - 通过则用新 segments 在原位置 splice（AI 可能按说话人切分成多条）
+  // - 临时会话仅改内存；磁盘会话写回 JSON
+  const polishSavedBubble = useCallback(
+    async (session, bubbleIdx) => {
+      if (!session) return;
+      const transcripts = Array.isArray(session.transcripts) ? session.transcripts : [];
+      const target = transcripts[bubbleIdx];
+      if (!target) return;
+      if (!isSavedBubbleUnpolished(target)) return;
+
+      const rawEn = String(target.en || "").trim();
+      if (!rawEn) {
+        pushToast({ level: "warn", text: "该气泡没有英文内容，无法精调", ttl: 3000 });
+        return;
+      }
+
+      const key = `${session.fileName}::${bubbleIdx}`;
+      if (polishingSavedKeys.has(key)) return;
+
+      setPolishingSavedKeys((prev) => {
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+
+      try {
+        const contextHistory = transcripts
+          .slice(0, bubbleIdx)
+          .filter((t) => t && t.en && t.zh && t.zh !== "...")
+          .slice(-2)
+          .map((t) => ({ en: t.en, zh: t.zh }));
+
+        const aiSegments = await polishWithAI(rawEn, { contextHistory });
+
+        const qualityCheck = evaluateAiPolishQuality({
+          rawEn,
+          aiSegments,
+          basicZh: String(target.zh || ""),
+        });
+
+        if (!qualityCheck.ok) {
+          console.warn("AI polish quality gate fallback:", qualityCheck.reason);
+          pushToast({
+            level: "warn",
+            text: "AI 精调结果未通过质量门控，已保留原文。",
+            ttl: 5000,
+          });
+          return;
+        }
+
+        const baseId = target.id || `${session.fileName}-${bubbleIdx}`;
+        const newItems = aiSegments.map((seg, idx) => ({
+          id: `${baseId}-polish-${idx}`,
+          speaker: seg.speaker || "👩‍🏫 主讲人",
+          en: smartPunctuateEnglish(seg.en || rawEn, true),
+          zh: seg.zh || target.zh,
+          isPolished: true,
+        }));
+
+        const buildNextTranscripts = (current) => {
+          const arr = Array.isArray(current) ? [...current] : [];
+          if (!arr[bubbleIdx]) return arr;
+          arr.splice(bubbleIdx, 1, ...newItems);
+          return arr;
+        };
+
+        if (session.isTemporary) {
+          setTemporarySessions((prev) =>
+            prev.map((s) =>
+              s.fileName === session.fileName
+                ? { ...s, transcripts: buildNextTranscripts(s.transcripts) }
+                : s
+            )
+          );
+          setSelectedSavedSession((prev) =>
+            prev && prev.fileName === session.fileName
+              ? { ...prev, transcripts: buildNextTranscripts(prev.transcripts) }
+              : prev
+          );
+          pushToast({ level: "success", text: "AI 精调完成", ttl: 2500 });
+          return;
+        }
+
+        if (!sessionFolderHandle) {
+          pushToast({
+            level: "error",
+            text: "未选择保存文件夹，无法持久化精调结果",
+            ttl: 5000,
+          });
+          return;
+        }
+
+        const permission = await sessionFolderHandle.requestPermission({
+          mode: "readwrite",
+        });
+        if (permission !== "granted") {
+          pushToast({
+            level: "error",
+            text: "未获得文件夹写入权限，无法保存精调结果",
+            ttl: 5000,
+          });
+          return;
+        }
+
+        const fileHandle = await sessionFolderHandle.getFileHandle(session.fileName);
+        const file = await fileHandle.getFile();
+        const data = JSON.parse(await file.text());
+        if (!data || !Array.isArray(data.transcripts) || !data.transcripts[bubbleIdx]) {
+          throw new Error("会话文件结构异常");
+        }
+        data.transcripts.splice(bubbleIdx, 1, ...newItems);
+
+        const writable = await fileHandle.createWritable();
+        await writable.write(JSON.stringify(data, null, 2));
+        await writable.close();
+
+        setSavedSessions((prev) =>
+          prev.map((s) =>
+            s.fileName === session.fileName
+              ? { ...s, transcripts: data.transcripts }
+              : s
+          )
+        );
+        setSelectedSavedSession((prev) =>
+          prev && prev.fileName === session.fileName
+            ? { ...prev, transcripts: data.transcripts }
+            : prev
+        );
+
+        pushToast({ level: "success", text: "AI 精调完成并已写入文件", ttl: 3000 });
+      } catch (err) {
+        console.error("AI 精调失败:", err);
+        pushToast({
+          level: "error",
+          text: `AI 精调失败：${err && err.message ? err.message : err}`,
+          ttl: 7000,
+        });
+      } finally {
+        setPolishingSavedKeys((prev) => {
+          if (!prev.has(key)) return prev;
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
+      }
+    },
+    [polishingSavedKeys, pushToast, sessionFolderHandle]
+  );
+
   // 关闭 popover：点其他地方 / 滚动 / Esc
   useEffect(() => {
     if (!wordEditPopover) return;
@@ -5354,6 +5522,9 @@ export default function App() {
                           const savedEditKey = `saved-${selectedSavedSession.fileName}-${idx}`;
                           const isEditing =
                             bubbleEditDraft && bubbleEditDraft.key === savedEditKey;
+                          const polishKey = `${selectedSavedSession.fileName}::${idx}`;
+                          const isPolishingThis = polishingSavedKeys.has(polishKey);
+                          const showPolishButton = isSavedBubbleUnpolished(item);
                           return (
                             <div key={`${selectedSavedSession.fileName}-${idx}`} className="ct-card p-4">
                               <div className="flex items-center justify-between gap-2 mb-2">
@@ -5362,24 +5533,53 @@ export default function App() {
                                   {item.speaker || "👩‍🏫 主讲人"}
                                 </div>
                                 {!isEditing && (
-                                  <button
-                                    onClick={() =>
-                                      openBubbleEditor(
-                                        "saved",
-                                        {
-                                          session: selectedSavedSession,
-                                          bubbleIdx: idx,
-                                        },
-                                        item.en,
-                                        item.zh
-                                      )
-                                    }
-                                    className="opacity-40 hover:opacity-100 p-1 rounded-md text-slate-400 hover:text-slate-100 hover:bg-white/[0.06] border border-transparent hover:border-white/10 transition-all shrink-0"
-                                    title="编辑这一条转录的中英文"
-                                    aria-label="编辑气泡"
-                                  >
-                                    <Pencil className="w-3.5 h-3.5" />
-                                  </button>
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    {showPolishButton && (
+                                      <button
+                                        onClick={() =>
+                                          polishSavedBubble(selectedSavedSession, idx)
+                                        }
+                                        disabled={isPolishingThis}
+                                        className={`text-xs px-2 py-1 rounded-md font-semibold flex items-center gap-1 border transition-colors ${
+                                          isPolishingThis
+                                            ? "border-violet-400/30 bg-violet-500/10 text-violet-200 opacity-70 cursor-not-allowed"
+                                            : "border-violet-400/30 bg-violet-500/10 text-violet-200 hover:bg-violet-500/20 hover:text-violet-100"
+                                        }`}
+                                        title="使用 AI 重新精调这一条转录的中英文（适用于因配额耗尽等原因未精调的气泡）"
+                                        aria-label="AI 精调这一条转录"
+                                      >
+                                        {isPolishingThis ? (
+                                          <>
+                                            <Loader2 className="w-3 h-3 animate-spin" />
+                                            精调中…
+                                          </>
+                                        ) : (
+                                          <>
+                                            <Sparkles className="w-3 h-3" />
+                                            AI 精调
+                                          </>
+                                        )}
+                                      </button>
+                                    )}
+                                    <button
+                                      onClick={() =>
+                                        openBubbleEditor(
+                                          "saved",
+                                          {
+                                            session: selectedSavedSession,
+                                            bubbleIdx: idx,
+                                          },
+                                          item.en,
+                                          item.zh
+                                        )
+                                      }
+                                      className="opacity-40 hover:opacity-100 p-1 rounded-md text-slate-400 hover:text-slate-100 hover:bg-white/[0.06] border border-transparent hover:border-white/10 transition-all"
+                                      title="编辑这一条转录的中英文"
+                                      aria-label="编辑气泡"
+                                    >
+                                      <Pencil className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
                                 )}
                               </div>
                               {isEditing ? (
