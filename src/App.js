@@ -125,13 +125,16 @@ const translateRealtimeFast = async (text) => {
 const MODEL_STORAGE_KEY = "classtrans.aiModelName.v1";
 const REALTIME_MODEL_STORAGE_KEY = "classtrans.realtimeModelName.v1";
 const SUMMARY_MODEL_STORAGE_KEY = "classtrans.summaryModelName.v1";
+const ASR_MODEL_STORAGE_KEY = "classtrans.asrModelName.v1";
 
 const DEFAULT_POLISH_MODEL = "qwen3.5-122b-a10b";
 const DEFAULT_REALTIME_MODEL = "qwen-turbo";
+const DEFAULT_ASR_MODEL = "paraformer-realtime-v2";
 
 let runtimeModelName = DEFAULT_POLISH_MODEL;
 let runtimeRealtimeModelName = DEFAULT_REALTIME_MODEL;
 let runtimeSummaryModelName = ""; // 空 → 回退到 polish 模型
+let runtimeAsrModelName = DEFAULT_ASR_MODEL;
 
 try {
   if (typeof window !== "undefined") {
@@ -141,8 +144,14 @@ try {
     const r = ls.getItem(REALTIME_MODEL_STORAGE_KEY);
     if (r) runtimeRealtimeModelName = r;
     runtimeSummaryModelName = ls.getItem(SUMMARY_MODEL_STORAGE_KEY) || "";
+    const a = ls.getItem(ASR_MODEL_STORAGE_KEY);
+    if (a) runtimeAsrModelName = a;
   }
 } catch (err) {}
+
+// 仅 Paraformer 系列支持 vocabulary_id 热词偏置；切到 Gummy 等其他系列时跳过
+const isParaformerFamilyModel = (name) =>
+  /^paraformer-/i.test(String(name || "").trim());
 
 export const setGlobalModelName = (name) => {
   const cleanName = String(name || "").trim();
@@ -173,6 +182,14 @@ const setGlobalSummaryModelName = (name) => {
     } else {
       window.localStorage.removeItem(SUMMARY_MODEL_STORAGE_KEY);
     }
+  } catch (e) {}
+};
+
+const setGlobalAsrModelName = (name) => {
+  const cleanName = String(name || "").trim() || DEFAULT_ASR_MODEL;
+  runtimeAsrModelName = cleanName;
+  try {
+    window.localStorage.setItem(ASR_MODEL_STORAGE_KEY, cleanName);
   } catch (e) {}
 };
 
@@ -2148,6 +2165,7 @@ export default function App() {
   const [modelDraft, setModelDraft] = useState("");
   const [realtimeModelDraft, setRealtimeModelDraft] = useState("");
   const [summaryModelDraft, setSummaryModelDraft] = useState("");
+  const [asrModelDraft, setAsrModelDraft] = useState("");
   const [modelSuccessMsg, setModelSuccessMsg] = useState("");
 
   const [aiUsageLog, setAiUsageLog] = useState(() => readUsageLog());
@@ -3124,7 +3142,11 @@ export default function App() {
         wsUrl: PARAFORMER_WS_URL,
         audioTrack,
         languageHints: ["en"],
-        vocabularyId: getStoredVocabularyId() || undefined,
+        model: runtimeAsrModelName,
+        // 热词偏置（vocabulary_id）目前是 Paraformer 独有功能；切到 Gummy 等系列时不要带
+        vocabularyId: isParaformerFamilyModel(runtimeAsrModelName)
+          ? getStoredVocabularyId() || undefined
+          : undefined,
         // Defer rotation while user is mid-utterance. ParaformerSession will
         // wait for a "safe window" (this returns true) before swapping the
         // pipeline, with a hard ceiling so it can't defer forever.
@@ -3641,6 +3663,7 @@ export default function App() {
     setModelDraft(runtimeModelName);
     setRealtimeModelDraft(runtimeRealtimeModelName);
     setSummaryModelDraft(runtimeSummaryModelName);
+    setAsrModelDraft(runtimeAsrModelName);
     setActiveView("modelConfig");
   };
 
@@ -3648,7 +3671,8 @@ export default function App() {
     setGlobalModelName(modelDraft);
     setGlobalRealtimeModelName(realtimeModelDraft);
     setGlobalSummaryModelName(summaryModelDraft);
-    setModelSuccessMsg("模型配置已保存并立即生效！");
+    setGlobalAsrModelName(asrModelDraft);
+    setModelSuccessMsg("模型配置已保存并立即生效！下次启动识别时新模型生效。");
     setTimeout(() => {
       setModelSuccessMsg("");
       setActiveView("home");
@@ -5702,7 +5726,7 @@ export default function App() {
           <div className="ct-panel p-6 space-y-5 min-h-[78vh]">
             <h2 className="text-lg font-bold text-slate-100 tracking-tight">配置 AI 模型</h2>
             <p className="text-sm text-slate-300 leading-relaxed">
-              三个调用点各自可换模型。可以分别填入有免费额度的不同模型名，分摊到不同账户 / 不同免费配额上。保存后立即生效。
+              四个调用点各自可换模型。可以分别填入有免费额度的不同模型名，分摊到不同账户 / 不同免费配额上。LLM 三项保存后立即生效；语音识别模型在下次启动识别时生效。
             </p>
 
             <div className="space-y-2">
@@ -5754,6 +5778,26 @@ export default function App() {
                 className="ct-input w-full p-3 text-sm font-mono"
                 placeholder="留空 = 复用润色模型"
               />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-200 flex items-center justify-between">
+                <span>语音识别模型 <span className="text-slate-400 font-normal">（DashScope 16 kHz 实时 ASR；下次启动识别时生效）</span></span>
+                <span className="text-[11px] text-slate-400">当前：<span className="font-mono text-slate-200">{runtimeAsrModelName || DEFAULT_ASR_MODEL}</span></span>
+              </label>
+              <input
+                type="text"
+                value={asrModelDraft}
+                onChange={(e) => {
+                  setAsrModelDraft(e.target.value);
+                  if (modelSuccessMsg) setModelSuccessMsg("");
+                }}
+                className="ct-input w-full p-3 text-sm font-mono"
+                placeholder={`例如: ${DEFAULT_ASR_MODEL} / paraformer-realtime-v1 / gummy-realtime-v1`}
+              />
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                必须是 16 kHz 实时 ASR 模型；8 kHz (paraformer-realtime-8k-*) 暂不支持。切到非 Paraformer 系列后，自定义术语热词偏置会自动跳过（hot-word 仅 Paraformer 支持）。
+              </p>
             </div>
 
             {modelSuccessMsg && (

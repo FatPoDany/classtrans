@@ -14,7 +14,7 @@
 // onUpdate is called with { fullText, finalText, confidence } whenever the
 // running transcript changes; the caller drives its own silence timer / UI.
 
-const PARAFORMER_MODEL = "paraformer-realtime-v2";
+const DEFAULT_PARAFORMER_MODEL = "paraformer-realtime-v2";
 const FRAME_SIZE = 1600; // 100 ms at 16 kHz
 const TARGET_SAMPLE_RATE = 16000;
 const TASK_STARTED_TIMEOUT_MS = 5000;
@@ -92,6 +92,7 @@ export class ParaformerSession {
     audioTrack,
     languageHints,
     vocabularyId,
+    model,
     onUpdate,
     onError,
     onStatus,
@@ -106,6 +107,7 @@ export class ParaformerSession {
       ? languageHints
       : ["en"];
     this.vocabularyId = (vocabularyId && String(vocabularyId).trim()) || null;
+    this.model = (model && String(model).trim()) || DEFAULT_PARAFORMER_MODEL;
     this.onUpdate = typeof onUpdate === "function" ? onUpdate : () => {};
     this.onError = typeof onError === "function" ? onError : () => {};
     this.onStatus = typeof onStatus === "function" ? onStatus : () => {};
@@ -334,7 +336,7 @@ export class ParaformerSession {
         task_group: "audio",
         task: "asr",
         function: "recognition",
-        model: PARAFORMER_MODEL,
+        model: this.model,
         parameters,
         input: {},
       },
