@@ -14,7 +14,7 @@
 // onUpdate is called with { fullText, finalText, confidence } whenever the
 // running transcript changes; the caller drives its own silence timer / UI.
 
-const DEFAULT_PARAFORMER_MODEL = "paraformer-realtime-v2";
+const DEFAULT_PARAFORMER_MODEL = "paraformer-realtime-v1";
 const FRAME_SIZE = 1600; // 100 ms at 16 kHz
 const TARGET_SAMPLE_RATE = 16000;
 const TASK_STARTED_TIMEOUT_MS = 5000;

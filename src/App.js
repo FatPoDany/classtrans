@@ -129,7 +129,7 @@ const ASR_MODEL_STORAGE_KEY = "classtrans.asrModelName.v1";
 
 const DEFAULT_POLISH_MODEL = "qwen3.5-122b-a10b";
 const DEFAULT_REALTIME_MODEL = "qwen-turbo";
-const DEFAULT_ASR_MODEL = "paraformer-realtime-v2";
+const DEFAULT_ASR_MODEL = "paraformer-realtime-v1";
 
 let runtimeModelName = DEFAULT_POLISH_MODEL;
 let runtimeRealtimeModelName = DEFAULT_REALTIME_MODEL;
@@ -288,7 +288,7 @@ let customClassroomTermRules = [];
 // Paraformer 热词词典：自定义术语保存时同步注册到 DashScope，得到 vocabulary_id
 // 后续 ASR 会话在 run-task 的 parameters 里带上它，实现声学层的偏置纠错
 // ============================================================================
-const PARAFORMER_VOCAB_TARGET_MODEL = "paraformer-realtime-v2";
+const PARAFORMER_VOCAB_TARGET_MODEL = "paraformer-realtime-v1";
 const PARAFORMER_VOCAB_PREFIX = "classtrans";
 const PARAFORMER_VOCAB_DEFAULT_WEIGHT = 4;
 
