@@ -1,0 +1,15 @@
+# Cloudflare Pages configuration for classtrans
+#
+# This file is used by `wrangler pages dev` for local development.
+# Production deployment uses `wrangler pages deploy` or the Cloudflare
+# Dashboard Git integration.
+#
+# Required secret (set via Dashboard or CLI):
+#   wrangler pages secret put DASHSCOPE_API_KEY --project-name classtrans
+
+name = "classtrans"
+compatibility_date = "2024-09-01"
+
+[vars]
+# Non-secret environment variables can go here.
+# DASHSCOPE_API_KEY must be set as a secret, not here.
