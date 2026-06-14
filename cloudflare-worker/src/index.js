@@ -71,7 +71,6 @@ export default {
         headers: {
           Upgrade: "websocket",
           Authorization: `bearer ${env.DASHSCOPE_API_KEY}`,
-          "X-DashScope-DataInspection": "enable",
         },
       });
     } catch (err) {
