@@ -35,6 +35,7 @@ import { useAuth } from './AuthContext';
 import AuthPage from './pages/AuthPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 import { useCloudSettings } from './hooks/useCloudSettings';
+import { useGlobalSettings } from './hooks/useGlobalSettings';
 import { useCloudGlossary } from './hooks/useCloudGlossary';
 import { useCloudSessions } from './hooks/useCloudSessions';
 
@@ -2036,20 +2037,24 @@ const UsageView = ({ log, onClear }) => {
 };
 
 export default function App() {
-  const { user, loading, signOut, session } = useAuth();
-  if (loading) return null; // Wait for initial auth check
+  const { user, loading: authLoading, signOut, session, isAdmin } = useAuth();
+  
+  if (authLoading) return null; // Wait for initial auth check
 
   return (
     <Routes>
       <Route path="/auth" element={user ? <Navigate to="/" /> : <AuthPage />} />
       <Route path="/reset-password" element={<ResetPasswordPage />} />
-      <Route path="/*" element={user ? <MainApp user={user} signOut={signOut} authSession={session} /> : <Navigate to="/auth" />} />
+      <Route path="/*" element={user ? <MainApp user={user} signOut={signOut} authSession={session} isAdmin={isAdmin} /> : <Navigate to="/auth" />} />
     </Routes>
   );
 }
 
-function MainApp({ user, signOut, authSession }) {
+function MainApp({ user, signOut, authSession, isAdmin }) {
   React.useEffect(() => { setGlobalApiToken(authSession?.access_token || ""); }, [authSession]);
+  
+  const { settings: globalSettings, loading: globalSettingsLoading, updateSettings } = useGlobalSettings();
+  const { aiModelName, realtimeModelName, summaryModelName, asrModelName } = globalSettings;
 
 
   const [listeningMode, setListeningMode] = useState("none");
@@ -4638,18 +4643,21 @@ function MainApp({ user, signOut, authSession }) {
               {!isSidebarCollapsed && <span>术语词典</span>}
             </button>
 
+
+            {isAdmin && (
             <button
-              onClick={openModelConfigModal}
+              onClick={() => setActiveView("admin")}
               className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
-                activeView === "modelConfig"
-                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
+                activeView === "admin"
+                  ? "bg-amber-500/15 text-amber-200 border-amber-400/30"
                   : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
               }`}
-              title="配置模型"
+              title="后台管理"
             >
-              <Cpu className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>配置模型</span>}
+              <Settings className="w-4 h-4 shrink-0" />
+              {!isSidebarCollapsed && <span>后台管理</span>}
             </button>
+            )}
 
             <button
               onClick={() => setActiveView("usage")}
@@ -5754,97 +5762,57 @@ function MainApp({ user, signOut, authSession }) {
           </div>
         )}
 
-        {activeView === "modelConfig" && (
+
+        
+        {activeView === "admin" && isAdmin && (
           <div className="ct-panel p-6 space-y-5 min-h-[78vh]">
-            <h2 className="text-lg font-bold text-slate-100 tracking-tight">配置 AI 模型</h2>
+            <h2 className="text-lg font-bold text-amber-400 tracking-tight flex items-center gap-2">
+              <Settings className="w-5 h-5" /> 后台管理 - 全局 AI 模型配置
+            </h2>
             <p className="text-sm text-slate-300 leading-relaxed">
-              四个调用点各自可换模型。可以分别填入有免费额度的不同模型名，分摊到不同账户 / 不同免费配额上。LLM 三项保存后立即生效；语音识别模型在下次启动识别时生效。
+              您是管理员。在此处修改的模型配置将立刻对全站所有用户生效。
             </p>
 
-            <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-200 flex items-center justify-between">
-                <span>润色模型 <span className="text-slate-400 font-normal">（用于 finalize 后段的 polish 流式输出）</span></span>
-                <span className="text-[11px] text-slate-400">当前：<span className="font-mono text-slate-200">{runtimeModelName}</span></span>
-              </label>
-              <input
-                type="text"
-                value={modelDraft}
-                onChange={(e) => {
-                  setModelDraft(e.target.value);
-                  if (modelSuccessMsg) setModelSuccessMsg("");
-                }}
-                className="ct-input w-full p-3 text-sm font-mono"
-                placeholder={`例如: ${DEFAULT_POLISH_MODEL}`}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-200 flex items-center justify-between">
-                <span>实时机翻模型 <span className="text-slate-400 font-normal">（活气泡的快速 ZH 跟进 + finalize 兜底）</span></span>
-                <span className="text-[11px] text-slate-400">当前：<span className="font-mono text-slate-200">{runtimeRealtimeModelName || DEFAULT_REALTIME_MODEL}</span></span>
-              </label>
-              <input
-                type="text"
-                value={realtimeModelDraft}
-                onChange={(e) => {
-                  setRealtimeModelDraft(e.target.value);
-                  if (modelSuccessMsg) setModelSuccessMsg("");
-                }}
-                className="ct-input w-full p-3 text-sm font-mono"
-                placeholder={`例如: ${DEFAULT_REALTIME_MODEL}`}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-200 flex items-center justify-between">
-                <span>课堂纪要模型 <span className="text-slate-400 font-normal">（停止时生成总结；留空 = 跟随润色模型）</span></span>
-                <span className="text-[11px] text-slate-400">当前：<span className="font-mono text-slate-200">{runtimeSummaryModelName || `${runtimeModelName}（继承）`}</span></span>
-              </label>
-              <input
-                type="text"
-                value={summaryModelDraft}
-                onChange={(e) => {
-                  setSummaryModelDraft(e.target.value);
-                  if (modelSuccessMsg) setModelSuccessMsg("");
-                }}
-                className="ct-input w-full p-3 text-sm font-mono"
-                placeholder="留空 = 复用润色模型"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-200 flex items-center justify-between">
-                <span>语音识别模型 <span className="text-slate-400 font-normal">（DashScope 16 kHz 实时 ASR；下次启动识别时生效）</span></span>
-                <span className="text-[11px] text-slate-400">当前：<span className="font-mono text-slate-200">{runtimeAsrModelName || DEFAULT_ASR_MODEL}</span></span>
-              </label>
-              <input
-                type="text"
-                value={asrModelDraft}
-                onChange={(e) => {
-                  setAsrModelDraft(e.target.value);
-                  if (modelSuccessMsg) setModelSuccessMsg("");
-                }}
-                className="ct-input w-full p-3 text-sm font-mono"
-                placeholder={`例如: ${DEFAULT_ASR_MODEL} / paraformer-realtime-v1 / gummy-realtime-v1`}
-              />
-              <p className="text-[11px] text-slate-400 leading-relaxed">
-                必须是 16 kHz 实时 ASR 模型；8 kHz (paraformer-realtime-8k-*) 暂不支持。切到非 Paraformer 系列后，自定义术语热词偏置会自动跳过（hot-word 仅 Paraformer 支持）。
-              </p>
-            </div>
-
-            {modelSuccessMsg && (
-              <div className="ct-tag ct-tag-success text-sm rounded-lg px-3 py-2" style={{ display: "block" }}>
-                {modelSuccessMsg}
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-slate-200">润色模型 (Polish)</label>
+                <input
+                  type="text"
+                  value={aiModelName}
+                  onChange={(e) => updateSettings({ aiModelName: e.target.value })}
+                  className="ct-input w-full p-3 text-sm font-mono"
+                />
               </div>
-            )}
 
-            <div className="flex flex-wrap gap-2 justify-end">
-              <button
-                onClick={handleSaveModelConfig}
-                className="ct-btn-primary text-sm px-4 py-2 rounded-lg font-semibold"
-              >
-                保存并应用
-              </button>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-slate-200">实时机翻模型 (Realtime)</label>
+                <input
+                  type="text"
+                  value={realtimeModelName}
+                  onChange={(e) => updateSettings({ realtimeModelName: e.target.value })}
+                  className="ct-input w-full p-3 text-sm font-mono"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-slate-200">课堂纪要模型 (Summary)</label>
+                <input
+                  type="text"
+                  value={summaryModelName}
+                  onChange={(e) => updateSettings({ summaryModelName: e.target.value })}
+                  className="ct-input w-full p-3 text-sm font-mono"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-slate-200">语音识别模型 (ASR)</label>
+                <input
+                  type="text"
+                  value={asrModelName}
+                  onChange={(e) => updateSettings({ asrModelName: e.target.value })}
+                  className="ct-input w-full p-3 text-sm font-mono"
+                />
+              </div>
             </div>
           </div>
         )}

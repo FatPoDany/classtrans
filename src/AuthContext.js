@@ -6,13 +6,29 @@ const AuthContext = createContext(null);
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  const fetchProfile = async (userId) => {
+    if (!userId) {
+      setProfile(null);
+      setIsAdmin(false);
+      return;
+    }
+    const { data } = await supabase.from('profiles').select('*').eq('id', userId).single();
+    if (data) {
+      setProfile(data);
+      setIsAdmin(!!data.is_admin);
+    }
+  };
 
   useEffect(() => {
     // Get initial session
     supabase.auth.getSession().then(({ data: { session: s } }) => {
       setSession(s);
       setUser(s?.user ?? null);
+      if (s?.user) fetchProfile(s.user.id);
       setLoading(false);
     });
 
@@ -21,6 +37,12 @@ export function AuthProvider({ children }) {
       (_event, s) => {
         setSession(s);
         setUser(s?.user ?? null);
+        if (s?.user) {
+          fetchProfile(s.user.id);
+        } else {
+          setProfile(null);
+          setIsAdmin(false);
+        }
         setLoading(false);
       }
     );
@@ -69,6 +91,8 @@ export function AuthProvider({ children }) {
   const value = {
     user,
     session,
+    profile,
+    isAdmin,
     loading,
     signUp,
     signIn,
