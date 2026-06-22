@@ -2056,6 +2056,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const { settings: globalSettings, loading: globalSettingsLoading, updateSettings } = useGlobalSettings();
   const { aiModelName, realtimeModelName, summaryModelName, asrModelName } = globalSettings;
 
+  React.useEffect(() => {
+    if (aiModelName) setGlobalModelName(aiModelName);
+    if (realtimeModelName) setGlobalRealtimeModelName(realtimeModelName);
+    if (summaryModelName) setGlobalSummaryModelName(summaryModelName);
+    if (asrModelName) setGlobalAsrModelName(asrModelName);
+  }, [aiModelName, realtimeModelName, summaryModelName, asrModelName]);
 
   const [listeningMode, setListeningMode] = useState("none");
   const [isPaused, setIsPaused] = useState(false);
