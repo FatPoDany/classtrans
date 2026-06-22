@@ -14,11 +14,14 @@ CREATE TABLE IF NOT EXISTS public.global_settings (
 
 -- 3. Insert default models
 INSERT INTO public.global_settings (key, value) VALUES
-  ('ai_model_name', 'qwen3.5-122b-a10b'),
+  ('ai_model_name', 'qwen-plus'),
   ('realtime_model_name', 'qwen-turbo'),
-  ('summary_model_name', 'qwen3.5-122b-a10b'),
+  ('summary_model_name', 'qwen-plus'),
   ('asr_model_name', 'paraformer-realtime-v2')
-ON CONFLICT (key) DO NOTHING;
+ON CONFLICT (key) DO UPDATE
+  SET value = EXCLUDED.value,
+      updated_at = now()
+  WHERE public.global_settings.value = 'qwen3.5-122b-a10b';
 
 -- 4. Enable RLS
 ALTER TABLE public.global_settings ENABLE ROW LEVEL SECURITY;

@@ -1,11 +1,14 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../supabaseClient';
 
+const normalizeLegacyModelName = (value) =>
+  value === 'qwen3.5-122b-a10b' ? 'qwen-plus' : value;
+
 export function useGlobalSettings() {
   const [settings, setSettings] = useState({
-    aiModelName: 'qwen3.5-122b-a10b',
+    aiModelName: 'qwen-plus',
     realtimeModelName: 'qwen-turbo',
-    summaryModelName: 'qwen3.5-122b-a10b',
+    summaryModelName: 'qwen-plus',
     asrModelName: 'paraformer-realtime-v2'
   });
   const [loading, setLoading] = useState(true);
@@ -18,9 +21,9 @@ export function useGlobalSettings() {
       if (data && data.length > 0) {
         const newSettings = { ...settings };
         data.forEach(item => {
-          if (item.key === 'ai_model_name') newSettings.aiModelName = item.value;
+          if (item.key === 'ai_model_name') newSettings.aiModelName = normalizeLegacyModelName(item.value);
           if (item.key === 'realtime_model_name') newSettings.realtimeModelName = item.value;
-          if (item.key === 'summary_model_name') newSettings.summaryModelName = item.value;
+          if (item.key === 'summary_model_name') newSettings.summaryModelName = normalizeLegacyModelName(item.value);
           if (item.key === 'asr_model_name') newSettings.asrModelName = item.value;
         });
         setSettings(newSettings);

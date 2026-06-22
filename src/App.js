@@ -139,9 +139,14 @@ const REALTIME_MODEL_STORAGE_KEY = "classtrans.realtimeModelName.v1";
 const SUMMARY_MODEL_STORAGE_KEY = "classtrans.summaryModelName.v1";
 const ASR_MODEL_STORAGE_KEY = "classtrans.asrModelName.v1";
 
-const DEFAULT_POLISH_MODEL = "qwen3.5-122b-a10b";
+const DEFAULT_POLISH_MODEL = "qwen-plus";
 const DEFAULT_REALTIME_MODEL = "qwen-turbo";
 const DEFAULT_ASR_MODEL = "paraformer-realtime-v1";
+
+const normalizeLegacyPolishModelName = (name) => {
+  const cleanName = String(name || "").trim();
+  return cleanName === "qwen3.5-122b-a10b" ? DEFAULT_POLISH_MODEL : cleanName;
+};
 
 let runtimeModelName = DEFAULT_POLISH_MODEL;
 let runtimeRealtimeModelName = DEFAULT_REALTIME_MODEL;
@@ -152,10 +157,12 @@ try {
   if (typeof window !== "undefined") {
     const ls = window.localStorage;
     const m = ls.getItem(MODEL_STORAGE_KEY);
-    if (m) runtimeModelName = m;
+    if (m) runtimeModelName = normalizeLegacyPolishModelName(m);
     const r = ls.getItem(REALTIME_MODEL_STORAGE_KEY);
     if (r) runtimeRealtimeModelName = r;
-    runtimeSummaryModelName = ls.getItem(SUMMARY_MODEL_STORAGE_KEY) || "";
+    runtimeSummaryModelName = normalizeLegacyPolishModelName(
+      ls.getItem(SUMMARY_MODEL_STORAGE_KEY) || ""
+    );
     const a = ls.getItem(ASR_MODEL_STORAGE_KEY);
     if (a) runtimeAsrModelName = a;
   }
@@ -166,7 +173,7 @@ const isParaformerFamilyModel = (name) =>
   /^paraformer-/i.test(String(name || "").trim());
 
 export const setGlobalModelName = (name) => {
-  const cleanName = String(name || "").trim();
+  const cleanName = normalizeLegacyPolishModelName(name);
   if (cleanName) {
     runtimeModelName = cleanName;
     try {
@@ -186,7 +193,7 @@ const setGlobalRealtimeModelName = (name) => {
 };
 
 const setGlobalSummaryModelName = (name) => {
-  const cleanName = String(name || "").trim();
+  const cleanName = normalizeLegacyPolishModelName(name);
   runtimeSummaryModelName = cleanName;
   try {
     if (cleanName) {
@@ -293,7 +300,6 @@ const CLASSROOM_TERM_RULES = [
 const GLOSSARY_STORAGE_KEY = "classtrans.customGlossaryTerms.v1";
 const VOCAB_ID_STORAGE_KEY = "classtrans.paraformerVocabularyId.v1";
 const VOCAB_SIGNATURE_STORAGE_KEY = "classtrans.paraformerVocabularySignature.v1";
-const SESSION_FILE_SUFFIX = ".classtrans.json";
 let customClassroomTermRules = [];
 
 // ============================================================================
@@ -785,7 +791,7 @@ const isSavedBubbleUnpolished = (item) => {
   if (item.isPolished === true) return false;
   if (item.isPolished === false) return true;
   const speaker = String(item.speaker || "");
-  return /AI\s*超时降级|质量守卫|机译保底/.test(speaker);
+  return /AI\s*超时降级|AI报错|AI保底|质量守卫|机译保底/.test(speaker);
 };
 
 const evaluateAiPolishQuality = ({ rawEn, aiSegments, basicZh }) => {
@@ -908,6 +914,8 @@ const normalizePolishSegments = (segments, rawEn) =>
 
 // 等多久 polish 还没出第一个 ZH delta，再启动 qwen-turbo 基线（用于质量门控对比 + 兜底）
 const POLISH_BASELINE_DELAY_MS = 2500;
+const POLISH_PRIMARY_TIMEOUT_MS = 30_000;
+const POLISH_FALLBACK_TIMEOUT_MS = 18_000;
 
 const POLISH_SYSTEM_PROMPT = `You are a professional interpreter and context analyzer. Output ONLY plain text in the segment format below. Do NOT use JSON, do NOT wrap in code fences, do NOT add any preamble or trailing commentary.
 
@@ -950,112 +958,173 @@ const buildPolishUserMessage = (rawEn, contextHistory) => {
 const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) => {
   const url = `/api/polish`;
 
-  const polishModel = runtimeModelName;
-  const payload = {
-    model: polishModel,
-    stream: true,
-    stream_options: { include_usage: true },
-    messages: [
-      { role: "system", content: POLISH_SYSTEM_PROMPT },
-      { role: "user", content: buildPolishUserMessage(rawEn, contextHistory) },
-    ],
-  };
+  const runPolishStream = async (polishModel, timeoutMs) => {
+    const payload = {
+      model: polishModel,
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [
+        { role: "system", content: POLISH_SYSTEM_PROMPT },
+        { role: "user", content: buildPolishUserMessage(rawEn, contextHistory) },
+      ],
+    };
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": globalApiToken ? `Bearer ${globalApiToken}` : "" },
-    body: JSON.stringify(payload),
-    signal,
-  });
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    const abortFromParent = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) abortFromParent();
+      else signal.addEventListener("abort", abortFromParent, { once: true });
+    }
 
-  if (!response.ok || !response.body) {
-    let errMessage = `Polish stream failed: ${response.status}`;
+    let reader = null;
+    let sseBuffer = "";
+    let assistantText = "";
+    let lastEmittedSnapshot = "";
+    let capturedUsage = null;
+    let streamError = null;
+    const decoder = new TextDecoder("utf-8");
+
+    const emitProgress = () => {
+      if (!onUpdate) return;
+      if (assistantText === lastEmittedSnapshot) return;
+      lastEmittedSnapshot = assistantText;
+      try {
+        onUpdate(parseLineFormatSegments(assistantText));
+      } catch (e) {
+        console.warn("polish onUpdate threw:", e);
+      }
+    };
+
+    const ingestSseJson = (json) => {
+      if (!json) return;
+      if (json.error) {
+        const errMsg =
+          typeof json.error === "string"
+            ? json.error
+            : json.error?.message || "upstream error";
+        throw new Error(errMsg);
+      }
+      const delta = json?.choices?.[0]?.delta?.content || "";
+      if (delta) {
+        assistantText += delta;
+        emitProgress();
+      }
+      if (json.usage && Number(json.usage.total_tokens || 0) > 0) {
+        capturedUsage = json.usage;
+      }
+    };
+
+    const consumeBufferedLine = (rawLine) => {
+      if (!rawLine.startsWith("data:")) return;
+      const dataStr = rawLine.slice(5).trim();
+      if (!dataStr || dataStr === "[DONE]") return;
+      try {
+        ingestSseJson(JSON.parse(dataStr));
+      } catch (e) {
+        if (!(e instanceof SyntaxError)) throw e;
+      }
+    };
+
     try {
-      const errBody = await response.json();
-      if (errBody?.error) errMessage = typeof errBody.error === "string" ? errBody.error : JSON.stringify(errBody.error);
-    } catch (e) {}
-    throw new Error(errMessage);
-  }
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": globalApiToken ? `Bearer ${globalApiToken}` : "",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let sseBuffer = "";
-  let assistantText = "";
-  let lastEmittedSnapshot = "";
-  let capturedUsage = null;
-
-  const emitProgress = () => {
-    if (!onUpdate) return;
-    if (assistantText === lastEmittedSnapshot) return;
-    lastEmittedSnapshot = assistantText;
-    try {
-      onUpdate(parseLineFormatSegments(assistantText));
-    } catch (e) {
-      console.warn("polish onUpdate threw:", e);
-    }
-  };
-
-  const ingestSseJson = (json) => {
-    if (!json) return;
-    if (json.error) {
-      const errMsg = typeof json.error === "string" ? json.error : json.error?.message || "upstream error";
-      throw new Error(errMsg);
-    }
-    const delta = json?.choices?.[0]?.delta?.content || "";
-    if (delta) {
-      assistantText += delta;
-      emitProgress();
-    }
-    if (json.usage && Number(json.usage.total_tokens || 0) > 0) {
-      capturedUsage = json.usage;
-    }
-  };
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      sseBuffer += decoder.decode(value, { stream: true });
-
-      let newlineIdx;
-      while ((newlineIdx = sseBuffer.indexOf("\n")) !== -1) {
-        const rawLine = sseBuffer.slice(0, newlineIdx).replace(/\r$/, "");
-        sseBuffer = sseBuffer.slice(newlineIdx + 1);
-
-        if (!rawLine.startsWith("data:")) continue;
-        const dataStr = rawLine.slice(5).trim();
-        if (!dataStr || dataStr === "[DONE]") continue;
-
+      if (!response.ok || !response.body) {
+        let errMessage = `Polish stream failed: ${response.status}`;
         try {
-          ingestSseJson(JSON.parse(dataStr));
-        } catch (e) {
-          if (e instanceof SyntaxError) continue;
-          throw e;
+          const errBody = await response.json();
+          if (errBody?.error) {
+            errMessage =
+              typeof errBody.error === "string"
+                ? errBody.error
+                : JSON.stringify(errBody.error);
+          }
+        } catch (e) {}
+        const err = new Error(errMessage);
+        err.status = response.status;
+        throw err;
+      }
+
+      reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sseBuffer += decoder.decode(value, { stream: true });
+
+        let newlineIdx;
+        while ((newlineIdx = sseBuffer.indexOf("\n")) !== -1) {
+          const rawLine = sseBuffer.slice(0, newlineIdx).replace(/\r$/, "");
+          sseBuffer = sseBuffer.slice(newlineIdx + 1);
+          consumeBufferedLine(rawLine);
         }
       }
+    } catch (error) {
+      streamError =
+        timedOut && !signal?.aborted
+          ? new Error(`AI polish timeout after ${Math.round(timeoutMs / 1000)}s`)
+          : error;
+    } finally {
+      clearTimeout(timeout);
+      if (signal) signal.removeEventListener?.("abort", abortFromParent);
+      try { reader?.releaseLock(); } catch (e) {}
     }
-  } finally {
-    try { reader.releaseLock(); } catch (e) {}
-  }
 
-  if (sseBuffer.startsWith("data:")) {
-    const dataStr = sseBuffer.slice(5).trim();
-    if (dataStr && dataStr !== "[DONE]") {
-      try { ingestSseJson(JSON.parse(dataStr)); } catch (e) {}
+    if (sseBuffer.startsWith("data:")) {
+      const dataStr = sseBuffer.slice(5).trim();
+      if (dataStr && dataStr !== "[DONE]") {
+        try { ingestSseJson(JSON.parse(dataStr)); } catch (e) {}
+      }
     }
-  }
 
-  if (capturedUsage) {
-    recordAiUsage({ type: "polish", model: polishModel, usage: capturedUsage });
-  }
+    if (capturedUsage) {
+      recordAiUsage({ type: "polish", model: polishModel, usage: capturedUsage });
+    }
 
-  const segments = parseLineFormatSegments(assistantText);
-  if (segments.length === 0 || segments.every((seg) => !String(seg.zh || "").trim())) {
+    const segments = parseLineFormatSegments(assistantText);
+    if (segments.length > 0 && segments.some((seg) => String(seg.zh || "").trim())) {
+      return normalizePolishSegments(segments, rawEn);
+    }
+
+    if (streamError) throw streamError;
+
     console.warn("AI 流式输出无法解析为有效片段。Raw output:", assistantText);
     throw new Error("AI 流式输出为空或缺失中文翻译");
-  }
+  };
 
-  return normalizePolishSegments(segments, rawEn);
+  const primaryModel = runtimeModelName || DEFAULT_POLISH_MODEL;
+  const fallbackModel = (runtimeRealtimeModelName || DEFAULT_REALTIME_MODEL).trim();
+
+  try {
+    return await runPolishStream(primaryModel, POLISH_PRIMARY_TIMEOUT_MS);
+  } catch (error) {
+    const status = Number(error?.status || 0);
+    const canRetryFastModel =
+      fallbackModel &&
+      fallbackModel !== primaryModel &&
+      status !== 401 &&
+      status !== 403 &&
+      !signal?.aborted;
+
+    if (!canRetryFastModel) throw error;
+
+    console.warn(
+      `AI polish primary model ${primaryModel} failed, retrying ${fallbackModel}:`,
+      error
+    );
+    return runPolishStream(fallbackModel, POLISH_FALLBACK_TIMEOUT_MS);
+  }
 };
 
 const generateSummaryWithAI = async (fullTextContent) => {
@@ -2153,21 +2222,19 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const [activeView, setActiveView] = useState("home");
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const sessionFolderHandle = true;
-  const setSessionFolderHandle = () => {};
-  const [sessionFolderName, setSessionFolderName] = useState("");
+  const sessionFolderName = "云端自动保存";
   const {
     sessions: cloudSessions,
     loadSessions,
+    getSession: cloudGetSession,
     saveSession: cloudSaveSession,
     deleteSession: cloudDeleteSession,
     updateSession: cloudUpdateSession,
-    updateTranscript: cloudUpdateTranscript
+    updateTranscript: cloudUpdateTranscript,
+    replaceTranscripts: cloudReplaceTranscripts,
   } = useCloudSessions(user.id);
   const savedSessions = cloudSessions;
-  const setSavedSessions = () => {};
-  const temporarySessions = [];
-  const setTemporarySessions = () => {};
+  const [temporarySessions, setTemporarySessions] = useState([]);
   const [selectedSavedSession, setSelectedSavedSession] = useState(null);
   const [savedSessionsQuery, setSavedSessionsQuery] = useState("");
   const [titleDraft, setTitleDraft] = useState(null); // null = not editing
@@ -2204,6 +2271,19 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     zhCharCount: 0,
     mode: "mic",
   });
+
+  useEffect(() => {
+    loadSessions(0);
+  }, [loadSessions]);
+
+  const patchSelectedSavedSession = useCallback((fileName, patchOrUpdater) => {
+    setSelectedSavedSession((prev) => {
+      if (!prev || prev.fileName !== fileName) return prev;
+      return typeof patchOrUpdater === "function"
+        ? patchOrUpdater(prev)
+        : { ...prev, ...patchOrUpdater };
+    });
+  }, []);
 
   const [modelDraft, setModelDraft] = useState("");
   const [realtimeModelDraft, setRealtimeModelDraft] = useState("");
@@ -2325,9 +2405,6 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     };
   };
 
-  const supportsDirectoryPicker =
-    typeof window !== "undefined" && typeof window.showDirectoryPicker === "function";
-
   const stopSystemAudioCapture = useCallback(() => {
     if (systemAudioTrackRef.current) {
       try {
@@ -2434,6 +2511,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           speaker: item.speaker || "👩‍🏫 主讲人",
           en: item.en,
           zh: item.zh,
+          confidence: item.confidence || 0,
           // 持久化精调标记，让历史会话视图能区分"已 AI 精调" vs "机译/降级"
           isPolished: item.isPolished === true,
         })),
@@ -2443,108 +2521,71 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   );
 
   const saveSessionToFolder = useCallback(
-    async (overrideSummary = "") => {
+    async (overrideSummary = "", options = {}) => {
       const payload = buildSessionPayload(overrideSummary);
       if (!payload.transcripts.length && !payload.summary) return false;
 
-      if (!sessionFolderHandle) {
-        setTemporarySessions((prev) => [
-          {
-            fileName: `temp-${payload.id}`,
-            createdAt: payload.createdAt,
-            summary: payload.summary,
-            transcripts: payload.transcripts,
-            title: payload.title,
-            isTemporary: true,
-          },
-          ...prev,
-        ]);
-        return true;
-      }
+      const stats = getSessionStatsFromTranscripts(payload.transcripts);
+      const fallbackTempSession = {
+        fileName: `temp-${payload.id}`,
+        createdAt: payload.createdAt,
+        summary: payload.summary,
+        transcripts: payload.transcripts,
+        title: payload.title,
+        isTemporary: true,
+      };
 
       try {
-        const permission = await sessionFolderHandle.requestPermission({ mode: "readwrite" });
-        if (permission !== "granted") {
-          setErrorMsg("未获得文件夹写入权限，无法保存本次同传记录。");
-          return false;
+        const saved = await cloudSaveSession({
+          title: payload.title,
+          summary: payload.summary,
+          durationSec: options.durationSec || 0,
+          wordCount: stats.enWordCount,
+          mode: options.mode || "mic",
+          transcripts: payload.transcripts,
+        });
+
+        if (!saved) {
+          throw new Error("云端未返回保存结果");
         }
 
-        const stamp = new Date().toISOString().replace(/[.:]/g, "-");
-        const fileHandle = await sessionFolderHandle.getFileHandle(
-          `classtrans_${stamp}${SESSION_FILE_SUFFIX}`,
-          { create: true }
-        );
-        const writable = await fileHandle.createWritable();
-        await writable.write(JSON.stringify(payload, null, 2));
-        await writable.close();
+        setSelectedSavedSession(saved);
         return true;
       } catch (err) {
-        console.error("保存同传记录失败:", err);
-        setErrorMsg("保存同传记录失败，请检查文件夹权限。" );
-        return false;
+        console.error("云端保存同传记录失败，已转为临时内存保存:", err);
+        setTemporarySessions((prev) => [
+          fallbackTempSession,
+          ...prev,
+        ]);
+        setSelectedSavedSession(fallbackTempSession);
+        pushToast({
+          level: "warn",
+          text: "云端保存失败，本次记录已临时保存在当前页面，请稍后重试导出或刷新前处理。",
+          ttl: 7000,
+        });
+        return true;
       }
     },
-    [buildSessionPayload, sessionFolderHandle, setErrorMsg]
+    [buildSessionPayload, cloudSaveSession, pushToast]
   );
 
-  const loadSavedSessionsFromFolder = useCallback(async (folderHandle) => {
-    if (!folderHandle) {
-      setSavedSessions([]);
-      return;
-    }
-
+  const loadSavedSessionsFromFolder = useCallback(async () => {
     try {
-      const sessions = [];
-      for await (const [name, entry] of folderHandle.entries()) {
-        if (entry.kind !== "file" || !name.endsWith(SESSION_FILE_SUFFIX)) continue;
-
-        try {
-          const file = await entry.getFile();
-          const text = await file.text();
-          const data = JSON.parse(text);
-          sessions.push({
-            fileName: name,
-            createdAt: data.createdAt || file.lastModified,
-            summary: data.summary || "",
-            transcripts: Array.isArray(data.transcripts) ? data.transcripts : [],
-            title: data.title || name,
-            isTemporary: false,
-          });
-        } catch (err) {
-          console.warn("读取会话文件失败:", name, err);
-        }
-      }
-
-      sessions.sort(
-        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-      );
-      setSavedSessions(sessions);
+      return await loadSessions(0);
     } catch (err) {
-      console.error("加载已保存会话失败:", err);
-      setErrorMsg("读取文件夹中的历史会话失败，请重新选择文件夹。");
+      console.error("加载云端会话失败:", err);
+      setErrorMsg("读取云端历史会话失败，请稍后重试。");
+      return [];
     }
-  }, [setErrorMsg]);
+  }, [loadSessions, setErrorMsg]);
 
   const pickSessionFolder = useCallback(async () => {
-    if (!supportsDirectoryPicker) {
-      alert("当前浏览器不支持文件夹选择功能，请使用最新版 Chrome 或 Edge。");
-      return false;
-    }
-
-    try {
-      const folderHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-      setSessionFolderHandle(folderHandle);
-      setSessionFolderName(folderHandle.name || "未命名文件夹");
-      await loadSavedSessionsFromFolder(folderHandle);
-      return true;
-    } catch (err) {
-      if (err?.name !== "AbortError") {
-        console.error("选择文件夹失败:", err);
-        setErrorMsg("选择文件夹失败，请重试。");
-      }
-      return false;
-    }
-  }, [loadSavedSessionsFromFolder, setErrorMsg, supportsDirectoryPicker]);
+    const loaded = await loadSavedSessionsFromFolder();
+    setSelectedSavedSession((prev) => prev || loaded?.[0] || null);
+    setActiveView("saved");
+    pushToast({ level: "success", text: "云端会话已刷新", ttl: 2500 });
+    return true;
+  }, [loadSavedSessionsFromFolder, pushToast]);
 
   useEffect(() => {
     try {
@@ -2833,7 +2874,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         }
 
         console.warn("AI polish quality gate fallback:", qualityCheck.reason);
-        const fallback = baselineZh || (await ensureBaseline());
+        const fallback = baselineZh || (await ensureBaseline()) || currentInterimZh;
         applyFinalSegments(
           [
             {
@@ -2848,11 +2889,11 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       .catch(async (error) => {
         cancelBaselineTimer();
         console.warn("AI Polish failed:", error);
-        const fallback = await ensureBaseline();
+        const fallback = (await ensureBaseline()) || currentInterimZh;
         applyFinalSegments(
           [
             {
-              speaker: "⚠️ AI超时降级",
+              speaker: "🛟 AI保底翻译",
               en: textToFinalize,
               zh: fallback || "[基础翻译异常]",
             },
@@ -3069,10 +3110,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       const sessionStats = getSessionStatsFromTranscripts(cleaned);
 
       if (cleaned.length === 0) {
-        await saveSessionToFolder(summaryResult);
-        if (sessionFolderHandle) {
-          await loadSavedSessionsFromFolder(sessionFolderHandle);
-        }
+        await saveSessionToFolder(summaryResult, {
+          durationSec: sessionDurationSec,
+          mode: restartMode,
+        });
         setActiveView("saved");
         if (showCompletionModal) {
           setSessionCompletionModal({
@@ -3111,10 +3152,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         }
       }
 
-      await saveSessionToFolder(nextSummary);
-      if (sessionFolderHandle) {
-        await loadSavedSessionsFromFolder(sessionFolderHandle);
-      }
+      await saveSessionToFolder(nextSummary, {
+        durationSec: sessionDurationSec,
+        mode: restartMode,
+      });
       setActiveView("saved");
       if (showCompletionModal) {
         setSessionCompletionModal({
@@ -3129,7 +3170,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     } finally {
       setIsFinalizingSession(false);
       setFinalizingProgress({ done: 0, total: 0, phase: "idle" });
-      // 本次同传已落盘 / 已写入临时列表 → 把首页清空，回首页就是干净下一场的起点。
+      // 本次同传已保存到云端 / 已写入临时列表 → 把首页清空，回首页就是干净下一场的起点。
       // 完整内容仍可在"已保存"视图回看。
       setTranscripts([]);
       setActiveEn("");
@@ -3150,9 +3191,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     }
   }, [
     finalizeCurrentBlock,
-    loadSavedSessionsFromFolder,
     saveSessionToFolder,
-    sessionFolderHandle,
     summaryResult,
   ]);
 
@@ -3735,12 +3774,32 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   };
 
   const openSavedSessions = async () => {
-    if (sessionFolderHandle) {
-      await loadSavedSessionsFromFolder(sessionFolderHandle);
-    }
-    setSelectedSavedSession((prev) => prev || allSavedSessions[0] || null);
+    const loaded = await loadSavedSessionsFromFolder();
+    setSelectedSavedSession((prev) => {
+      if (prev) {
+        return loaded.find((session) => session.fileName === prev.fileName) || prev;
+      }
+      return loaded[0] || allSavedSessions[0] || null;
+    });
     setActiveView("saved");
   };
+
+  const selectSavedSession = useCallback(
+    async (session) => {
+      if (!session) return;
+      setSelectedSavedSession(session);
+      if (session.isTemporary || !session.id) return;
+
+      try {
+        const fullSession = await cloudGetSession(session.id);
+        if (fullSession) setSelectedSavedSession(fullSession);
+      } catch (err) {
+        console.error("加载云端会话详情失败:", err);
+        pushToast({ level: "error", text: "加载会话详情失败，请重试", ttl: 5000 });
+      }
+    },
+    [cloudGetSession, pushToast]
+  );
 
   const formatSessionToHtml = useCallback((session) => {
     const summaryMarkdownHtml = renderMarkdownToSafeHtml(session?.summary || "（该会话未保存纪要）");
@@ -3857,47 +3916,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         return;
       }
 
-      if (!sessionFolderHandle) {
-        setTitleDraft(null);
-        return;
-      }
-
       try {
-        const permission = await sessionFolderHandle.requestPermission({
-          mode: "readwrite",
-        });
-        if (permission !== "granted") {
-          pushToast({
-            level: "error",
-            text: "未获得文件夹写入权限，无法重命名",
-            ttl: 5000,
-          });
-          setTitleDraft(null);
-          return;
-        }
-
-        const fileHandle = await sessionFolderHandle.getFileHandle(
-          session.fileName
-        );
-        const file = await fileHandle.getFile();
-        const text = await file.text();
-        const data = JSON.parse(text);
-        data.title = newTitle;
-
-        const writable = await fileHandle.createWritable();
-        await writable.write(JSON.stringify(data, null, 2));
-        await writable.close();
-
-        setSavedSessions((prev) =>
-          prev.map((s) =>
-            s.fileName === session.fileName ? { ...s, title: newTitle } : s
-          )
-        );
-        setSelectedSavedSession((prev) =>
-          prev && prev.fileName === session.fileName
-            ? { ...prev, title: newTitle }
-            : prev
-        );
+        const { error } = await cloudUpdateSession(session.id, { title: newTitle });
+        if (error) throw error;
+        patchSelectedSavedSession(session.fileName, { title: newTitle });
         pushToast({ level: "success", text: "会话标题已更新", ttl: 2500 });
       } catch (err) {
         console.error("重命名会话失败:", err);
@@ -3910,7 +3932,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         setTitleDraft(null);
       }
     },
-    [pushToast, sessionFolderHandle]
+    [cloudUpdateSession, patchSelectedSavedSession, pushToast]
   );
 
   // ---- 单词级修正：点词→弹小窗→替换+可选加入词典 ----------------------
@@ -3970,47 +3992,20 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         return;
       }
 
-      if (!sessionFolderHandle) return;
       try {
-        const permission = await sessionFolderHandle.requestPermission({
-          mode: "readwrite",
-        });
-        if (permission !== "granted") {
-          pushToast({
-            level: "error",
-            text: "未获得文件夹写入权限，无法保存修正",
-            ttl: 5000,
-          });
-          return;
-        }
+        const currentTranscripts = Array.isArray(session.transcripts)
+          ? session.transcripts
+          : [];
+        const target = currentTranscripts[bubbleIdx];
+        if (!target?.id) throw new Error("会话转录缺少云端 ID");
 
-        const fileHandle = await sessionFolderHandle.getFileHandle(session.fileName);
-        const file = await fileHandle.getFile();
-        const data = JSON.parse(await file.text());
-        if (!data || !Array.isArray(data.transcripts) || !data.transcripts[bubbleIdx]) {
-          throw new Error("会话文件结构异常");
-        }
-        data.transcripts[bubbleIdx] = {
-          ...data.transcripts[bubbleIdx],
-          en: replaceWordAt(data.transcripts[bubbleIdx].en, wordIdx, newWord),
-        };
-
-        const writable = await fileHandle.createWritable();
-        await writable.write(JSON.stringify(data, null, 2));
-        await writable.close();
-
-        setSavedSessions((prev) =>
-          prev.map((s) =>
-            s.fileName === session.fileName
-              ? { ...s, transcripts: data.transcripts }
-              : s
-          )
+        const nextEn = replaceWordAt(target.en, wordIdx, newWord);
+        const nextTranscripts = currentTranscripts.map((item, idx) =>
+          idx === bubbleIdx ? { ...item, en: nextEn } : item
         );
-        setSelectedSavedSession((prev) =>
-          prev && prev.fileName === session.fileName
-            ? { ...prev, transcripts: data.transcripts }
-            : prev
-        );
+        const { error } = await cloudUpdateTranscript(target.id, { en: nextEn });
+        if (error) throw error;
+        patchSelectedSavedSession(session.fileName, { transcripts: nextTranscripts });
       } catch (err) {
         console.error("保存修正失败:", err);
         pushToast({
@@ -4020,7 +4015,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         });
       }
     },
-    [pushToast, sessionFolderHandle]
+    [cloudUpdateTranscript, patchSelectedSavedSession, pushToast]
   );
 
   const addCorrectionToGlossary = useCallback(
@@ -4178,50 +4173,29 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       return;
     }
 
-    if (!sessionFolderHandle) {
-      setBubbleEditDraft(null);
-      return;
-    }
-
     try {
-      const permission = await sessionFolderHandle.requestPermission({
-        mode: "readwrite",
-      });
-      if (permission !== "granted") {
-        pushToast({
-          level: "error",
-          text: "未获得文件夹写入权限，无法保存编辑",
-          ttl: 5000,
-        });
-        return;
-      }
-      const fileHandle = await sessionFolderHandle.getFileHandle(session.fileName);
-      const file = await fileHandle.getFile();
-      const data = JSON.parse(await file.text());
-      if (!data || !Array.isArray(data.transcripts) || !data.transcripts[bubbleIdx]) {
-        throw new Error("会话文件结构异常");
-      }
-      data.transcripts[bubbleIdx] = {
-        ...data.transcripts[bubbleIdx],
+      const currentTranscripts = Array.isArray(session.transcripts)
+        ? session.transcripts
+        : [];
+      const target = currentTranscripts[bubbleIdx];
+      if (!target?.id) throw new Error("会话转录缺少云端 ID");
+
+      const nextTranscripts = currentTranscripts.map((item, idx) =>
+        idx === bubbleIdx
+          ? {
+              ...item,
+              en: newEn,
+              zh: newZh,
+            }
+          : item
+      );
+      const { error } = await cloudUpdateTranscript(target.id, {
         en: newEn,
         zh: newZh,
-      };
-      const writable = await fileHandle.createWritable();
-      await writable.write(JSON.stringify(data, null, 2));
-      await writable.close();
+      });
+      if (error) throw error;
 
-      setSavedSessions((prev) =>
-        prev.map((s) =>
-          s.fileName === session.fileName
-            ? { ...s, transcripts: data.transcripts }
-            : s
-        )
-      );
-      setSelectedSavedSession((prev) =>
-        prev && prev.fileName === session.fileName
-          ? { ...prev, transcripts: data.transcripts }
-          : prev
-      );
+      patchSelectedSavedSession(session.fileName, { transcripts: nextTranscripts });
       setBubbleEditDraft(null);
       pushToast({ level: "success", text: "气泡内容已更新", ttl: 2500 });
     } catch (err) {
@@ -4232,7 +4206,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         ttl: 5000,
       });
     }
-  }, [bubbleEditDraft, pushToast, sessionFolderHandle]);
+  }, [bubbleEditDraft, cloudUpdateTranscript, patchSelectedSavedSession, pushToast]);
 
   // ---- 已保存会话：重新生成课堂纪要 ------------------------------------
   const handleRegenerateSummary = useCallback(
@@ -4270,47 +4244,11 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           return;
         }
 
-        if (!sessionFolderHandle) {
-          pushToast({
-            level: "error",
-            text: "未选择保存文件夹，无法持久化新纪要",
-            ttl: 5000,
-          });
-          return;
-        }
+        const { error } = await cloudUpdateSession(session.id, { summary: newSummary });
+        if (error) throw error;
+        patchSelectedSavedSession(session.fileName, { summary: newSummary });
 
-        const permission = await sessionFolderHandle.requestPermission({
-          mode: "readwrite",
-        });
-        if (permission !== "granted") {
-          pushToast({
-            level: "error",
-            text: "未获得文件夹写入权限，无法保存新纪要",
-            ttl: 5000,
-          });
-          return;
-        }
-
-        const fileHandle = await sessionFolderHandle.getFileHandle(session.fileName);
-        const file = await fileHandle.getFile();
-        const data = JSON.parse(await file.text());
-        data.summary = newSummary;
-        const writable = await fileHandle.createWritable();
-        await writable.write(JSON.stringify(data, null, 2));
-        await writable.close();
-
-        setSavedSessions((prev) =>
-          prev.map((s) =>
-            s.fileName === session.fileName ? { ...s, summary: newSummary } : s
-          )
-        );
-        setSelectedSavedSession((prev) =>
-          prev && prev.fileName === session.fileName
-            ? { ...prev, summary: newSummary }
-            : prev
-        );
-
-        pushToast({ level: "success", text: "课堂纪要已重新生成并写入文件", ttl: 3000 });
+        pushToast({ level: "success", text: "课堂纪要已重新生成并保存到云端", ttl: 3000 });
       } catch (err) {
         console.error("重新生成纪要失败:", err);
         pushToast({
@@ -4322,7 +4260,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         setIsRegeneratingSummary(false);
       }
     },
-    [pushToast, sessionFolderHandle]
+    [cloudUpdateSession, patchSelectedSavedSession, pushToast]
   );
 
   // 对历史会话中"未精调"的单条气泡触发 AI 精调；用法与 finalize 阶段一致：
@@ -4330,7 +4268,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   // - 调用 polishWithAI 取得新的 segments
   // - 走同一套 evaluateAiPolishQuality 质量门控；不通过则保留原文
   // - 通过则用新 segments 在原位置 splice（AI 可能按说话人切分成多条）
-  // - 临时会话仅改内存；磁盘会话写回 JSON
+  // - 临时会话仅改内存；云端会话写回 Supabase
   const polishSavedBubble = useCallback(
     async (session, bubbleIdx) => {
       if (!session) return;
@@ -4412,53 +4350,14 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           return;
         }
 
-        if (!sessionFolderHandle) {
-          pushToast({
-            level: "error",
-            text: "未选择保存文件夹，无法持久化精调结果",
-            ttl: 5000,
-          });
-          return;
-        }
-
-        const permission = await sessionFolderHandle.requestPermission({
-          mode: "readwrite",
+        const nextTranscripts = buildNextTranscripts(transcripts);
+        const { data, error } = await cloudReplaceTranscripts(session.id, nextTranscripts);
+        if (error) throw error;
+        patchSelectedSavedSession(session.fileName, {
+          transcripts: data || nextTranscripts,
         });
-        if (permission !== "granted") {
-          pushToast({
-            level: "error",
-            text: "未获得文件夹写入权限，无法保存精调结果",
-            ttl: 5000,
-          });
-          return;
-        }
 
-        const fileHandle = await sessionFolderHandle.getFileHandle(session.fileName);
-        const file = await fileHandle.getFile();
-        const data = JSON.parse(await file.text());
-        if (!data || !Array.isArray(data.transcripts) || !data.transcripts[bubbleIdx]) {
-          throw new Error("会话文件结构异常");
-        }
-        data.transcripts.splice(bubbleIdx, 1, ...newItems);
-
-        const writable = await fileHandle.createWritable();
-        await writable.write(JSON.stringify(data, null, 2));
-        await writable.close();
-
-        setSavedSessions((prev) =>
-          prev.map((s) =>
-            s.fileName === session.fileName
-              ? { ...s, transcripts: data.transcripts }
-              : s
-          )
-        );
-        setSelectedSavedSession((prev) =>
-          prev && prev.fileName === session.fileName
-            ? { ...prev, transcripts: data.transcripts }
-            : prev
-        );
-
-        pushToast({ level: "success", text: "AI 精调完成并已写入文件", ttl: 3000 });
+        pushToast({ level: "success", text: "AI 精调完成并已保存到云端", ttl: 3000 });
       } catch (err) {
         console.error("AI 精调失败:", err);
         pushToast({
@@ -4475,7 +4374,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         });
       }
     },
-    [polishingSavedKeys, pushToast, sessionFolderHandle]
+    [cloudReplaceTranscripts, patchSelectedSavedSession, polishingSavedKeys, pushToast]
   );
 
   // 关闭 popover：点其他地方 / 滚动 / Esc
@@ -4509,29 +4408,26 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         return;
       }
 
-      if (!sessionFolderHandle) return;
-
-      const shouldDelete = window.confirm(`确认删除会话文件：${session.fileName}？此操作不可恢复。`);
+      const shouldDelete = window.confirm(`确认删除会话：${session.title || "未命名会话"}？此操作不可恢复。`);
       if (!shouldDelete) return;
 
       try {
-        const permission = await sessionFolderHandle.requestPermission({ mode: "readwrite" });
-        if (permission !== "granted") {
-          alert("未获得删除权限，请重新授权文件夹权限。");
-          return;
-        }
-
-        await sessionFolderHandle.removeEntry(session.fileName);
+        const { error } = await cloudDeleteSession(session.id);
+        if (error) throw error;
         if (selectedSavedSession?.fileName === session.fileName) {
           setSelectedSavedSession(null);
         }
-        await loadSavedSessionsFromFolder(sessionFolderHandle);
+        pushToast({ level: "success", text: "会话已删除", ttl: 2500 });
       } catch (err) {
         console.error("删除会话失败:", err);
-        alert("删除失败，请检查文件夹权限或稍后重试。");
+        pushToast({
+          level: "error",
+          text: `删除失败：${err && err.message ? err.message : err}`,
+          ttl: 5000,
+        });
       }
     },
-    [loadSavedSessionsFromFolder, selectedSavedSession?.fileName, sessionFolderHandle]
+    [cloudDeleteSession, pushToast, selectedSavedSession?.fileName]
   );
 
   if (!isSupported) {
@@ -4617,10 +4513,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             <button
               onClick={pickSessionFolder}
               className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border bg-emerald-500/12 text-emerald-300 border-emerald-400/30 hover:bg-emerald-500/20 transition-colors`}
-              title={sessionFolderName ? `保存文件夹：${sessionFolderName}` : "保存文件夹"}
+              title={sessionFolderName}
             >
               <FolderOpen className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>保存文件夹</span>}
+              {!isSidebarCollapsed && <span>云端会话</span>}
             </button>
 
             <button
@@ -4697,9 +4593,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
 
           {!isSidebarCollapsed && (
             <div className="px-3 py-3 border-t border-white/10 text-xs text-slate-400">
-              {sessionFolderName
-                ? `当前目录：${sessionFolderName}`
-                : "当前为临时转录模式（未选择保存目录）"}
+              {sessionFolderName}
             </div>
           )}
         </div>
@@ -4731,11 +4625,6 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               <p className="text-xs text-slate-400 font-medium">
                 同传翻译 · 智能纪要
               </p>
-              {!sessionFolderHandle && (
-                <p className="text-[11px] text-amber-300 font-medium mt-0.5">
-                  当前为临时转录模式（未绑定保存文件夹）
-                </p>
-              )}
             </div>
           </div>
 
@@ -5153,8 +5042,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               <div className="text-slate-100 font-semibold mb-2">💡 如何转录网课视频？</div>
               <ol className="list-decimal pl-5 space-y-1.5">
                 <li>
-                  可直接开始临时转录；若希望自动存档，再点顶部
-                  <strong className="text-emerald-300">【选择保存文件夹】</strong>。
+                  同传结束后会自动保存到云端；左侧
+                  <strong className="text-emerald-300">【云端会话】</strong>可刷新历史记录。
                 </li>
                 <li>
                   推荐点
@@ -5437,7 +5326,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                   filteredSavedSessions.map((session) => (
                     <button
                       key={session.fileName}
-                      onClick={() => setSelectedSavedSession(session)}
+                      onClick={() => selectSavedSession(session)}
                       className={`w-full text-left px-4 py-3 border-b border-white/5 transition-colors ${
                         selectedSavedSession?.fileName === session.fileName
                           ? "bg-indigo-500/12"
@@ -5529,7 +5418,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                         className={`ct-btn-primary text-xs px-3 py-1.5 rounded-md font-semibold flex items-center gap-1.5 ${
                           isRegeneratingSummary ? "opacity-60 cursor-not-allowed pointer-events-none" : ""
                         }`}
-                        title="基于当前转录内容重新生成课堂纪要并写回文件"
+                        title="基于当前转录内容重新生成课堂纪要并保存到云端"
                       >
                         {isRegeneratingSummary ? (
                           <>
