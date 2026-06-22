@@ -2,11 +2,15 @@
 // Cloudflare Pages Function – pass-through proxy for DashScope's ASR
 // vocabulary (hot-word) management. The frontend assembles the official
 // body shape; we only inject the API key.
+import { verifyAuth, unauthorizedResponse } from './_auth.js';
 
 const VOCABULARY_URL =
   "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/customization/vocabulary";
 
 export async function onRequestPost(context) {
+  const user = await verifyAuth(context.request, context.env);
+  if (!user) return unauthorizedResponse();
+
   const apiKey = context.env.DASHSCOPE_API_KEY;
   if (!apiKey) {
     return Response.json({ error: "Server missing DASHSCOPE_API_KEY" }, { status: 500 });

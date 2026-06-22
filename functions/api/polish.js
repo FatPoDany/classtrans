@@ -1,8 +1,12 @@
 // functions/api/polish.js
 // Cloudflare Pages Function – proxy for DashScope chat completions (polish).
 // Supports both streaming (SSE) and non-streaming responses.
+import { verifyAuth, unauthorizedResponse } from './_auth.js';
 
 export async function onRequestPost(context) {
+  const user = await verifyAuth(context.request, context.env);
+  if (!user) return unauthorizedResponse();
+
   const apiKey = context.env.DASHSCOPE_API_KEY;
   if (!apiKey) {
     return Response.json({ error: "Server missing DASHSCOPE_API_KEY" }, { status: 500 });

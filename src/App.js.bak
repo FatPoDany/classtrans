@@ -30,20 +30,9 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { ParaformerSession } from "./paraformerSession";
-import { Routes, Route, Navigate } from 'react-router-dom';
-import { useAuth } from './AuthContext';
-import AuthPage from './pages/AuthPage';
-import ResetPasswordPage from './pages/ResetPasswordPage';
-import { useCloudSettings } from './hooks/useCloudSettings';
-import { useCloudGlossary } from './hooks/useCloudGlossary';
-import { useCloudSessions } from './hooks/useCloudSessions';
 
 const THEME_STORAGE_KEY = "classtrans.uiTheme.v1";
 const PARAFORMER_WS_URL = process.env.REACT_APP_PARAFORMER_WS_URL || "";
-
-let globalApiToken = "";
-export const setGlobalApiToken = (token) => { globalApiToken = token; };
-
 
 // ============================================================================
 // 引擎 1a：免费谷歌翻译公共接口 (作为最后兜底使用)
@@ -94,7 +83,7 @@ const translateRealtimeWithQwen = async (text) => {
 
   const response = await fetch("/api/polish", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": globalApiToken ? `Bearer ${globalApiToken}` : "" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
@@ -363,7 +352,7 @@ const syncGlossaryToParaformerVocabulary = async (pairs) => {
       try {
         await fetch("/api/asr-vocabulary", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": globalApiToken ? `Bearer ${globalApiToken}` : "" },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "speech-biasing",
             input: {
@@ -405,7 +394,7 @@ const syncGlossaryToParaformerVocabulary = async (pairs) => {
 
   const response = await fetch("/api/asr-vocabulary", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": globalApiToken ? `Bearer ${globalApiToken}` : "" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
 
@@ -962,7 +951,7 @@ const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) =>
 
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": globalApiToken ? `Bearer ${globalApiToken}` : "" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
     signal,
   });
@@ -1081,7 +1070,7 @@ const generateSummaryWithAI = async (fullTextContent) => {
 
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": globalApiToken ? `Bearer ${globalApiToken}` : "" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
@@ -2036,21 +2025,6 @@ const UsageView = ({ log, onClear }) => {
 };
 
 export default function App() {
-  const { user, loading, signOut, session } = useAuth();
-  if (loading) return null; // Wait for initial auth check
-
-  return (
-    <Routes>
-      <Route path="/auth" element={user ? <Navigate to="/" /> : <AuthPage />} />
-      <Route path="/reset-password" element={<ResetPasswordPage />} />
-      <Route path="/*" element={user ? <MainApp user={user} signOut={signOut} authSession={session} /> : <Navigate to="/auth" />} />
-    </Routes>
-  );
-}
-
-function MainApp({ user, signOut, authSession }) {
-  React.useEffect(() => { setGlobalApiToken(authSession?.access_token || ""); }, [authSession]);
-
 
   const [listeningMode, setListeningMode] = useState("none");
   const [isPaused, setIsPaused] = useState(false);
@@ -2142,21 +2116,10 @@ function MainApp({ user, signOut, authSession }) {
   const [activeView, setActiveView] = useState("home");
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const sessionFolderHandle = true;
-  const setSessionFolderHandle = () => {};
+  const [sessionFolderHandle, setSessionFolderHandle] = useState(null);
   const [sessionFolderName, setSessionFolderName] = useState("");
-  const {
-    sessions: cloudSessions,
-    loadSessions,
-    saveSession: cloudSaveSession,
-    deleteSession: cloudDeleteSession,
-    updateSession: cloudUpdateSession,
-    updateTranscript: cloudUpdateTranscript
-  } = useCloudSessions(user.id);
-  const savedSessions = cloudSessions;
-  const setSavedSessions = () => {};
-  const temporarySessions = [];
-  const setTemporarySessions = () => {};
+  const [savedSessions, setSavedSessions] = useState([]);
+  const [temporarySessions, setTemporarySessions] = useState([]);
   const [selectedSavedSession, setSelectedSavedSession] = useState(null);
   const [savedSessionsQuery, setSavedSessionsQuery] = useState("");
   const [titleDraft, setTitleDraft] = useState(null); // null = not editing
@@ -2166,9 +2129,14 @@ function MainApp({ user, signOut, authSession }) {
   // UI theme: "dark" (default) | "light" — persisted to localStorage and
   // applied as data-theme="..." on the <html> element so the CSS variable
   // overrides + Tailwind utility overrides in index.css take effect.
-  const { settings, updateSetting } = useCloudSettings(user.id);
-  const theme = settings.theme || "dark";
-  const setTheme = (t) => updateSetting('theme', t);
+  const [theme, setTheme] = useState(() => {
+    try {
+      const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+      return stored === "light" ? "light" : "dark";
+    } catch (e) {
+      return "dark";
+    }
+  });
   useEffect(() => {
     if (typeof document !== "undefined") {
       document.documentElement.setAttribute("data-theme", theme);
@@ -3186,10 +3154,17 @@ function MainApp({ user, signOut, authSession }) {
         onUpdate: ({ fullText, finalText, confidence }) => {
           applyTranscriptUpdate({ fullText, finalText, confidence });
         },
-        onStatus: ({ phase, attempt, reason }) => {
+        onStatus: ({ phase, attempt, reason, from, to }) => {
           if (phase === "started") {
             setAsrStatus("live");
             setAsrErrorReason("");
+          }
+          if (phase === "model-fallback") {
+            pushToast({
+              level: "warn",
+              text: `${from} 额度不可用，已自动切换到 ${to}`,
+              ttl: 6000,
+            });
           }
           if (phase === "reconnecting") {
             setAsrStatus("connecting");

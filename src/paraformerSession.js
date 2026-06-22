@@ -19,6 +19,12 @@ const FRAME_SIZE = 1600; // 100 ms at 16 kHz
 const TARGET_SAMPLE_RATE = 16000;
 const TASK_STARTED_TIMEOUT_MS = 5000;
 
+// DashScope occasionally returns spurious "free tier exhausted" task-failed
+// errors even when quota is available. Retry run-task a few times before
+// surfacing the error to the user.
+const TASK_START_MAX_RETRIES = 2;
+const TASK_START_RETRY_DELAY_MS = 2000;
+
 // Heartbeat: the Cloudflare Worker relay has a ~100 s idle timeout.
 // We ping every 25 s to stay well within the limit.
 const HEARTBEAT_INTERVAL_MS = 25_000;
@@ -86,6 +92,21 @@ const averageWordConfidence = (words) => {
   return count > 0 ? sum / count : 0;
 };
 
+// Detect DashScope errors that are worth retrying (transient quota glitches,
+// rate limits, etc.) vs. genuine fatal errors (bad model name, auth failure).
+const isRetriableTaskError = (msg) => {
+  if (!msg) return false;
+  const s = String(msg).toLowerCase();
+  return (
+    s.includes("free tier") ||
+    s.includes("quota") ||
+    s.includes("rate limit") ||
+    s.includes("throttl") ||
+    s.includes("too many requests") ||
+    s.includes("temporarily unavailable")
+  );
+};
+
 export class ParaformerSession {
   constructor({
     wsUrl,
@@ -140,8 +161,7 @@ export class ParaformerSession {
 
     await this._openWebSocket();
     await this._startAudioPipeline();
-    this._sendRunTask();
-    await this._awaitTaskStarted();
+    await this._startTaskWithRetry();
     this.onStatus({ phase: "started" });
     this._lastResultAt = Date.now(); // arm watchdog from session start
     this._startRotationTimer();
@@ -361,6 +381,91 @@ export class ParaformerSession {
     return this.taskStartedPromise;
   }
 
+  // Wrap _sendRunTask + _awaitTaskStarted with retry logic for transient
+  // DashScope errors (e.g. spurious "free tier exhausted" when quota is
+  // actually available, or temporary rate limits).
+  // Each retry tears down the old WebSocket and opens a fresh one, because
+  // DashScope typically closes the upstream connection after task-failed.
+  //
+  // If all retries with the primary model fail and a fallback paraformer
+  // model is available (e.g. v2 → v1), try it once before giving up.
+  async _startTaskWithRetry() {
+    const originalModel = this.model;
+
+    // Derive fallback: paraformer-realtime-v2 ↔ v1
+    const fallbackModel = (() => {
+      const m = /^(paraformer-realtime-v)(\d+)$/i.exec(originalModel);
+      return m ? m[1] + (m[2] === "2" ? "1" : "2") : null;
+    })();
+
+    let lastErr;
+
+    // --- Phase 1: try the primary model with retries --------------------------
+    for (let attempt = 0; attempt <= TASK_START_MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        // Rebuild WS for the retry. Null this.ws FIRST so the stale-handler
+        // guard skips the old socket's close event.
+        this._clearHeartbeat();
+        this._clearWatchdog();
+        const oldWs = this.ws;
+        this.ws = null;
+        if (oldWs) { try { oldWs.close(1000, "retry"); } catch (_) {} }
+
+        this.taskId = generateTaskId();
+        await new Promise((r) => setTimeout(r, TASK_START_RETRY_DELAY_MS));
+        if (this.stopped) throw lastErr;
+        await this._openWebSocket();
+      }
+
+      this.taskStartedPromise = null;
+      this._sendRunTask();
+      try {
+        await this._awaitTaskStarted();
+        return; // success
+      } catch (err) {
+        lastErr = err;
+        if (!isRetriableTaskError(err && err.message)) throw err;
+        console.warn(
+          `ParaformerSession: ${this.model} attempt ${attempt + 1}/${TASK_START_MAX_RETRIES + 1} failed: ${err.message}`
+        );
+      }
+    }
+
+    // --- Phase 2: try fallback model once -------------------------------------
+    if (fallbackModel) {
+      console.warn(
+        `ParaformerSession: primary model ${originalModel} exhausted retries, trying fallback ${fallbackModel}`
+      );
+      this.model = fallbackModel;
+
+      this._clearHeartbeat();
+      this._clearWatchdog();
+      const oldWs = this.ws;
+      this.ws = null;
+      if (oldWs) { try { oldWs.close(1000, "fallback"); } catch (_) {} }
+
+      this.taskId = generateTaskId();
+      await new Promise((r) => setTimeout(r, TASK_START_RETRY_DELAY_MS));
+      if (this.stopped) { this.model = originalModel; throw lastErr; }
+      await this._openWebSocket();
+
+      this.taskStartedPromise = null;
+      this._sendRunTask();
+      try {
+        await this._awaitTaskStarted();
+        console.log(`ParaformerSession: fallback model ${fallbackModel} succeeded`);
+        // Keep this.model = fallbackModel so future rotations/reconnects use it
+        this.onStatus({ phase: "model-fallback", from: originalModel, to: fallbackModel });
+        return; // success with fallback
+      } catch (err) {
+        this.model = originalModel; // restore before throwing
+        throw err;
+      }
+    }
+
+    throw lastErr;
+  }
+
   _handleMessage(event) {
     if (typeof event.data !== "string") return;
     let msg;
@@ -391,9 +496,14 @@ export class ParaformerSession {
     if (evt === "task-failed") {
       const errMsg = (msg.header && (msg.header.error_message || msg.header.error_code)) || "task failed";
       if (this._taskStartedReject) {
+        // During startup / renewal / reconnect the caller awaits
+        // _awaitTaskStarted and will handle the rejection (including retry
+        // logic for transient errors). Don't also fire onError here —
+        // that would cause a spurious error toast before the retry fires.
         this._taskStartedReject(new Error(errMsg));
         this._taskStartedResolve = null;
         this._taskStartedReject = null;
+        return;
       }
       this.onError(new Error(`Paraformer: ${errMsg}`));
       return;
@@ -588,8 +698,7 @@ export class ParaformerSession {
       this.taskStartedPromise = null;
 
       await this._openWebSocket();  // new WS → new upstream in Worker
-      this._sendRunTask();
-      await this._awaitTaskStarted();
+      await this._startTaskWithRetry();
 
       // The new task numbers sentences from 0 again. If we kept the old
       // sentences[] entries with the same ids, _applySentence would replace
@@ -721,8 +830,7 @@ export class ParaformerSession {
       this.taskStartedPromise = null;
 
       await this._openWebSocket();
-      this._sendRunTask();
-      await this._awaitTaskStarted();
+      await this._startTaskWithRetry();
 
       // New task → new sentence_id space. Drop accumulated sentences and
       // signal the App to reset processedLength (see _renewTask comment).
