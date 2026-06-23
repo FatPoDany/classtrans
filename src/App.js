@@ -2125,19 +2125,39 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const { settings: globalSettings, loading: globalSettingsLoading, updateSettings } = useGlobalSettings();
   const { aiModelName, realtimeModelName, summaryModelName, asrModelName } = globalSettings;
 
+  // One-time migration: Clear old localStorage values to force sync from database
+  React.useEffect(() => {
+    const migrationKey = 'classtrans.settings.migrated.v2';
+    const alreadyMigrated = window.localStorage.getItem(migrationKey);
+    
+    if (!alreadyMigrated) {
+      // Clear all old model settings from localStorage
+      window.localStorage.removeItem(MODEL_STORAGE_KEY);
+      window.localStorage.removeItem(REALTIME_MODEL_STORAGE_KEY);
+      window.localStorage.removeItem(SUMMARY_MODEL_STORAGE_KEY);
+      window.localStorage.removeItem(ASR_MODEL_STORAGE_KEY);
+      
+      // Mark migration as complete
+      window.localStorage.setItem(migrationKey, 'true');
+      
+      console.log('[ClassTrans] Migrated to database-driven settings');
+    }
+  }, []);
+
   React.useEffect(() => {
     // Sync global settings from database to runtime variables and localStorage
     // This ensures admin changes take effect immediately for all users
-    if (aiModelName && aiModelName !== runtimeModelName) {
+    // IMPORTANT: Always sync from database to override any stale localStorage values
+    if (aiModelName) {
       setGlobalModelName(aiModelName);
     }
-    if (realtimeModelName && realtimeModelName !== runtimeRealtimeModelName) {
+    if (realtimeModelName) {
       setGlobalRealtimeModelName(realtimeModelName);
     }
-    if (summaryModelName && summaryModelName !== runtimeSummaryModelName) {
+    if (summaryModelName) {
       setGlobalSummaryModelName(summaryModelName);
     }
-    if (asrModelName && asrModelName !== runtimeAsrModelName) {
+    if (asrModelName) {
       setGlobalAsrModelName(asrModelName);
     }
   }, [aiModelName, realtimeModelName, summaryModelName, asrModelName]);
