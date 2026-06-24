@@ -387,35 +387,34 @@ export class ParaformerSession {
   // Each retry tears down the old WebSocket and opens a fresh one, because
   // DashScope typically closes the upstream connection after task-failed.
   //
-  // If all retries with the primary model fail and a fallback paraformer
-  // model is available (e.g. v2 → v1), try it once before giving up.
+  // IMPORTANT: we do NOT silently downgrade the model (e.g. v2 → v1). The user
+  // chooses the ASR model deliberately (and may have quota specifically for
+  // paraformer-realtime-v2); a hidden downgrade produces worse results and
+  // masks the real failure. Instead, if a hot-word vocabulary_id is set, we
+  // drop it and retry the SAME model once (a stale/deleted vocabulary is a
+  // common cause of run-task failure). If the requested model still cannot
+  // start, we surface the real error.
   async _startTaskWithRetry() {
-    const originalModel = this.model;
-
-    // Derive fallback: paraformer-realtime-v2 ↔ v1
-    const fallbackModel = (() => {
-      const m = /^(paraformer-realtime-v)(\d+)$/i.exec(originalModel);
-      return m ? m[1] + (m[2] === "2" ? "1" : "2") : null;
-    })();
-
     let lastErr;
 
-    // --- Phase 1: try the primary model with retries --------------------------
-    for (let attempt = 0; attempt <= TASK_START_MAX_RETRIES; attempt++) {
-      if (attempt > 0) {
-        // Rebuild WS for the retry. Null this.ws FIRST so the stale-handler
-        // guard skips the old socket's close event.
-        this._clearHeartbeat();
-        this._clearWatchdog();
-        const oldWs = this.ws;
-        this.ws = null;
-        if (oldWs) { try { oldWs.close(1000, "retry"); } catch (_) {} }
+    // Tear down the current WS and open a fresh one for a retry. Null this.ws
+    // FIRST so the stale-handler guard skips the old socket's close event.
+    const rebuildSocket = async () => {
+      this._clearHeartbeat();
+      this._clearWatchdog();
+      const oldWs = this.ws;
+      this.ws = null;
+      if (oldWs) { try { oldWs.close(1000, "retry"); } catch (_) {} }
 
-        this.taskId = generateTaskId();
-        await new Promise((r) => setTimeout(r, TASK_START_RETRY_DELAY_MS));
-        if (this.stopped) throw lastErr;
-        await this._openWebSocket();
-      }
+      this.taskId = generateTaskId();
+      await new Promise((r) => setTimeout(r, TASK_START_RETRY_DELAY_MS));
+      if (this.stopped) throw lastErr || new Error("session stopped");
+      await this._openWebSocket();
+    };
+
+    // --- Phase 1: retry the configured model ----------------------------------
+    for (let attempt = 0; attempt <= TASK_START_MAX_RETRIES; attempt++) {
+      if (attempt > 0) await rebuildSocket();
 
       this.taskStartedPromise = null;
       this._sendRunTask();
@@ -431,38 +430,26 @@ export class ParaformerSession {
       }
     }
 
-    // --- Phase 2: try fallback model once -------------------------------------
-    if (fallbackModel) {
+    // --- Phase 2: drop a possibly-stale vocabulary_id and retry SAME model -----
+    if (this.vocabularyId) {
       console.warn(
-        `ParaformerSession: primary model ${originalModel} exhausted retries, trying fallback ${fallbackModel}`
+        `ParaformerSession: retrying ${this.model} without vocabulary_id after repeated failures`
       );
-      this.model = fallbackModel;
-
-      this._clearHeartbeat();
-      this._clearWatchdog();
-      const oldWs = this.ws;
-      this.ws = null;
-      if (oldWs) { try { oldWs.close(1000, "fallback"); } catch (_) {} }
-
-      this.taskId = generateTaskId();
-      await new Promise((r) => setTimeout(r, TASK_START_RETRY_DELAY_MS));
-      if (this.stopped) { this.model = originalModel; throw lastErr; }
-      await this._openWebSocket();
-
-      this.taskStartedPromise = null;
-      this._sendRunTask();
+      this.vocabularyId = null;
       try {
+        await rebuildSocket();
+        this.taskStartedPromise = null;
+        this._sendRunTask();
         await this._awaitTaskStarted();
-        console.log(`ParaformerSession: fallback model ${fallbackModel} succeeded`);
-        // Keep this.model = fallbackModel so future rotations/reconnects use it
-        this.onStatus({ phase: "model-fallback", from: originalModel, to: fallbackModel });
-        return; // success with fallback
+        this.onStatus({ phase: "vocabulary-dropped" });
+        return; // success without the vocabulary
       } catch (err) {
-        this.model = originalModel; // restore before throwing
-        throw err;
+        lastErr = err;
       }
     }
 
+    // Exhausted retries on the requested model — surface the real error rather
+    // than silently switching to a different model.
     throw lastErr;
   }
 

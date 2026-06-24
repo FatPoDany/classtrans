@@ -143,9 +143,26 @@ const DEFAULT_POLISH_MODEL = "qwen-plus";
 const DEFAULT_REALTIME_MODEL = "qwen-turbo";
 const DEFAULT_ASR_MODEL = "paraformer-realtime-v2";
 
+// Non-existent / hallucinated model names that earlier tooling accidentally
+// wrote into the global settings. DashScope rejects these outright, which
+// breaks translation / polish / summary. Map them back to real models so the
+// app keeps working even if the database still holds a bad value.
+const BROKEN_MODEL_ALIASES = {
+  "qwen3.5-122b-a10b": "qwen-plus",
+  "qwen3.6-35b-a3b": "qwen-plus",
+  "deepseek-v4-flash": "qwen-turbo",
+};
+
 const normalizeLegacyPolishModelName = (name) => {
   const cleanName = String(name || "").trim();
-  return cleanName === "qwen3.5-122b-a10b" ? DEFAULT_POLISH_MODEL : cleanName;
+  return BROKEN_MODEL_ALIASES[cleanName] || cleanName;
+};
+
+const normalizeRealtimeModelName = (name) => {
+  const cleanName = String(name || "").trim();
+  // Prefer a fast model on the realtime path when the configured one is broken.
+  if (cleanName === "qwen3.6-35b-a3b") return DEFAULT_REALTIME_MODEL;
+  return BROKEN_MODEL_ALIASES[cleanName] || cleanName;
 };
 
 let runtimeModelName = DEFAULT_POLISH_MODEL;
@@ -183,7 +200,7 @@ export const setGlobalModelName = (name) => {
 };
 
 const setGlobalRealtimeModelName = (name) => {
-  const cleanName = String(name || "").trim();
+  const cleanName = normalizeRealtimeModelName(name);
   if (cleanName) {
     runtimeRealtimeModelName = cleanName;
     try {

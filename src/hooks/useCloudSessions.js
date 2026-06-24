@@ -3,6 +3,14 @@ import { supabase } from '../supabaseClient';
 
 const PAGE_SIZE = 20;
 
+// Build a human-readable string from a Supabase/PostgREST error so failures
+// (e.g. missing table GRANTs / RLS policies) are visible instead of silent.
+const supabaseErrorText = (error) => {
+  if (!error) return '未知错误';
+  const parts = [error.message, error.code, error.details, error.hint].filter(Boolean);
+  return parts.length ? parts.join(' | ') : String(error);
+};
+
 const normalizeTranscript = (row, fallbackIndex = 0) => ({
   id: row?.id || `${row?.session_id || 'transcript'}-${fallbackIndex}`,
   speaker: row?.speaker || '',
@@ -150,7 +158,9 @@ export function useCloudSessions(userId) {
 
     if (sessionError || !session) {
       console.error('Failed to save session:', sessionError);
-      return null;
+      // Surface the real cause (e.g. missing GRANT / RLS policy) so the caller
+      // can fall back to a temporary session and the error is diagnosable.
+      throw new Error(`保存会话失败：${supabaseErrorText(sessionError)}`);
     }
 
     // Insert transcripts in batch
@@ -164,9 +174,13 @@ export function useCloudSessions(userId) {
         .select('id, session_id, speaker, en_text, zh_text, is_polished, confidence, sort_order, created_at');
       if (txError) {
         console.error('Failed to save transcripts:', txError);
-      } else {
-        savedTranscripts = txData || [];
+        // The session row was created but its transcripts could not be saved.
+        // Roll it back so it doesn't reappear empty after a refresh, then
+        // surface the real error instead of reporting a hollow success.
+        await supabase.from('sessions').delete().eq('id', session.id);
+        throw new Error(`保存转录记录失败：${supabaseErrorText(txError)}`);
       }
+      savedTranscripts = txData || [];
     }
 
     const normalized = normalizeSession({
