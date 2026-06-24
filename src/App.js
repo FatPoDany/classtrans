@@ -3741,6 +3741,9 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     lastFinalSessionStringRef.current = "";
     lastTranslatedEnRef.current = "";
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    // Also discard the ASR session's accumulated transcript, otherwise the next
+    // recognized speech replays the cleared bubbles and continues from their end.
+    paraformerSessionRef.current?.resetTranscript();
   };
 
   const openGlossaryModal = () => {

@@ -175,6 +175,15 @@ export class ParaformerSession {
     this.paused = false;
   }
 
+  // Discard the accumulated transcript buffer so the cumulative fullText starts
+  // fresh. Used when the user clears the on-screen transcript mid-session: the
+  // WebSocket / ASR task stays open (no recognition gap), but the next
+  // result-generated event rebuilds from an empty buffer instead of replaying
+  // everything spoken before the clear.
+  resetTranscript() {
+    this.sentences = [];
+  }
+
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
