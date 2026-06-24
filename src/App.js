@@ -2427,6 +2427,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const processedLengthRef = useRef(0);
   const lastSessionStringRef = useRef("");
   const lastFinalSessionStringRef = useRef("");
+  // One-pass speech-translation (Gummy) ASR-provided Chinese bookkeeping,
+  // mirrored on the English processedLength logic. When the ASR streams its own
+  // translation we display that directly and skip the LLM interim translate.
+  const processedZhLengthRef = useRef(0);
+  const lastTranslatedSessionStringRef = useRef("");
+  const asrProvidesTranslationRef = useRef(false);
 
   useEffect(() => {
     transcriptsRef.current = transcripts;
@@ -2933,6 +2939,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   // 还可能是空。所以这里推进到当前会话整段文本（含 interim），把已展示给用户的内容
   // 完整标记为已消费，避免下一条气泡复读上一段。
   processedLengthRef.current = lastSessionStringRef.current.length;
+  // Advance the ASR-translation consume point in lock-step (Gummy path).
+  processedZhLengthRef.current = lastTranslatedSessionStringRef.current.length;
 
     setActiveEn("");
     setActiveZh("");
@@ -3092,6 +3100,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   useEffect(() => {
     const intervalId = setInterval(async () => {
       if ((listeningMode !== "mic" && listeningMode !== "tab") || isPaused) return;
+      // One-pass speech-translation (Gummy) supplies Chinese directly; don't
+      // also run the LLM interim translate (it would double-work and clobber
+      // the ASR translation).
+      if (asrProvidesTranslationRef.current) return;
 
       const currentEn = activeEnRef.current.trim();
       const currentBlockId = activeBlockIdRef.current;
@@ -3124,7 +3136,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   // 通用的转录增量更新逻辑：mic 模式（webkitSpeechRecognition）和 tab 模式
   // (Paraformer) 都通过它写入活动文本、推进静音定时器。
   const applyTranscriptUpdate = useCallback(
-    ({ fullText, finalText, confidence }) => {
+    ({ fullText, finalText, confidence, translatedText }) => {
       if (isPausedRef.current) return;
 
       const next = fullText || "";
@@ -3135,6 +3147,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       // doesn't get hidden behind a stale processedLength from the old task.
       if (next === "" && prev.length > 0) {
         processedLengthRef.current = 0;
+        processedZhLengthRef.current = 0;
       }
 
       lastSessionStringRef.current = next;
@@ -3160,6 +3173,23 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       setActiveConfidence(safeConfidence);
       activeEnRef.current = activeNewText;
       activeConfidenceRef.current = safeConfidence;
+
+      // One-pass speech-translation models (Gummy) stream their own Chinese.
+      // When present, drive the live ZH directly from it (un-finalized tail,
+      // mirroring the English processedLength logic) and skip the LLM interim
+      // translate. Empty/absent translation → keep the LLM fallback path.
+      if (translatedText !== undefined) {
+        const zhNext = translatedText || "";
+        lastTranslatedSessionStringRef.current = zhNext;
+        if (zhNext.trim()) asrProvidesTranslationRef.current = true;
+        const zhProcessed = Math.min(processedZhLengthRef.current, zhNext.length);
+        const activeZhTail = zhNext
+          .substring(zhProcessed)
+          .replace(/^[\s.,;:!?。，；：！？]+/, "")
+          .trim();
+        setActiveZh(activeZhTail);
+        activeZhRef.current = activeZhTail;
+      }
 
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (activeNewText.trim()) {
@@ -3397,6 +3427,9 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       processedLengthRef.current = 0;
       lastSessionStringRef.current = "";
       lastFinalSessionStringRef.current = "";
+      processedZhLengthRef.current = 0;
+      lastTranslatedSessionStringRef.current = "";
+      asrProvidesTranslationRef.current = false;
 
       setAsrStatus("connecting");
       setAsrErrorReason("");

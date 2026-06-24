@@ -15,6 +15,13 @@
 // running transcript changes; the caller drives its own silence timer / UI.
 
 const DEFAULT_PARAFORMER_MODEL = "paraformer-realtime-v2";
+
+// Gummy (e.g. gummy-realtime-v1) is a one-pass speech-translation model: it
+// streams the source transcription AND the target translation together, over
+// the same DashScope WebSocket protocol as Paraformer. Detecting it lets us
+// switch the run-task parameters and the result parsing while reusing all of
+// the resilient connection/lifecycle machinery below.
+const isGummyModel = (name) => /^gummy/i.test(String(name || "").trim());
 const FRAME_SIZE = 1600; // 100 ms at 16 kHz
 const TARGET_SAMPLE_RATE = 16000;
 const TASK_STARTED_TIMEOUT_MS = 5000;
@@ -114,6 +121,7 @@ export class ParaformerSession {
     languageHints,
     vocabularyId,
     model,
+    translationTargets,
     onUpdate,
     onError,
     onStatus,
@@ -129,6 +137,11 @@ export class ParaformerSession {
       : ["en"];
     this.vocabularyId = (vocabularyId && String(vocabularyId).trim()) || null;
     this.model = (model && String(model).trim()) || DEFAULT_PARAFORMER_MODEL;
+    // Target language(s) for one-pass speech-translation models (Gummy).
+    this.translationTargets =
+      Array.isArray(translationTargets) && translationTargets.length > 0
+        ? translationTargets
+        : ["zh"];
     this.onUpdate = typeof onUpdate === "function" ? onUpdate : () => {};
     this.onError = typeof onError === "function" ? onError : () => {};
     this.onStatus = typeof onStatus === "function" ? onStatus : () => {};
@@ -348,12 +361,27 @@ export class ParaformerSession {
 
   _sendRunTask() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const parameters = {
-      format: "pcm",
-      sample_rate: TARGET_SAMPLE_RATE,
-      language_hints: this.languageHints,
-    };
-    if (this.vocabularyId) parameters.vocabulary_id = this.vocabularyId;
+    let parameters;
+    if (isGummyModel(this.model)) {
+      // Gummy: one-pass speech translation. Source language from the first
+      // language hint (default en); translation enabled to the target list.
+      parameters = {
+        format: "pcm",
+        sample_rate: TARGET_SAMPLE_RATE,
+        source_language: (this.languageHints && this.languageHints[0]) || "en",
+        transcription_enabled: true,
+        translation_enabled: true,
+        translation_target_languages: this.translationTargets,
+      };
+      if (this.vocabularyId) parameters.vocabulary_id = this.vocabularyId;
+    } else {
+      parameters = {
+        format: "pcm",
+        sample_rate: TARGET_SAMPLE_RATE,
+        language_hints: this.languageHints,
+      };
+      if (this.vocabularyId) parameters.vocabulary_id = this.vocabularyId;
+    }
 
     const runTask = {
       header: {
@@ -484,8 +512,14 @@ export class ParaformerSession {
 
     if (evt === "result-generated") {
       this._lastResultAt = Date.now(); // reset watchdog
-      const sentence = msg.payload && msg.payload.output && msg.payload.output.sentence;
-      if (sentence) this._applySentence(sentence);
+      const output = msg.payload && msg.payload.output;
+      if (output) {
+        if (isGummyModel(this.model)) {
+          this._applyGummyOutput(output);
+        } else if (output.sentence) {
+          this._applySentence(output.sentence);
+        }
+      }
       return;
     }
 
@@ -703,7 +737,7 @@ export class ParaformerSession {
       this.sentences = [];
       // Tell the consumer to realign its cumulative-text bookkeeping. App.js
       // listens for empty fullText after non-empty and resets processedLength.
-      this.onUpdate({ fullText: "", finalText: "", confidence: 0 });
+      this.onUpdate({ fullText: "", finalText: "", confidence: 0, translatedText: "", translatedFinalText: "" });
 
       this._isRenewing = false;
       this._reconnectAttempt = 0;
@@ -831,7 +865,7 @@ export class ParaformerSession {
       // New task → new sentence_id space. Drop accumulated sentences and
       // signal the App to reset processedLength (see _renewTask comment).
       this.sentences = [];
-      this.onUpdate({ fullText: "", finalText: "", confidence: 0 });
+      this.onUpdate({ fullText: "", finalText: "", confidence: 0, translatedText: "", translatedFinalText: "" });
 
       // Success – reset counter.
       this._reconnectAttempt = 0;
@@ -881,5 +915,62 @@ export class ParaformerSession {
     const confidence = averageWordConfidence(sentence.words);
 
     this.onUpdate({ fullText, finalText, confidence });
+  }
+
+  // Parse a Gummy result, which carries both the source transcription and the
+  // target translation. Field names can vary across API revisions, so we read
+  // them defensively. The English transcript always works; if the translation
+  // can't be located, translatedText stays empty and the App falls back to its
+  // own LLM translation path.
+  _applyGummyOutput(output) {
+    const tr = output.transcription || output.sentence || null;
+    const enText = sanitizeText(tr && tr.text);
+    const isFinal = !!(tr && (tr.sentence_end || tr.end_time));
+
+    let zhText = "";
+    const translations =
+      output.translations || output.translation || (tr && tr.translation);
+    if (Array.isArray(translations)) {
+      const target = this.translationTargets[0] || "zh";
+      const match =
+        translations.find((t) =>
+          new RegExp(target, "i").test(
+            String(t.lang || t.language || t.target_language || "")
+          )
+        ) || translations[0];
+      zhText = sanitizeText(match && match.text);
+    } else if (translations && typeof translations === "object") {
+      zhText = sanitizeText(translations.text);
+    }
+
+    const id =
+      tr && tr.sentence_id != null
+        ? String(tr.sentence_id)
+        : tr && tr.begin_time != null
+        ? `bt-${tr.begin_time}`
+        : `auto-${this.sentences.length}`;
+
+    if (!enText && !zhText && !isFinal) return;
+
+    const entry = { id, text: enText, zh: zhText, isFinal };
+    const idx = this.sentences.findIndex((s) => s.id === id);
+    if (idx >= 0) this.sentences[idx] = entry;
+    else this.sentences.push(entry);
+
+    const join = (pred, key) =>
+      this.sentences
+        .filter(pred)
+        .map((s) => s[key])
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+
+    this.onUpdate({
+      fullText: join(() => true, "text"),
+      finalText: join((s) => s.isFinal, "text"),
+      confidence: 0,
+      translatedText: join(() => true, "zh"),
+      translatedFinalText: join((s) => s.isFinal, "zh"),
+    });
   }
 }
