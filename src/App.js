@@ -2263,6 +2263,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const [newFolderName, setNewFolderName] = useState("");
   const [newFolderColor, setNewFolderColor] = useState("indigo");
   const [creatingFolder, setCreatingFolder] = useState(false);
+  // Inline folder rename (文件夹 view)
+  const [editingFolderId, setEditingFolderId] = useState(null);
+  const [editFolderName, setEditFolderName] = useState("");
+  const [editFolderColor, setEditFolderColor] = useState("indigo");
 
   const [summaryResult, setSummaryResult] = useState("");
   const [isFinalizingSession, setIsFinalizingSession] = useState(false);
@@ -2298,6 +2302,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     folders,
     loadFolders,
     createFolder: cloudCreateFolder,
+    updateFolder: cloudUpdateFolder,
     deleteFolder: cloudDeleteFolder,
   } = useCloudFolders(user.id);
   // The folder a NEW recording will be saved into (required before starting).
@@ -2726,6 +2731,28 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     // refresh so the local list reflects that.
     await loadSavedSessionsFromFolder();
     pushToast({ level: "success", text: "文件夹已删除", ttl: 2500 });
+  };
+
+  const startRenameFolder = (folder) => {
+    setEditingFolderId(folder.id);
+    setEditFolderName(folder.name);
+    setEditFolderColor(folder.color || "indigo");
+  };
+
+  const handleRenameFolder = async () => {
+    const name = editFolderName.trim();
+    if (!name) {
+      pushToast({ level: "warn", text: "请输入文件夹名称", ttl: 3000 });
+      return;
+    }
+    const folderId = editingFolderId;
+    const { error } = await cloudUpdateFolder(folderId, { name, color: editFolderColor });
+    if (error) {
+      pushToast({ level: "error", text: "重命名失败，请重试", ttl: 4000 });
+      return;
+    }
+    setEditingFolderId(null);
+    pushToast({ level: "success", text: "文件夹已更新", ttl: 2000 });
   };
 
   useEffect(() => {
@@ -6033,38 +6060,93 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 </div>
               </button>
 
-              {folders.map((f) => (
-                <div key={f.id} className="group relative">
-                  <button
-                    onClick={() => {
-                      setOpenFolderId(f.id);
-                      setActiveView("saved");
-                    }}
-                    className="w-full text-left focus:outline-none"
+              {folders.map((f) =>
+                editingFolderId === f.id ? (
+                  <div
+                    key={f.id}
+                    className="h-28 rounded-2xl bg-white/[0.05] border border-white/15 p-2.5 flex flex-col gap-1.5"
                   >
-                    <div
-                      className={`relative h-28 rounded-2xl bg-gradient-to-br ${folderGrad(
-                        f.color
-                      )} shadow-lg group-hover:-translate-y-0.5 transition-transform overflow-hidden`}
-                    >
-                      <div className="absolute -top-1.5 left-5 w-16 h-4 rounded-t-lg bg-white/25" />
-                      <div className="absolute bottom-3 left-4 right-4">
-                        <p className="text-white font-bold text-sm truncate">{f.name}</p>
-                        <p className="text-white/70 text-xs mt-0.5">
-                          {savedSessions.filter((s) => s.folderId === f.id).length} 条记录
-                        </p>
-                      </div>
+                    <input
+                      autoFocus
+                      value={editFolderName}
+                      onChange={(e) => setEditFolderName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleRenameFolder();
+                        else if (e.key === "Escape") setEditingFolderId(null);
+                      }}
+                      className="ct-input w-full px-2 py-1.5 text-sm"
+                      placeholder="文件夹名称"
+                    />
+                    <div className="flex items-center gap-1 flex-wrap">
+                      {FOLDER_COLOR_KEYS.map((c) => (
+                        <button
+                          key={c}
+                          type="button"
+                          onClick={() => setEditFolderColor(c)}
+                          className={`w-5 h-5 rounded-full bg-gradient-to-tr ${FOLDER_COLORS[c].grad} transition ${
+                            editFolderColor === c ? "ring-2 ring-white/80 scale-110" : "opacity-70 hover:opacity-100"
+                          }`}
+                          aria-label={`颜色 ${c}`}
+                        />
+                      ))}
                     </div>
-                  </button>
-                  <button
-                    onClick={() => handleDeleteFolder(f)}
-                    title="删除文件夹"
-                    className="absolute top-2 right-2 p-1.5 rounded-lg bg-black/30 text-white/70 opacity-0 group-hover:opacity-100 hover:bg-black/50 hover:text-white transition"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))}
+                    <div className="flex items-center gap-2 mt-auto">
+                      <button
+                        onClick={handleRenameFolder}
+                        className="ct-btn-success px-2 py-1 rounded-md text-xs flex items-center gap-1"
+                      >
+                        <Check className="w-3.5 h-3.5" /> 保存
+                      </button>
+                      <button
+                        onClick={() => setEditingFolderId(null)}
+                        className="ct-btn-ghost px-2 py-1 rounded-md text-xs flex items-center gap-1"
+                      >
+                        <X className="w-3.5 h-3.5" /> 取消
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div key={f.id} className="group relative">
+                    <button
+                      onClick={() => {
+                        setOpenFolderId(f.id);
+                        setActiveView("saved");
+                      }}
+                      className="w-full text-left focus:outline-none"
+                    >
+                      <div
+                        className={`relative h-28 rounded-2xl bg-gradient-to-br ${folderGrad(
+                          f.color
+                        )} shadow-lg group-hover:-translate-y-0.5 transition-transform overflow-hidden`}
+                      >
+                        <div className="absolute -top-1.5 left-5 w-16 h-4 rounded-t-lg bg-white/25" />
+                        <div className="absolute bottom-3 left-4 right-4">
+                          <p className="text-white font-bold text-sm truncate">{f.name}</p>
+                          <p className="text-white/70 text-xs mt-0.5">
+                            {savedSessions.filter((s) => s.folderId === f.id).length} 条记录
+                          </p>
+                        </div>
+                      </div>
+                    </button>
+                    <div className="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition">
+                      <button
+                        onClick={() => startRenameFolder(f)}
+                        title="重命名文件夹"
+                        className="p-1.5 rounded-lg bg-black/30 text-white/70 hover:bg-black/50 hover:text-white"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={() => handleDeleteFolder(f)}
+                        title="删除文件夹"
+                        className="p-1.5 rounded-lg bg-black/30 text-white/70 hover:bg-black/50 hover:text-white"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                )
+              )}
             </div>
 
             {/* Recent recordings */}
