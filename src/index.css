@@ -775,3 +775,63 @@ code {
 kbd {
   font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
 }
+
+/* Rendered classroom-summary markdown. Driven by the --ct-text/-accent theme
+   variables so it stays readable in BOTH dark and light mode. (Previously the
+   summary used Tailwind [&_h1]:text-slate-100 arbitrary variants, which the
+   light-theme .text-slate-100 override does not match — so headings turned
+   near-white and vanished on the light background.) */
+.ct-markdown {
+  color: var(--ct-text-2);
+}
+.ct-markdown h1,
+.ct-markdown h2,
+.ct-markdown h3,
+.ct-markdown h4,
+.ct-markdown h5,
+.ct-markdown h6 {
+  color: var(--ct-text-1);
+  font-weight: 700;
+  line-height: 1.3;
+  margin: 12px 0 8px;
+}
+.ct-markdown h1 { font-size: 1.25rem; }
+.ct-markdown h2 { font-size: 1.125rem; font-weight: 600; }
+.ct-markdown h3 { font-size: 1rem; font-weight: 600; margin: 8px 0 4px; }
+.ct-markdown p { margin: 8px 0; }
+.ct-markdown ul { list-style: disc; padding-left: 1.25rem; margin: 8px 0; }
+.ct-markdown ol { list-style: decimal; padding-left: 1.25rem; margin: 8px 0; }
+.ct-markdown li { margin: 4px 0; }
+.ct-markdown strong { color: var(--ct-text-1); font-weight: 700; }
+.ct-markdown blockquote {
+  border-left: 4px solid var(--ct-accent);
+  background: var(--ct-glass-2);
+  padding: 8px 12px;
+  border-radius: 0 6px 6px 0;
+  margin: 8px 0;
+  color: var(--ct-text-3);
+}
+.ct-markdown code {
+  background: var(--ct-glass-3);
+  color: var(--ct-text-1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.85em;
+}
+/* Code blocks stay dark in both themes for legibility. */
+.ct-markdown pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 12px 0;
+}
+.ct-markdown pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+.ct-markdown a { color: var(--ct-accent); text-decoration: underline; }
+.ct-markdown hr { border: 0; border-top: 1px solid var(--ct-border-soft); margin: 12px 0; }

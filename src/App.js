@@ -2338,8 +2338,11 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     } catch (e) {}
   }, [theme]);
   const toggleTheme = useCallback(() => {
-    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
-  }, []);
+    // setTheme forwards its argument straight to updateSetting, so it is NOT a
+    // React state setter — passing a functional updater would store the
+    // function itself as the theme value. Compute the next value from `theme`.
+    updateSetting("theme", theme === "dark" ? "light" : "dark");
+  }, [theme, updateSetting]);
   // Whole-bubble editor draft. shape: { scope, key, payload, enDraft, zhDraft }
   const [bubbleEditDraft, setBubbleEditDraft] = useState(null);
   const [isRegeneratingSummary, setIsRegeneratingSummary] = useState(false);
@@ -3459,6 +3462,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     const stopDurationSec = recordingTime;
     shouldListenRef.current = false;
 
+    // End the session immediately so the header timer stops and Pause / Stop
+    // revert to idle; the summary + save run afterwards via autoSave.
+    setListeningMode("none");
+    setIsPaused(false);
+    isPausedRef.current = false;
+
     // 与麦克风模式保持一致：停止时先收口当前活跃片段
     if (activeEnRef.current.trim()) {
       finalizeCurrentBlock();
@@ -3479,10 +3488,6 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     processedLengthRef.current = 0;
     lastSessionStringRef.current = "";
     lastFinalSessionStringRef.current = "";
-
-    setListeningMode("none");
-    setIsPaused(false);
-    isPausedRef.current = false;
   }, [
     autoSaveCurrentSessionWithSummary,
     finalizeCurrentBlock,
@@ -3711,11 +3716,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       const stopDurationSec = recordingTime;
       shouldListenRef.current = false;
 
-      if (isPausedRef.current) {
-        setListeningMode("none");
-        setIsPaused(false);
-        isPausedRef.current = false;
-      }
+      // End the recording session immediately so the header timer stops and the
+      // Pause / Stop buttons revert to the idle state — regardless of whether we
+      // were paused. (Summary + save then run in the background via autoSave.)
+      setListeningMode("none");
+      setIsPaused(false);
+      isPausedRef.current = false;
 
       await stopParaformerSession();
       stopMicCaptureEnhancer();
@@ -5838,7 +5844,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                     <div className="rounded-2xl border border-indigo-400/20 bg-indigo-500/[0.06] p-5">
                       <h4 className="font-semibold text-indigo-200 mb-2">课堂纪要</h4>
                       <div
-                        className="text-sm text-slate-200 leading-relaxed break-words [&_h1]:text-xl [&_h1]:font-bold [&_h1]:text-slate-100 [&_h1]:mt-3 [&_h1]:mb-2 [&_h2]:text-lg [&_h2]:font-semibold [&_h2]:text-slate-100 [&_h2]:mt-3 [&_h2]:mb-2 [&_h3]:text-base [&_h3]:font-semibold [&_h3]:text-slate-100 [&_h3]:mt-2 [&_h3]:mb-1 [&_p]:my-2 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-1 [&_blockquote]:border-l-4 [&_blockquote]:border-indigo-400 [&_blockquote]:bg-white/[0.03] [&_blockquote]:px-3 [&_blockquote]:py-2 [&_blockquote]:rounded-r-md [&_code]:bg-white/10 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:font-mono [&_pre]:bg-black/40 [&_pre]:text-slate-100 [&_pre]:p-3 [&_pre]:rounded-lg [&_pre]:overflow-x-auto [&_pre]:my-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_hr]:my-3 [&_hr]:border-white/10 [&_a]:text-indigo-300 [&_a]:underline"
+                        className="ct-markdown text-sm leading-relaxed break-words"
                         dangerouslySetInnerHTML={{
                           __html: renderMarkdownToSafeHtml(
                             selectedSavedSession.summary || "（该会话未保存纪要）"
