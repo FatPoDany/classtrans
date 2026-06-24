@@ -9,7 +9,7 @@ export function useGlobalSettings() {
     aiModelName: 'qwen-plus',
     realtimeModelName: 'qwen-turbo',
     summaryModelName: 'qwen-plus',
-    asrModelName: 'paraformer-realtime-v2'
+    asrModelName: 'qwen3.5-livetranslate-flash-realtime'
   });
   const [loading, setLoading] = useState(true);
 

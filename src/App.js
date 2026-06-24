@@ -32,8 +32,11 @@ import {
   Folder,
   FolderPlus,
   Plus,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { ParaformerSession } from "./paraformerSession";
+import { LiveTranslateSession } from "./liveTranslateSession";
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './AuthContext';
 import AuthPage from './pages/AuthPage';
@@ -157,10 +160,11 @@ const MODEL_STORAGE_KEY = "classtrans.aiModelName.v1";
 const REALTIME_MODEL_STORAGE_KEY = "classtrans.realtimeModelName.v1";
 const SUMMARY_MODEL_STORAGE_KEY = "classtrans.summaryModelName.v1";
 const ASR_MODEL_STORAGE_KEY = "classtrans.asrModelName.v1";
+const TRANSLATION_AUDIO_STORAGE_KEY = "classtrans.playTranslationAudio.v1";
 
 const DEFAULT_POLISH_MODEL = "qwen-plus";
 const DEFAULT_REALTIME_MODEL = "qwen-turbo";
-const DEFAULT_ASR_MODEL = "paraformer-realtime-v2";
+const DEFAULT_ASR_MODEL = "qwen3.5-livetranslate-flash-realtime";
 
 const normalizeLegacyPolishModelName = (name) => {
   const cleanName = String(name || "").trim();
@@ -190,6 +194,19 @@ try {
 // 仅 Paraformer 系列支持 vocabulary_id 热词偏置；切到 Gummy 等其他系列时跳过
 const isParaformerFamilyModel = (name) =>
   /^paraformer-/i.test(String(name || "").trim());
+
+// 一体化语音翻译模型（Qwen LiveTranslate，Omni-Realtime 协议）：与 Paraformer/Gummy 的
+// run-task 协议不同，需要走中继的 /realtime 路由并自带译文。
+const isLiveTranslateModel = (name) => /livetranslate/i.test(String(name || "").trim());
+
+// 由 Paraformer 中继地址推导 Realtime 中继地址：/asr → /realtime，附带 model 查询参数。
+const REALTIME_WS_BASE = PARAFORMER_WS_URL
+  ? /\/asr$/i.test(PARAFORMER_WS_URL)
+    ? PARAFORMER_WS_URL.replace(/\/asr$/i, "/realtime")
+    : PARAFORMER_WS_URL.replace(/\/+$/, "") + "/realtime"
+  : "";
+const buildRealtimeWsUrl = (model) =>
+  REALTIME_WS_BASE ? `${REALTIME_WS_BASE}?model=${encodeURIComponent(model)}` : "";
 
 export const setGlobalModelName = (name) => {
   const cleanName = normalizeLegacyPolishModelName(name);
@@ -2197,6 +2214,28 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const [isSupported, setIsSupported] = useState(true);
   const [asrStatus, setAsrStatus] = useState("idle"); // 'idle' | 'connecting' | 'live' | 'error'
   const [asrErrorReason, setAsrErrorReason] = useState("");
+  // 一体化语音翻译（livetranslate）：是否朗读中文译文，以及当前会话是否使用该模型。
+  const [playTranslationAudio, setPlayTranslationAudioState] = useState(() => {
+    try {
+      return window.localStorage.getItem(TRANSLATION_AUDIO_STORAGE_KEY) === "1";
+    } catch (e) {
+      return false;
+    }
+  });
+  const playTranslationAudioRef = useRef(playTranslationAudio);
+  const [liveTranslateActive, setLiveTranslateActive] = useState(false);
+
+  // 切换“朗读中文译文”。即时持久化，并对正在运行的 livetranslate 会话热更新输出模态。
+  const toggleTranslationAudio = useCallback(() => {
+    const next = !playTranslationAudioRef.current;
+    playTranslationAudioRef.current = next;
+    setPlayTranslationAudioState(next);
+    try {
+      window.localStorage.setItem(TRANSLATION_AUDIO_STORAGE_KEY, next ? "1" : "0");
+    } catch (e) {}
+    const s = paraformerSessionRef.current;
+    if (s && typeof s.setAudioOutput === "function") s.setAudioOutput(next);
+  }, []);
 
   // ---- Toasts: 可堆栈、自动消失、可手动关 -----------------------------------
   const [toasts, setToasts] = useState([]);
@@ -3410,6 +3449,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     const session = paraformerSessionRef.current;
     if (!session) return;
     paraformerSessionRef.current = null;
+    setLiveTranslateActive(false);
     setAsrStatus("idle");
     setAsrErrorReason("");
     try {
@@ -3434,52 +3474,75 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       setAsrStatus("connecting");
       setAsrErrorReason("");
 
-      const session = new ParaformerSession({
-        wsUrl: PARAFORMER_WS_URL,
-        audioTrack,
-        languageHints: ["en"],
-        model: runtimeAsrModelName,
-        // 热词偏置（vocabulary_id）目前是 Paraformer 独有功能；切到 Gummy 等系列时不要带
-        vocabularyId: isParaformerFamilyModel(runtimeAsrModelName)
-          ? getStoredVocabularyId() || undefined
-          : undefined,
-        // Defer rotation while user is mid-utterance. ParaformerSession will
-        // wait for a "safe window" (this returns true) before swapping the
-        // pipeline, with a hard ceiling so it can't defer forever.
-        canRotateNow: () => !activeEnRef.current.trim(),
-        onUpdate: ({ fullText, finalText, confidence }) => {
-          applyTranscriptUpdate({ fullText, finalText, confidence });
-        },
-        onStatus: ({ phase, attempt, reason }) => {
-          if (phase === "started") {
-            setAsrStatus("live");
-            setAsrErrorReason("");
+      const useLiveTranslate = isLiveTranslateModel(runtimeAsrModelName);
+
+      // 转录增量回调：两种会话共用。translatedText 仅在一体化翻译（livetranslate/Gummy）
+      // 时出现；出现即由 applyTranscriptUpdate 直接驱动中文并跳过 LLM 实时翻译。
+      const onUpdate = ({ fullText, finalText, confidence, translatedText }) => {
+        applyTranscriptUpdate({ fullText, finalText, confidence, translatedText });
+      };
+      const onStatus = ({ phase, attempt, reason }) => {
+        if (phase === "started") {
+          setAsrStatus("live");
+          setAsrErrorReason("");
+        }
+        if (phase === "reconnecting") {
+          setAsrStatus("connecting");
+          // Planned rotation / DashScope task-finished are part of the normal
+          // long-session cycle. Update the pipeline pill briefly but don't pop
+          // a toast — only true anomalies warrant one.
+          const isQuietRecovery =
+            reason === "rotation" || reason === "task-finished";
+          if (!isQuietRecovery) {
+            pushToast({
+              level: "warn",
+              text: `识别连接中断，正在自动重连 (${attempt}/${3})…`,
+              ttl: 4000,
+            });
           }
-          if (phase === "reconnecting") {
-            setAsrStatus("connecting");
-            // Planned rotation / DashScope task-finished are part of the
-            // normal long-session cycle. Update the pipeline pill briefly
-            // but don't pop a toast — only true anomalies warrant one.
-            const isQuietRecovery =
-              reason === "rotation" || reason === "task-finished";
-            if (!isQuietRecovery) {
-              pushToast({
-                level: "warn",
-                text: `识别连接中断，正在自动重连 (${attempt}/${3})…`,
-                ttl: 4000,
-              });
-            }
-          }
-        },
-        onError: (err) => {
-          console.error("Paraformer error:", err);
-          const label = mode === "tab" ? "系统音频识别" : "麦克风识别";
-          const reason = err && err.message ? err.message : String(err);
-          setAsrStatus("error");
-          setAsrErrorReason(reason);
-          pushToast({ level: "error", text: `${label}异常：${reason}`, ttl: 7000 });
-        },
-      });
+        }
+      };
+      const onError = (err) => {
+        console.error("ASR error:", err);
+        const label = mode === "tab" ? "系统音频识别" : "麦克风识别";
+        const reason = err && err.message ? err.message : String(err);
+        setAsrStatus("error");
+        setAsrErrorReason(reason);
+        pushToast({ level: "error", text: `${label}异常：${reason}`, ttl: 7000 });
+      };
+
+      // Defer rotation while user is mid-utterance; the session waits for this
+      // "safe window" (true) before swapping the pipeline, with a hard ceiling.
+      const canRotateNow = () => !activeEnRef.current.trim();
+
+      const session = useLiveTranslate
+        ? new LiveTranslateSession({
+            wsUrl: buildRealtimeWsUrl(runtimeAsrModelName),
+            audioTrack,
+            model: runtimeAsrModelName,
+            sourceLang: "en",
+            target: "zh",
+            audioOutput: playTranslationAudioRef.current,
+            canRotateNow,
+            onUpdate,
+            onStatus,
+            onError,
+          })
+        : new ParaformerSession({
+            wsUrl: PARAFORMER_WS_URL,
+            audioTrack,
+            languageHints: ["en"],
+            model: runtimeAsrModelName,
+            // 热词偏置（vocabulary_id）目前是 Paraformer 独有功能；切到其他系列时不要带
+            vocabularyId: isParaformerFamilyModel(runtimeAsrModelName)
+              ? getStoredVocabularyId() || undefined
+              : undefined,
+            canRotateNow,
+            onUpdate,
+            onStatus,
+            onError,
+          });
+      setLiveTranslateActive(useLiveTranslate);
       paraformerSessionRef.current = session;
 
       try {
@@ -5051,6 +5114,25 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                   {formatTime(recordingTime)}
                 </div>
 
+                {liveTranslateActive && (
+                  <button
+                    onClick={toggleTranslationAudio}
+                    title={playTranslationAudio ? "关闭中文译文朗读" : "朗读中文译文（实时语音）"}
+                    className={`flex items-center justify-center px-3 py-2 rounded-xl font-semibold text-sm border transition-colors ${
+                      playTranslationAudio
+                        ? "bg-emerald-500/20 text-emerald-200 border-emerald-400/40"
+                        : "bg-black/30 text-slate-300 border-white/10 hover:text-slate-100"
+                    }`}
+                  >
+                    {playTranslationAudio ? (
+                      <Volume2 className="w-4 h-4" />
+                    ) : (
+                      <VolumeX className="w-4 h-4" />
+                    )}
+                    <span className="hidden lg:inline ml-1">译文朗读</span>
+                  </button>
+                )}
+
                 {isPaused ? (
                   <button
                     onClick={togglePause}
@@ -6339,7 +6421,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                   type="text"
                   value={asrModelDraft}
                   onChange={(e) => setAsrModelDraft(e.target.value)}
-                  placeholder="例如 paraformer-realtime-v2"
+                  placeholder="例如 qwen3.5-livetranslate-flash-realtime"
                   className="ct-input w-full p-3 text-sm font-mono"
                 />
               </div>

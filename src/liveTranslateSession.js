@@ -1,0 +1,261 @@
+// Qwen LiveTranslate real-time speech-translation session adapter.
+//
+// DashScope "Omni-Realtime" protocol over the WebSocket relay (Cloudflare
+// Worker → DashScope `/api-ws/v1/realtime?model=...`). This is a different wire
+// protocol from Paraformer/Gummy: a `session.update` configures source/target
+// languages, audio is sent as base64 `input_audio_buffer.append` events, and
+// the server streams source transcription + translated text (+ optional speech)
+// back as `conversation.item.input_audio_transcription.*` and `response.*`
+// events. All the transport/resilience machinery comes from BaseAsrSession.
+//
+// One-pass: this session emits both the source English (`fullText`) and the
+// translated Chinese (`translatedText`) on `onUpdate`, so the App drives ZH
+// directly and skips its interim-LLM translate loop (see App.js
+// applyTranscriptUpdate / asrProvidesTranslationRef).
+//
+// NOTE: event/field names are best-effort against the Jan-2026 Omni-Realtime
+// docs and may need a tweak after a live test — unhandled event types are
+// console.debug-logged once to make that easy (same approach as Gummy).
+
+import { BaseAsrSession, sanitizeText, generateEventId } from "./baseAsrSession";
+import { AsrAudioPlayer } from "./asrAudioPlayer";
+
+const DEFAULT_SOURCE_LANG = "en";
+const DEFAULT_TARGET_LANG = "zh";
+// Internal ASR sub-model the realtime model uses to transcribe the source.
+const SOURCE_ASR_MODEL = "qwen3-asr-flash-realtime";
+
+const toUint8 = (buf) =>
+  buf instanceof ArrayBuffer
+    ? new Uint8Array(buf)
+    : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+
+const arrayBufferToBase64 = (buf) => {
+  const bytes = toUint8(buf);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+};
+
+// Strip tags + zero-width chars from a streaming delta WITHOUT collapsing/
+// trimming spaces (deltas may carry meaningful leading/trailing spaces; the
+// final join trims). sanitizeText is used for whole-string fields.
+const stripDelta = (s) =>
+  String(s || "")
+    .replace(/<\/?[^>]+>/g, "")
+    .replace(/[​-‍﻿]/g, "");
+
+export class LiveTranslateSession extends BaseAsrSession {
+  constructor(options) {
+    super(options);
+    const { sourceLang, target, audioOutput } = options || {};
+    this.sourceLang = (sourceLang && String(sourceLang).trim()) || DEFAULT_SOURCE_LANG;
+    this.target = (target && String(target).trim()) || DEFAULT_TARGET_LANG;
+    this.audioOutput = !!audioOutput;
+
+    // Ordered accumulation across turns. EN keyed by input-transcription item,
+    // ZH keyed by response — independent cumulative strings (the App tracks each
+    // with its own processedLength).
+    this._enItems = []; // { id, text, isFinal }
+    this._zhItems = []; // { id, text, isFinal }
+    this._loggedUnknown = new Set();
+
+    this._player = null; // lazy AsrAudioPlayer when audioOutput is on
+  }
+
+  // ---- protocol hooks ----------------------------------------------------
+
+  _sendConfig() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const session = {
+      modalities: this.audioOutput ? ["text", "audio"] : ["text"],
+      input_audio_format: "pcm",
+      input_audio_transcription: { model: SOURCE_ASR_MODEL, language: this.sourceLang },
+      translation: { language: this.target },
+      turn_detection: { type: "server_vad" },
+    };
+    if (this.audioOutput) session.output_audio_format = "pcm";
+    try {
+      this.ws.send(
+        JSON.stringify({ event_id: generateEventId(), type: "session.update", session })
+      );
+    } catch (e) {}
+  }
+
+  _sendAudio(buf) {
+    // Omni-Realtime: base64 PCM in an input_audio_buffer.append event.
+    this.ws.send(
+      JSON.stringify({
+        event_id: generateEventId(),
+        type: "input_audio_buffer.append",
+        audio: arrayBufferToBase64(buf),
+      })
+    );
+  }
+
+  // No explicit finish event — closing the socket ends the session, so the base
+  // no-op _sendFinish() is correct.
+
+  _resetBuffers() {
+    this._enItems = [];
+    this._zhItems = [];
+    if (this._player) this._player.reset();
+  }
+
+  _handleProtocolMessage(msg) {
+    const type = msg && msg.type;
+    if (!type || typeof type !== "string") return;
+
+    if (type === "session.created") {
+      // Some servers apply session.update only after session.created; resend
+      // (idempotent). Readiness is signalled by session.updated.
+      this._sendConfig();
+      return;
+    }
+    if (type === "session.updated") {
+      this._signalReady();
+      return;
+    }
+
+    if (type === "error") {
+      const err = msg.error || {};
+      const errMsg = err.message || err.code || msg.message || "realtime error";
+      this._handleFatalError(errMsg);
+      return;
+    }
+
+    // --- source (input) transcription -> English ---
+    if (type.indexOf("input_audio_transcription") !== -1) {
+      const itemId = msg.item_id || msg.id || `en-${this._enItems.length}`;
+      const isFinal = /\.completed$/.test(type);
+      // partial uses `stash`; completed uses `transcript`.
+      const text = sanitizeText(msg.transcript ?? msg.stash ?? msg.text ?? msg.delta);
+      if (text || isFinal) {
+        this._markResult();
+        this._setItem(this._enItems, itemId, text, isFinal);
+        this._emit();
+      }
+      return;
+    }
+
+    // --- translated output -> Chinese ---
+    // Text-only mode streams response.text.delta/.done; audio+text mode carries
+    // the same text on response.audio_transcript.delta/.done.
+    if (/^response\.(text|audio_transcript)\.(delta|done)$/.test(type)) {
+      const respId = msg.response_id || msg.item_id || `zh-${this._zhItems.length}`;
+      this._markResult();
+      if (/\.done$/.test(type)) {
+        this._setItem(this._zhItems, respId, sanitizeText(msg.text ?? msg.transcript), true);
+      } else {
+        const delta = stripDelta(msg.delta);
+        if (delta) this._appendDelta(this._zhItems, respId, delta);
+      }
+      this._emit();
+      return;
+    }
+
+    // --- streamed translated speech ---
+    if (type === "response.audio.delta") {
+      this._markResult();
+      if (this.audioOutput && msg.delta) this._ensurePlayer().feed(msg.delta);
+      return;
+    }
+
+    // Benign lifecycle / no-op events.
+    if (
+      type === "response.created" ||
+      type === "response.done" ||
+      type === "response.audio.done" ||
+      type === "response.output_item.added" ||
+      type === "response.output_item.done" ||
+      type === "response.content_part.added" ||
+      type === "response.content_part.done" ||
+      type === "input_audio_buffer.speech_started" ||
+      type === "input_audio_buffer.speech_stopped" ||
+      type === "input_audio_buffer.committed" ||
+      type === "conversation.item.created" ||
+      type === "rate_limits.updated"
+    ) {
+      return;
+    }
+
+    // Unknown event — log once to ease first-run field tuning.
+    if (!this._loggedUnknown.has(type)) {
+      this._loggedUnknown.add(type);
+      console.debug(`${this._tag}: unhandled event type "${type}"`, msg);
+    }
+  }
+
+  // ---- accumulation helpers ----------------------------------------------
+
+  // Replace-or-insert the text for an id. Source partials supersede the prior
+  // partial for the same item; the final `done`/`completed` replaces it. Guard
+  // against a late empty update clobbering good text.
+  _setItem(list, id, text, isFinal) {
+    const idx = list.findIndex((it) => it.id === id);
+    if (idx >= 0) {
+      list[idx] = { id, text: text || list[idx].text, isFinal: isFinal || list[idx].isFinal };
+    } else {
+      list.push({ id, text, isFinal });
+    }
+  }
+
+  // Append a streaming translation delta to a response item.
+  _appendDelta(list, id, delta) {
+    const idx = list.findIndex((it) => it.id === id);
+    if (idx >= 0) list[idx].text = `${list[idx].text}${delta}`;
+    else list.push({ id, text: delta, isFinal: false });
+  }
+
+  _join(list, finalOnly) {
+    return list
+      .filter((it) => (finalOnly ? it.isFinal : true))
+      .map((it) => it.text)
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  _emit() {
+    this.onUpdate({
+      fullText: this._join(this._enItems, false),
+      finalText: this._join(this._enItems, true),
+      confidence: 0,
+      translatedText: this._join(this._zhItems, false),
+      translatedFinalText: this._join(this._zhItems, true),
+    });
+  }
+
+  // ---- audio output ------------------------------------------------------
+
+  _ensurePlayer() {
+    if (!this._player) this._player = new AsrAudioPlayer();
+    return this._player;
+  }
+
+  // Toggle spoken-translation output mid-session: re-send session.update with
+  // the new modalities and start/stop playback. Called by the App's UI toggle.
+  setAudioOutput(enabled) {
+    const next = !!enabled;
+    if (next === this.audioOutput) return;
+    this.audioOutput = next;
+    if (next) {
+      this._ensurePlayer().enable();
+    } else if (this._player) {
+      this._player.disable();
+    }
+    this._sendConfig();
+  }
+
+  async stop() {
+    if (this._player) {
+      try { this._player.dispose(); } catch (_) {}
+      this._player = null;
+    }
+    await super.stop();
+  }
+}

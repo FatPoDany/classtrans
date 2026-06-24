@@ -1,7 +1,9 @@
 // Cloudflare Worker: pass-through WebSocket relay between the classtrans
-// browser client and DashScope Paraformer real-time ASR.
+// browser client and DashScope real-time ASR. Routes:
+//   /asr       → Paraformer/Gummy run-task endpoint (/api-ws/v1/inference)
+//   /realtime  → Qwen Omni-Realtime endpoint (/api-ws/v1/realtime?model=...)
 //
-// Why a relay: the Paraformer endpoint requires an Authorization header which
+// Why a relay: the DashScope endpoints require an Authorization header which
 // browsers cannot set on a WebSocket connection, and we don't want the API key
 // in client code.
 //
@@ -15,6 +17,12 @@
 // 30 s on *both* legs to keep the connection alive.
 
 const PARAFORMER_WS_URL = "https://dashscope.aliyuncs.com/api-ws/v1/inference";
+// Qwen Omni-Realtime endpoint (e.g. qwen3.5-livetranslate-flash-realtime). The
+// model is supplied by the client as a query param and appended here.
+const REALTIME_WS_URL = "https://dashscope.aliyuncs.com/api-ws/v1/realtime";
+// DashScope model ids only contain these characters; reject anything else so
+// the model param can't turn the relay into an open proxy.
+const MODEL_RE = /^[a-zA-Z0-9._-]+$/;
 
 // Interval between heartbeat pings (ms). 30 s is well within the 100 s limit.
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -44,7 +52,9 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname !== "/asr") {
+    const isAsr = url.pathname === "/asr";           // Paraformer/Gummy (run-task)
+    const isRealtime = url.pathname === "/realtime";  // Qwen Omni-Realtime
+    if (!isAsr && !isRealtime) {
       return new Response("Not found", { status: 404 });
     }
 
@@ -65,9 +75,18 @@ export default {
       return new Response("Server missing DASHSCOPE_API_KEY", { status: 500 });
     }
 
+    let upstreamUrl = PARAFORMER_WS_URL;
+    if (isRealtime) {
+      const model = url.searchParams.get("model") || "";
+      if (!MODEL_RE.test(model)) {
+        return new Response("Invalid or missing model parameter", { status: 400 });
+      }
+      upstreamUrl = `${REALTIME_WS_URL}?model=${encodeURIComponent(model)}`;
+    }
+
     let upstreamResponse;
     try {
-      upstreamResponse = await fetch(PARAFORMER_WS_URL, {
+      upstreamResponse = await fetch(upstreamUrl, {
         headers: {
           Upgrade: "websocket",
           Authorization: `bearer ${env.DASHSCOPE_API_KEY}`,
@@ -160,10 +179,13 @@ export default {
         return;
       }
       try { server.send(PING_MSG); } catch (_) {}
-      // For upstream we send a proper silence PCM frame (100 ms at 16 kHz).
-      // DashScope needs valid-sized audio frames to consider the stream
-      // active and keep the ASR task alive.
-      try { upstream.send(SILENCE_PCM_FRAME); } catch (_) {}
+      // Paraformer needs valid binary PCM frames (100 ms at 16 kHz) to keep its
+      // ASR task alive. The Omni-Realtime endpoint expects base64
+      // `input_audio_buffer.append` events instead — raw binary is invalid
+      // there — so the client handles its own upstream keepalive on /realtime.
+      if (isAsr) {
+        try { upstream.send(SILENCE_PCM_FRAME); } catch (_) {}
+      }
     }, HEARTBEAT_INTERVAL_MS);
 
     return new Response(null, {
