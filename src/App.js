@@ -2530,7 +2530,13 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
 
   const buildSessionPayload = useCallback(
     (overrideSummary = "") => {
-      const cleaned = transcripts.filter(
+      // Read from the ref, not the `transcripts` state: a bubble whose AI
+      // polish finishes *after* "Stop" is clicked lands via setTranscripts
+      // while this save runs inside a stale closure. The ref always holds the
+      // latest committed transcripts (kept in sync by an effect), so the
+      // just-finalized bubble is included instead of being dropped as a
+      // still-pending placeholder.
+      const cleaned = transcriptsRef.current.filter(
         (item) =>
           item &&
           item.en &&
@@ -2559,7 +2565,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         })),
       };
     },
-    [summaryResult, transcripts]
+    [summaryResult]
   );
 
   const saveSessionToFolder = useCallback(
