@@ -59,7 +59,7 @@ export class LiveTranslateSession extends BaseAsrSession {
     this._enPartial = "";    // in-progress source partial
     this._zhFinalParts = []; // completed translated (ZH) texts
     this._zhPartial = "";    // in-progress translation (accumulated deltas)
-    this._seenTypes = new Set(); // one-shot raw-event logging for field tuning
+    this._loggedUnknown = new Set(); // log each unrecognized event type once (debug)
     this._configSent = false; // one-shot session.update per connection
 
     this._player = null; // lazy AsrAudioPlayer when audioOutput is on
@@ -118,17 +118,6 @@ export class LiveTranslateSession extends BaseAsrSession {
   _handleProtocolMessage(msg) {
     const type = msg && msg.type;
     if (!type || typeof type !== "string") return;
-
-    // DEBUG: log the first occurrence of each event type with its raw payload so
-    // the exact transcription/translation field names can be confirmed live.
-    // console.log (not debug) so it shows at the default console level. Remove
-    // once the protocol mapping is verified.
-    if (!this._seenTypes.has(type)) {
-      this._seenTypes.add(type);
-      try {
-        console.log(`[LT-EVENT] ${type} =>`, JSON.stringify(msg).slice(0, 1000));
-      } catch (_) {}
-    }
 
     if (type === "session.created") {
       // Configure exactly once, now that the session exists. Sending more than
@@ -228,8 +217,12 @@ export class LiveTranslateSession extends BaseAsrSession {
       return;
     }
 
-    // Any other event (response.created/done, speech_started/stopped, …) needs
-    // no action; its shape was already captured by the one-shot logging above.
+    // Unrecognized event — no action needed, but log once (debug-level, hidden
+    // by default) so a future DashScope protocol change is discoverable.
+    if (!this._loggedUnknown.has(type)) {
+      this._loggedUnknown.add(type);
+      console.debug(`${this._tag}: unhandled event "${type}"`);
+    }
   }
 
   // ---- accumulation ------------------------------------------------------
