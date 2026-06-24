@@ -62,13 +62,23 @@ export class LiveTranslateSession extends BaseAsrSession {
     this._enItems = []; // { id, text, isFinal }
     this._zhItems = []; // { id, text, isFinal }
     this._loggedUnknown = new Set();
+    this._configSent = false; // one-shot session.update per connection
 
     this._player = null; // lazy AsrAudioPlayer when audioOutput is on
   }
 
   // ---- protocol hooks ----------------------------------------------------
 
+  // Base calls this on every (re)connect. The realtime handshake requires
+  // waiting for `session.created` before configuring, and DashScope allows the
+  // session to be configured only ONCE ("session already started" otherwise) —
+  // so we just arm the one-shot here and send the real session.update when
+  // session.created arrives.
   _sendConfig() {
+    this._configSent = false;
+  }
+
+  _sendSessionUpdate() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const session = {
       modalities: this.audioOutput ? ["text", "audio"] : ["text"],
@@ -110,9 +120,13 @@ export class LiveTranslateSession extends BaseAsrSession {
     if (!type || typeof type !== "string") return;
 
     if (type === "session.created") {
-      // Some servers apply session.update only after session.created; resend
-      // (idempotent). Readiness is signalled by session.updated.
-      this._sendConfig();
+      // Configure exactly once, now that the session exists. Sending more than
+      // one session.update per session is rejected ("session already started").
+      // Readiness is signalled by session.updated.
+      if (!this._configSent) {
+        this._configSent = true;
+        this._sendSessionUpdate();
+      }
       return;
     }
     if (type === "session.updated") {
@@ -237,8 +251,10 @@ export class LiveTranslateSession extends BaseAsrSession {
     return this._player;
   }
 
-  // Toggle spoken-translation output mid-session: re-send session.update with
-  // the new modalities and start/stop playback. Called by the App's UI toggle.
+  // Toggle spoken-translation output mid-session. The session's modality is
+  // fixed at creation (a live session.update is rejected), so switch by renewing
+  // the task — a brief reconnect that reconfigures with the new modalities.
+  // Called by the App's UI toggle.
   setAudioOutput(enabled) {
     const next = !!enabled;
     if (next === this.audioOutput) return;
@@ -248,7 +264,9 @@ export class LiveTranslateSession extends BaseAsrSession {
     } else if (this._player) {
       this._player.disable();
     }
-    this._sendConfig();
+    if (this.ws && !this.stopped && !this._isRenewing && !this._isReconnecting) {
+      this._renewTask("audio-toggle");
+    }
   }
 
   async stop() {

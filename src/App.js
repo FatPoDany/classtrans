@@ -3492,7 +3492,9 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           // long-session cycle. Update the pipeline pill briefly but don't pop
           // a toast — only true anomalies warrant one.
           const isQuietRecovery =
-            reason === "rotation" || reason === "task-finished";
+            reason === "rotation" ||
+            reason === "task-finished" ||
+            reason === "audio-toggle";
           if (!isQuietRecovery) {
             pushToast({
               level: "warn",
