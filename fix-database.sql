@@ -1,36 +1,21 @@
 -- =============================================================
--- ClassTrans — consolidated database fix
+-- ClassTrans — database permissions fix (grants + RLS)
 -- =============================================================
 -- HOW TO RUN: Supabase Dashboard → SQL Editor → New query → paste → Run.
 -- This script is IDEMPOTENT: it is safe to run more than once.
 --
--- It fixes:
---   • #1 / #2  AI translation, polishing and minutes — restores REAL DashScope
---              model names (earlier tooling stored non-existent names such as
---              'qwen3.6-35b-a3b' and 'deepseek-v4-flash', which DashScope
---              rejects).
---   • #4       Saved transcripts disappearing after refresh — restores the
---              table GRANTs + RLS policies. Without the base GRANT, every query
---              fails with "permission denied for table … (42501)", so sessions
---              and transcripts were never actually written to the cloud.
+-- It fixes #4 (saved transcripts disappearing after refresh): the base table
+-- GRANTs and RLS policies were missing, so every query failed with
+-- "permission denied for table … (42501)" and sessions/transcripts were never
+-- actually written to the cloud.
 --
--- This supersedes fix-global-settings.sql (which wrote the bad model names).
+-- NOTE: This script does NOT change the AI model names. Those are managed by
+-- an admin in the in-app dashboard (后台管理 → 全局 AI 模型配置) and live in the
+-- public.global_settings table.
 -- =============================================================
 
 -- -------------------------------------------------------------
--- 1) Restore real, working DashScope model names
--- -------------------------------------------------------------
-INSERT INTO public.global_settings (key, value, updated_at) VALUES
-  ('ai_model_name',       'qwen-plus',              now()),
-  ('realtime_model_name', 'qwen-turbo',             now()),
-  ('summary_model_name',  'qwen-plus',              now()),
-  ('asr_model_name',      'paraformer-realtime-v2', now())
-ON CONFLICT (key) DO UPDATE
-  SET value = EXCLUDED.value,
-      updated_at = now();
-
--- -------------------------------------------------------------
--- 2) Enable RLS + grant table privileges to the API roles
+-- 1) Enable RLS + grant table privileges to the API roles
 --    (PostgREST uses role `authenticated` for logged-in users; RLS then
 --     filters rows. The base GRANT must exist or every query is denied.)
 -- -------------------------------------------------------------
@@ -67,7 +52,7 @@ BEGIN
 END $$;
 
 -- -------------------------------------------------------------
--- 3) RLS policies (drop + recreate, guarded by table existence)
+-- 2) RLS policies (drop + recreate, guarded by table existence)
 -- -------------------------------------------------------------
 DO $$
 BEGIN
@@ -142,6 +127,6 @@ BEGIN
 END $$;
 
 -- -------------------------------------------------------------
--- 4) Verify (should list the four correct model names)
+-- 3) Show current model config (read-only; NOT modified by this script)
 -- -------------------------------------------------------------
 SELECT key, value FROM public.global_settings ORDER BY key;

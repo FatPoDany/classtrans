@@ -143,26 +143,9 @@ const DEFAULT_POLISH_MODEL = "qwen-plus";
 const DEFAULT_REALTIME_MODEL = "qwen-turbo";
 const DEFAULT_ASR_MODEL = "paraformer-realtime-v2";
 
-// Non-existent / hallucinated model names that earlier tooling accidentally
-// wrote into the global settings. DashScope rejects these outright, which
-// breaks translation / polish / summary. Map them back to real models so the
-// app keeps working even if the database still holds a bad value.
-const BROKEN_MODEL_ALIASES = {
-  "qwen3.5-122b-a10b": "qwen-plus",
-  "qwen3.6-35b-a3b": "qwen-plus",
-  "deepseek-v4-flash": "qwen-turbo",
-};
-
 const normalizeLegacyPolishModelName = (name) => {
   const cleanName = String(name || "").trim();
-  return BROKEN_MODEL_ALIASES[cleanName] || cleanName;
-};
-
-const normalizeRealtimeModelName = (name) => {
-  const cleanName = String(name || "").trim();
-  // Prefer a fast model on the realtime path when the configured one is broken.
-  if (cleanName === "qwen3.6-35b-a3b") return DEFAULT_REALTIME_MODEL;
-  return BROKEN_MODEL_ALIASES[cleanName] || cleanName;
+  return cleanName === "qwen3.5-122b-a10b" ? DEFAULT_POLISH_MODEL : cleanName;
 };
 
 let runtimeModelName = DEFAULT_POLISH_MODEL;
@@ -200,7 +183,7 @@ export const setGlobalModelName = (name) => {
 };
 
 const setGlobalRealtimeModelName = (name) => {
-  const cleanName = normalizeRealtimeModelName(name);
+  const cleanName = String(name || "").trim();
   if (cleanName) {
     runtimeRealtimeModelName = cleanName;
     try {
@@ -2337,6 +2320,18 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const [summaryModelDraft, setSummaryModelDraft] = useState("");
   const [asrModelDraft, setAsrModelDraft] = useState("");
   const [modelSuccessMsg, setModelSuccessMsg] = useState("");
+  const [savingModelConfig, setSavingModelConfig] = useState(false);
+
+  // Keep the admin form drafts in sync with the global settings loaded from the
+  // database. Depending on the primitive values (not the settings object) means
+  // this only re-runs when a value actually changes — so it won't overwrite
+  // what the admin is currently typing.
+  React.useEffect(() => {
+    setModelDraft(aiModelName || "");
+    setRealtimeModelDraft(realtimeModelName || "");
+    setSummaryModelDraft(summaryModelName || "");
+    setAsrModelDraft(asrModelName || "");
+  }, [aiModelName, realtimeModelName, summaryModelName, asrModelName]);
 
   const [aiUsageLog, setAiUsageLog] = useState(() => readUsageLog());
   useEffect(() => subscribeUsageLog(setAiUsageLog), []);
@@ -3787,25 +3782,22 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       });
   };
 
-  const openModelConfigModal = () => {
+  const handleSaveAdminSettings = async () => {
+    setSavingModelConfig(true);
     setModelSuccessMsg("");
-    setModelDraft(runtimeModelName);
-    setRealtimeModelDraft(runtimeRealtimeModelName);
-    setSummaryModelDraft(runtimeSummaryModelName);
-    setAsrModelDraft(runtimeAsrModelName);
-    setActiveView("modelConfig");
-  };
-
-  const handleSaveModelConfig = () => {
-    setGlobalModelName(modelDraft);
-    setGlobalRealtimeModelName(realtimeModelDraft);
-    setGlobalSummaryModelName(summaryModelDraft);
-    setGlobalAsrModelName(asrModelDraft);
-    setModelSuccessMsg("模型配置已保存并立即生效！下次启动识别时新模型生效。");
-    setTimeout(() => {
-      setModelSuccessMsg("");
-      setActiveView("home");
-    }, 1500);
+    try {
+      await updateSettings({
+        aiModelName: modelDraft.trim(),
+        realtimeModelName: realtimeModelDraft.trim(),
+        summaryModelName: summaryModelDraft.trim(),
+        asrModelName: asrModelDraft.trim(),
+      });
+      setModelSuccessMsg("✅ 模型配置已保存，全站立即生效。");
+    } catch (err) {
+      setModelSuccessMsg(`❌ 保存失败：${err && err.message ? err.message : err}`);
+    } finally {
+      setSavingModelConfig(false);
+    }
   };
 
   const handleClearGlossary = () => {
@@ -5720,8 +5712,9 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 <label className="text-xs font-semibold text-slate-200">润色模型 (Polish)</label>
                 <input
                   type="text"
-                  value={aiModelName}
-                  onChange={(e) => updateSettings({ aiModelName: e.target.value })}
+                  value={modelDraft}
+                  onChange={(e) => setModelDraft(e.target.value)}
+                  placeholder="例如 qwen3.6-35b-a3b"
                   className="ct-input w-full p-3 text-sm font-mono"
                 />
               </div>
@@ -5730,8 +5723,9 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 <label className="text-xs font-semibold text-slate-200">实时机翻模型 (Realtime)</label>
                 <input
                   type="text"
-                  value={realtimeModelName}
-                  onChange={(e) => updateSettings({ realtimeModelName: e.target.value })}
+                  value={realtimeModelDraft}
+                  onChange={(e) => setRealtimeModelDraft(e.target.value)}
+                  placeholder="例如 deepseek-v4-flash"
                   className="ct-input w-full p-3 text-sm font-mono"
                 />
               </div>
@@ -5740,8 +5734,9 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 <label className="text-xs font-semibold text-slate-200">课堂纪要模型 (Summary)</label>
                 <input
                   type="text"
-                  value={summaryModelName}
-                  onChange={(e) => updateSettings({ summaryModelName: e.target.value })}
+                  value={summaryModelDraft}
+                  onChange={(e) => setSummaryModelDraft(e.target.value)}
+                  placeholder="留空则沿用润色模型"
                   className="ct-input w-full p-3 text-sm font-mono"
                 />
               </div>
@@ -5750,11 +5745,32 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 <label className="text-xs font-semibold text-slate-200">语音识别模型 (ASR)</label>
                 <input
                   type="text"
-                  value={asrModelName}
-                  onChange={(e) => updateSettings({ asrModelName: e.target.value })}
+                  value={asrModelDraft}
+                  onChange={(e) => setAsrModelDraft(e.target.value)}
+                  placeholder="例如 paraformer-realtime-v2"
                   className="ct-input w-full p-3 text-sm font-mono"
                 />
               </div>
+            </div>
+
+            <div className="flex items-center gap-3 pt-1">
+              <button
+                type="button"
+                onClick={handleSaveAdminSettings}
+                disabled={savingModelConfig}
+                className="px-5 py-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {savingModelConfig ? "保存中…" : "保存设置"}
+              </button>
+              {modelSuccessMsg && (
+                <span
+                  className={`text-sm font-medium ${
+                    modelSuccessMsg.startsWith("✅") ? "text-emerald-400" : "text-rose-400"
+                  }`}
+                >
+                  {modelSuccessMsg}
+                </span>
+              )}
             </div>
           </div>
         )}
