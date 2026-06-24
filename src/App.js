@@ -3142,7 +3142,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   // 通用的转录增量更新逻辑：mic 模式（webkitSpeechRecognition）和 tab 模式
   // (Paraformer) 都通过它写入活动文本、推进静音定时器。
   const applyTranscriptUpdate = useCallback(
-    ({ fullText, finalText, confidence, translatedText }) => {
+    ({ fullText, finalText, confidence, translatedText, turnFinal }) => {
       if (isPausedRef.current) return;
 
       const next = fullText || "";
@@ -3198,11 +3198,20 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       }
 
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      if (activeNewText.trim()) {
-        const adaptiveThreshold = getAdaptivePauseThreshold(activeNewText);
+      if (turnFinal) {
+        // 一体化模型（livetranslate）通过 server VAD 给出的整句边界：在模型自己的边界上
+        // 用「已校正」的整句转录 + 译文收口气泡，避免本地静音定时器在说话人还没说完时
+        // 就把一句话切成两半（issue 1）。
+        finalizeCurrentBlock();
+      } else if (activeNewText.trim()) {
+        // 一体化模型靠 turnFinal 收口，这里只保留一个较长的兜底定时器（万一漏掉边界）；
+        // 两段式（Paraformer）仍用自适应停顿阈值。
+        const threshold = asrProvidesTranslationRef.current
+          ? Math.max(getAdaptivePauseThreshold(activeNewText), 8000)
+          : getAdaptivePauseThreshold(activeNewText);
         silenceTimerRef.current = setTimeout(() => {
           finalizeCurrentBlock();
-        }, adaptiveThreshold);
+        }, threshold);
       }
     },
     [finalizeCurrentBlock]
@@ -3448,8 +3457,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
 
       // 转录增量回调：两种会话共用。translatedText 仅在一体化翻译（livetranslate/Gummy）
       // 时出现；出现即由 applyTranscriptUpdate 直接驱动中文并跳过 LLM 实时翻译。
-      const onUpdate = ({ fullText, finalText, confidence, translatedText }) => {
-        applyTranscriptUpdate({ fullText, finalText, confidence, translatedText });
+      const onUpdate = ({ fullText, finalText, confidence, translatedText, turnFinal }) => {
+        applyTranscriptUpdate({ fullText, finalText, confidence, translatedText, turnFinal });
       };
       const onStatus = ({ phase, attempt, reason }) => {
         if (phase === "started") {

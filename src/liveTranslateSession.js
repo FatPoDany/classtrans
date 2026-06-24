@@ -161,36 +161,41 @@ export class LiveTranslateSession extends BaseAsrSession {
     }
 
     // --- source (input) transcription -> English ---
+    // Streaming `.text` events carry the confirmed prefix in `text` and the
+    // tentative tail in `stash`; the live hypothesis is text + stash. `.completed`
+    // carries the authoritative full `transcript`.
     if (type.indexOf("input_audio_transcription") !== -1) {
       this._markResult();
       if (/\.completed$/.test(type)) {
-        const t = sanitizeText(msg.transcript ?? msg.text ?? msg.stash ?? msg.delta);
+        const t = sanitizeText(msg.transcript ?? msg.text);
         if (t) this._enFinalParts.push(t);
         this._enPartial = "";
       } else {
-        // streaming partial (field `stash`, sometimes `text`/`delta`)
-        this._enPartial = sanitizeText(msg.stash ?? msg.text ?? msg.delta ?? msg.transcript);
+        this._enPartial = sanitizeText(
+          [msg.text, msg.stash ?? msg.delta].filter(Boolean).join(" ")
+        );
       }
       this._emit();
       return;
     }
 
     // --- translated output -> Chinese ---
-    // Mirrors the source side: streaming partial is `response.{audio_transcript|
-    // text}.text` with the cumulative text in `stash`; final is `.done` with
-    // `transcript` (audio mode) / `text` (text-only mode). (`.delta` kept as a
-    // fallback in case a revision streams incrementally instead.)
+    // Same shape as the source: partial `response.{audio_transcript|text}.text`
+    // carries confirmed `text` + tentative `stash`; `.done` carries the full
+    // `transcript` (audio) / `text` (text-only) AND marks the end of the model's
+    // turn (server VAD), so we flag turnFinal for the App to finalize the bubble.
     if (/^response\.(text|audio_transcript)\.(text|delta|done)$/.test(type)) {
       this._markResult();
       if (/\.done$/.test(type)) {
         const t = sanitizeText(msg.transcript ?? msg.text);
         if (t) this._zhFinalParts.push(t);
         this._zhPartial = "";
+        this._emit({ turnFinal: true });
       } else {
-        // cumulative partial in `stash`; replace, don't append
-        this._zhPartial = sanitizeText(msg.stash ?? msg.text ?? msg.delta);
+        // confirmed `text` + tentative `stash`, concatenated (no space for zh)
+        this._zhPartial = sanitizeText(`${msg.text || ""}${msg.stash ?? msg.delta ?? ""}`);
+        this._emit();
       }
-      this._emit();
       return;
     }
 
@@ -233,13 +238,15 @@ export class LiveTranslateSession extends BaseAsrSession {
       .trim();
   }
 
-  _emit() {
+  _emit(opts) {
     this.onUpdate({
       fullText: this._join(this._enFinalParts, this._enPartial),
       finalText: this._join(this._enFinalParts, ""),
       confidence: 0,
       translatedText: this._join(this._zhFinalParts, this._zhPartial),
       translatedFinalText: this._join(this._zhFinalParts, ""),
+      // model signalled end-of-turn → App should finalize this bubble now
+      turnFinal: !!(opts && opts.turnFinal),
     });
   }
 
