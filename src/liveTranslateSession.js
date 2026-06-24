@@ -129,11 +129,12 @@ export class LiveTranslateSession extends BaseAsrSession {
 
     // DEBUG: log the first occurrence of each event type with its raw payload so
     // the exact transcription/translation field names can be confirmed live.
-    // Remove once the protocol mapping is verified.
+    // console.log (not debug) so it shows at the default console level. Remove
+    // once the protocol mapping is verified.
     if (!this._seenTypes.has(type)) {
       this._seenTypes.add(type);
       try {
-        console.debug(`${this._tag}: first "${type}" =>`, JSON.stringify(msg).slice(0, 800));
+        console.log(`[LT-EVENT] ${type} =>`, JSON.stringify(msg).slice(0, 1000));
       } catch (_) {}
     }
 
@@ -155,6 +156,14 @@ export class LiveTranslateSession extends BaseAsrSession {
     if (type === "error") {
       const err = msg.error || {};
       const errMsg = err.message || err.code || msg.message || "realtime error";
+      // "model repeat output happened" is DashScope's repeat-guard — a transient
+      // hiccup; the server closes the socket and we auto-reconnect, so don't pop
+      // an error toast for it (only surface genuinely fatal errors). During
+      // startup (_readyReject set) always reject so the retry logic can react.
+      if (!this._readyReject && /repeat output|repeat detected|repetition/i.test(errMsg)) {
+        console.warn(`${this._tag}: transient model error, recovering on reconnect: ${errMsg}`);
+        return;
+      }
       this._handleFatalError(errMsg);
       return;
     }
