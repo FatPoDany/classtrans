@@ -28,6 +28,10 @@ import {
   Sun,
   Moon,
   RefreshCw,
+  LogOut,
+  Folder,
+  FolderPlus,
+  Plus,
 } from "lucide-react";
 import { ParaformerSession } from "./paraformerSession";
 import { Routes, Route, Navigate } from 'react-router-dom';
@@ -38,8 +42,23 @@ import { useCloudSettings } from './hooks/useCloudSettings';
 import { useGlobalSettings } from './hooks/useGlobalSettings';
 import { useCloudGlossary } from './hooks/useCloudGlossary';
 import { useCloudSessions } from './hooks/useCloudSessions';
+import { useCloudFolders } from './hooks/useCloudFolders';
 
 const THEME_STORAGE_KEY = "classtrans.uiTheme.v1";
+
+// Folder color palette. Stored as a key in the DB; the gradient drives the
+// folder card visuals. "未归档" (Unfiled) uses the neutral slate entry.
+const FOLDER_COLORS = {
+  slate: { grad: "from-slate-500 to-slate-600", dot: "#64748b" },
+  blue: { grad: "from-sky-400 to-blue-500", dot: "#3b82f6" },
+  green: { grad: "from-emerald-400 to-green-500", dot: "#10b981" },
+  purple: { grad: "from-purple-400 to-fuchsia-500", dot: "#a855f7" },
+  indigo: { grad: "from-indigo-400 to-indigo-600", dot: "#6366f1" },
+  amber: { grad: "from-amber-400 to-orange-500", dot: "#f59e0b" },
+  rose: { grad: "from-rose-400 to-pink-500", dot: "#f43f5e" },
+};
+const FOLDER_COLOR_KEYS = Object.keys(FOLDER_COLORS);
+const folderGrad = (color) => (FOLDER_COLORS[color] || FOLDER_COLORS.indigo).grad;
 const PARAFORMER_WS_URL = process.env.REACT_APP_PARAFORMER_WS_URL || "";
 
 let globalApiToken = "";
@@ -2238,6 +2257,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const [selectedDeviceId, setSelectedDeviceId] = useState("default");
   const [isDeviceMenuOpen, setIsDeviceMenuOpen] = useState(false);
   const deviceMenuRef = useRef(null);
+  // Folder picker (header) + inline "new folder" form (文件夹 view)
+  const [isFolderMenuOpen, setIsFolderMenuOpen] = useState(false);
+  const folderMenuRef = useRef(null);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [newFolderColor, setNewFolderColor] = useState("indigo");
+  const [creatingFolder, setCreatingFolder] = useState(false);
 
   const [summaryResult, setSummaryResult] = useState("");
   const [isFinalizingSession, setIsFinalizingSession] = useState(false);
@@ -2252,7 +2277,6 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const [activeView, setActiveView] = useState("home");
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const sessionFolderName = "云端自动保存";
   const {
     sessions: cloudSessions,
     loadSessions,
@@ -2262,11 +2286,34 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     updateSession: cloudUpdateSession,
     updateTranscript: cloudUpdateTranscript,
     replaceTranscripts: cloudReplaceTranscripts,
+    moveSession: cloudMoveSession,
   } = useCloudSessions(user.id);
   const savedSessions = cloudSessions;
   const [temporarySessions, setTemporarySessions] = useState([]);
   const [selectedSavedSession, setSelectedSavedSession] = useState(null);
   const [savedSessionsQuery, setSavedSessionsQuery] = useState("");
+
+  // ---- Cloud folders (organize recordings) --------------------------------
+  const {
+    folders,
+    loadFolders,
+    createFolder: cloudCreateFolder,
+    deleteFolder: cloudDeleteFolder,
+  } = useCloudFolders(user.id);
+  // The folder a NEW recording will be saved into (required before starting).
+  const [currentFolderId, setCurrentFolderId] = useState(null);
+  // Which folder's sessions are shown in the 文件夹 view (null = grid overview).
+  const [openFolderId, setOpenFolderId] = useState(null);
+  const currentFolder = folders.find((f) => f.id === currentFolderId) || null;
+  // Mirror the target folder into a ref so the (async, closure-captured) save
+  // path always reads the current selection rather than a stale value.
+  const currentFolderIdRef = useRef(null);
+  useEffect(() => {
+    currentFolderIdRef.current = currentFolderId;
+  }, [currentFolderId]);
+  useEffect(() => {
+    loadFolders();
+  }, [loadFolders]);
   const [titleDraft, setTitleDraft] = useState(null); // null = not editing
   // Inline word-correction popover. shape: { x, y, originalWord, draft, scope, payload }
   const [wordEditPopover, setWordEditPopover] = useState(null);
@@ -2574,12 +2621,14 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       if (!payload.transcripts.length && !payload.summary) return false;
 
       const stats = getSessionStatsFromTranscripts(payload.transcripts);
+      const folderId = currentFolderIdRef.current || null;
       const fallbackTempSession = {
         fileName: `temp-${payload.id}`,
         createdAt: payload.createdAt,
         summary: payload.summary,
         transcripts: payload.transcripts,
         title: payload.title,
+        folderId,
         isTemporary: true,
       };
 
@@ -2591,6 +2640,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           wordCount: stats.enWordCount,
           mode: options.mode || "mic",
           transcripts: payload.transcripts,
+          folderId,
         });
 
         if (!saved) {
@@ -2627,13 +2677,56 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     }
   }, [loadSessions, setErrorMsg]);
 
-  const pickSessionFolder = useCallback(async () => {
-    const loaded = await loadSavedSessionsFromFolder();
-    setSelectedSavedSession((prev) => prev || loaded?.[0] || null);
-    setActiveView("saved");
-    pushToast({ level: "success", text: "云端会话已刷新", ttl: 2500 });
+  const openFoldersView = useCallback(async () => {
+    setOpenFolderId(null);
+    await Promise.all([loadFolders(), loadSavedSessionsFromFolder()]);
+    setActiveView("folders");
     return true;
-  }, [loadSavedSessionsFromFolder, pushToast]);
+  }, [loadFolders, loadSavedSessionsFromFolder]);
+
+  const handleCreateFolder = async () => {
+    const name = newFolderName.trim();
+    if (!name) {
+      pushToast({ level: "warn", text: "请输入文件夹名称", ttl: 3000 });
+      return;
+    }
+    setCreatingFolder(true);
+    try {
+      const folder = await cloudCreateFolder(name, newFolderColor);
+      setNewFolderName("");
+      setNewFolderColor("indigo");
+      if (folder) {
+        // Auto-select the new folder as the recording target for convenience.
+        setCurrentFolderId(folder.id);
+        pushToast({ level: "success", text: `已创建文件夹「${folder.name}」`, ttl: 2500 });
+      }
+    } catch (err) {
+      pushToast({ level: "error", text: err && err.message ? err.message : "创建文件夹失败", ttl: 5000 });
+    } finally {
+      setCreatingFolder(false);
+    }
+  };
+
+  const handleDeleteFolder = async (folder) => {
+    if (
+      !window.confirm(
+        `删除文件夹「${folder.name}」？\n其中的录音会移到「未归档」，不会被删除。`
+      )
+    ) {
+      return;
+    }
+    const { error } = await cloudDeleteFolder(folder.id);
+    if (error) {
+      pushToast({ level: "error", text: "删除文件夹失败", ttl: 4000 });
+      return;
+    }
+    if (currentFolderId === folder.id) setCurrentFolderId(null);
+    if (openFolderId === folder.id) setOpenFolderId(null);
+    // Sessions whose folder was deleted are now 未归档 (DB ON DELETE SET NULL);
+    // refresh so the local list reflects that.
+    await loadSavedSessionsFromFolder();
+    pushToast({ level: "success", text: "文件夹已删除", ttl: 2500 });
+  };
 
   useEffect(() => {
     try {
@@ -2665,6 +2758,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         !deviceMenuRef.current.contains(event.target)
       ) {
         setIsDeviceMenuOpen(false);
+      }
+      if (
+        folderMenuRef.current &&
+        !folderMenuRef.current.contains(event.target)
+      ) {
+        setIsFolderMenuOpen(false);
       }
     };
     document.addEventListener("mousedown", handleClickOutside);
@@ -3366,6 +3465,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   ]);
 
   const startTabMode = useCallback(async () => {
+    if (!currentFolderIdRef.current) {
+      pushToast({ level: "warn", text: "请先在顶部选择或新建一个文件夹，再开始录音。", ttl: 4000 });
+      return;
+    }
     if (!navigator?.mediaDevices?.getDisplayMedia) {
       alert("当前浏览器不支持系统音频采集，请升级 Chrome/Edge。\n建议改用麦克风模式。");
       return;
@@ -3573,6 +3676,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   }, [transcripts, activeEn, activeZh, isAutoScroll]);
 
   const toggleMicMode = async () => {
+    if (listeningMode !== "mic" && !currentFolderIdRef.current) {
+      pushToast({ level: "warn", text: "请先在顶部选择或新建一个文件夹，再开始录音。", ttl: 4000 });
+      return;
+    }
     if (listeningMode === "mic") {
       const stopDurationSec = recordingTime;
       shouldListenRef.current = false;
@@ -3822,6 +3929,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   };
 
   const openSavedSessions = async () => {
+    setOpenFolderId(null);
     const loaded = await loadSavedSessionsFromFolder();
     setSelectedSavedSession((prev) => {
       if (prev) {
@@ -4496,7 +4604,19 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const allSavedSessions = [...savedSessions, ...temporarySessions].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
   );
-  const filteredSavedSessions = allSavedSessions.filter((session) => {
+  // Folder filter for the saved view: openFolderId may be a real folder id,
+  // the "__unfiled__" sentinel (未归档), or null (no filter / show all).
+  const activeFolderFilter =
+    openFolderId === "__unfiled__"
+      ? { id: "__unfiled__", name: "未归档", color: "slate" }
+      : folders.find((f) => f.id === openFolderId) || null;
+  const folderFilteredSessions =
+    openFolderId == null
+      ? allSavedSessions
+      : allSavedSessions.filter((s) =>
+          openFolderId === "__unfiled__" ? !s.folderId : s.folderId === openFolderId
+        );
+  const filteredSavedSessions = folderFilteredSessions.filter((session) => {
     const keyword = savedSessionsQuery.trim().toLowerCase();
     if (!keyword) return true;
 
@@ -4559,12 +4679,16 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             </button>
 
             <button
-              onClick={pickSessionFolder}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border bg-emerald-500/12 text-emerald-300 border-emerald-400/30 hover:bg-emerald-500/20 transition-colors`}
-              title={sessionFolderName}
+              onClick={openFoldersView}
+              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
+                activeView === "folders"
+                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
+                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
+              }`}
+              title="文件夹"
             >
               <FolderOpen className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>云端会话</span>}
+              {!isSidebarCollapsed && <span>文件夹</span>}
             </button>
 
             <button
@@ -4639,11 +4763,51 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             </button>
           </div>
 
-          {!isSidebarCollapsed && (
-            <div className="px-3 py-3 border-t border-white/10 text-xs text-slate-400">
-              {sessionFolderName}
-            </div>
-          )}
+          <div className="mt-auto border-t border-white/10">
+            {!isSidebarCollapsed ? (
+              <div className="px-3 py-3 space-y-2">
+                <div className="flex items-center gap-2.5 px-1">
+                  <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-sm shrink-0 uppercase">
+                    {(user?.email || "U").charAt(0)}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-slate-100 truncate" title={user?.email || ""}>
+                      {user?.email || "用户"}
+                    </p>
+                    <span
+                      className={`inline-block mt-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                        isAdmin ? "bg-amber-500/15 text-amber-300" : "bg-white/[0.06] text-slate-400"
+                      }`}
+                    >
+                      {isAdmin ? "管理员" : "已登录"}
+                    </span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => signOut()}
+                  className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold text-rose-300 bg-rose-500/10 border border-rose-400/20 hover:bg-rose-500/20 transition-colors"
+                >
+                  <LogOut className="w-4 h-4" /> 退出登录
+                </button>
+              </div>
+            ) : (
+              <div className="py-3 flex flex-col items-center gap-2">
+                <div
+                  className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-sm uppercase"
+                  title={user?.email || "用户"}
+                >
+                  {(user?.email || "U").charAt(0)}
+                </div>
+                <button
+                  onClick={() => signOut()}
+                  title="退出登录"
+                  className="p-2 rounded-lg text-rose-300 hover:bg-rose-500/15 transition-colors"
+                >
+                  <LogOut className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         {!isSidebarCollapsed && (
@@ -4738,11 +4902,69 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               <Trash2 className="w-4 h-4" />
             </button>
 
+            {listeningMode === "none" && (
+              <div className="relative" ref={folderMenuRef}>
+                <button
+                  onClick={() => setIsFolderMenuOpen((o) => !o)}
+                  className={`flex items-center space-x-1 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors max-w-[170px] ${
+                    currentFolder
+                      ? "bg-white/[0.06] text-slate-200 border-white/10 hover:bg-white/[0.10]"
+                      : "bg-amber-500/12 text-amber-300 border-amber-400/30 hover:bg-amber-500/20"
+                  }`}
+                  title="选择录音要保存到的文件夹"
+                >
+                  <Folder className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate">{currentFolder ? currentFolder.name : "选择文件夹"}</span>
+                  <ChevronDown className="w-3 h-3 shrink-0" />
+                </button>
+                {isFolderMenuOpen && (
+                  <div className="absolute top-full left-0 mt-1 w-60 ct-glass-strong rounded-xl shadow-2xl z-50 py-1 max-h-72 overflow-y-auto">
+                    {folders.length === 0 ? (
+                      <div className="px-4 py-3 text-xs text-slate-400">还没有文件夹</div>
+                    ) : (
+                      folders.map((f) => (
+                        <button
+                          key={f.id}
+                          onClick={() => {
+                            setCurrentFolderId(f.id);
+                            setIsFolderMenuOpen(false);
+                          }}
+                          className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2"
+                        >
+                          <span
+                            className="w-2.5 h-2.5 rounded-full shrink-0"
+                            style={{ background: (FOLDER_COLORS[f.color] || FOLDER_COLORS.indigo).dot }}
+                          />
+                          <span className="truncate text-slate-200 flex-1">{f.name}</span>
+                          {currentFolderId === f.id && <Check className="w-3.5 h-3.5 text-indigo-300 shrink-0" />}
+                        </button>
+                      ))
+                    )}
+                    <div className="border-t border-white/10 mt-1 pt-1">
+                      <button
+                        onClick={() => {
+                          setIsFolderMenuOpen(false);
+                          setOpenFolderId(null);
+                          setActiveView("folders");
+                        }}
+                        className="w-full text-left px-3 py-2 text-sm text-indigo-300 hover:bg-white/[0.06] flex items-center gap-2"
+                      >
+                        <FolderPlus className="w-4 h-4 shrink-0" /> 管理 / 新建文件夹
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             {listeningMode === "none" ? (
               <button
                 onClick={startTabMode}
-                className="ct-btn-tab flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all"
-                title="系统音频录制（快捷键 T）：点击后在弹窗选择 Chrome 标签页 或 窗口"
+                disabled={!currentFolderId}
+                className={`ct-btn-tab flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all ${
+                  !currentFolderId ? "opacity-50 cursor-not-allowed" : ""
+                }`}
+                title={currentFolder ? "系统音频录制（快捷键 T）：点击后在弹窗选择 Chrome 标签页 或 窗口" : "请先选择文件夹"}
               >
                 <Headphones className="w-4 h-4" />
                 <span>系统音频</span>
@@ -4811,8 +5033,11 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               {listeningMode === "none" ? (
                 <button
                   onClick={toggleMicMode}
-                  className="ct-btn-success flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm"
-                  title="开始语音转录（快捷键 M）。设备从左侧下拉菜单选择。"
+                  disabled={!currentFolderId}
+                  className={`ct-btn-success flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm ${
+                    !currentFolderId ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
+                  title={currentFolder ? "开始语音转录（快捷键 M）。设备从左侧下拉菜单选择。" : "请先选择文件夹"}
                 >
                   <Play className="w-4 h-4" />
                   <span>开始语音转录</span>
@@ -5082,16 +5307,44 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               <div className="absolute inset-0 rounded-full bg-indigo-500/20 blur-2xl"></div>
               <Mic className="w-16 h-16 mb-4 stroke-[1.5] text-indigo-300 relative" />
             </div>
-            <p className="text-lg text-slate-200 font-medium tracking-wide mt-2">
-              在首页选择麦克风，点击右上角的
-              <strong className="text-emerald-300">【开始上课】</strong>
-            </p>
+            {currentFolder ? (
+              <>
+                <p className="text-lg text-slate-200 font-medium tracking-wide mt-2">
+                  当前文件夹：
+                  <span className="inline-flex items-center gap-1.5 ml-1 align-middle">
+                    <span
+                      className="w-2.5 h-2.5 rounded-full"
+                      style={{ background: (FOLDER_COLORS[currentFolder.color] || FOLDER_COLORS.indigo).dot }}
+                    />
+                    <strong className="text-indigo-200">{currentFolder.name}</strong>
+                  </span>
+                </p>
+                <p className="text-sm text-slate-400 mt-1.5">
+                  点击右上角 <strong className="text-emerald-300">【开始语音转录】</strong> 或{" "}
+                  <strong className="text-purple-300">【系统音频】</strong> 开始录音
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-lg text-slate-200 font-medium tracking-wide mt-2">
+                  先选择一个<strong className="text-indigo-200">文件夹</strong>，再开始录音
+                </p>
+                <button
+                  onClick={() => {
+                    setOpenFolderId(null);
+                    setActiveView("folders");
+                  }}
+                  className="mt-4 inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-indigo-500 hover:bg-indigo-400 text-white font-semibold text-sm transition-colors"
+                >
+                  <FolderPlus className="w-4 h-4" /> 选择 / 新建文件夹
+                </button>
+              </>
+            )}
             <div className="ct-card text-sm mt-6 text-left max-w-md p-5 leading-relaxed text-slate-300">
               <div className="text-slate-100 font-semibold mb-2">💡 如何转录网课视频？</div>
               <ol className="list-decimal pl-5 space-y-1.5">
                 <li>
-                  同传结束后会自动保存到云端；左侧
-                  <strong className="text-emerald-300">【云端会话】</strong>可刷新历史记录。
+                  先在顶部<strong className="text-indigo-300">选择文件夹</strong>，录音会自动归档到该文件夹并保存到云端。
                 </li>
                 <li>
                   推荐点
@@ -5365,10 +5618,31 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                   className="ct-input w-full text-xs px-3 py-2"
                 />
               </div>
+              {activeFolderFilter && (
+                <div className="px-3 py-2 border-b border-white/10 flex items-center justify-between gap-2 bg-indigo-500/[0.06]">
+                  <span className="inline-flex items-center gap-1.5 text-xs text-indigo-200 font-medium min-w-0">
+                    <span
+                      className="w-2 h-2 rounded-full shrink-0"
+                      style={{ background: (FOLDER_COLORS[activeFolderFilter.color] || FOLDER_COLORS.slate).dot }}
+                    />
+                    <span className="truncate">文件夹：{activeFolderFilter.name}</span>
+                  </span>
+                  <button
+                    onClick={() => setOpenFolderId(null)}
+                    className="text-[11px] text-slate-400 hover:text-slate-200 shrink-0"
+                  >
+                    显示全部
+                  </button>
+                </div>
+              )}
               <div className="overflow-y-auto flex-1">
                 {filteredSavedSessions.length === 0 ? (
                   <p className="text-xs text-slate-400 px-4 py-5">
-                    {allSavedSessions.length === 0 ? "暂无已保存会话。" : "未匹配到相关会话。"}
+                    {allSavedSessions.length === 0
+                      ? "暂无已保存会话。"
+                      : activeFolderFilter
+                      ? "该文件夹暂无会话。"
+                      : "未匹配到相关会话。"}
                   </p>
                 ) : (
                   filteredSavedSessions.map((session) => (
@@ -5460,6 +5734,32 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                       {new Date(selectedSavedSession.createdAt).toLocaleString()} · {selectedSavedSession.transcripts.length} 条转录
                     </p>
                     <div className="flex items-center gap-2">
+                      {!selectedSavedSession.isTemporary && (
+                        <select
+                          value={selectedSavedSession.folderId || ""}
+                          onChange={async (e) => {
+                            const fid = e.target.value || null;
+                            const { error } = await cloudMoveSession(selectedSavedSession.id, fid);
+                            if (error) {
+                              pushToast({ level: "error", text: "移动失败，请重试", ttl: 3000 });
+                              return;
+                            }
+                            setSelectedSavedSession((prev) =>
+                              prev ? { ...prev, folderId: fid } : prev
+                            );
+                            pushToast({ level: "success", text: "已移动文件夹", ttl: 2000 });
+                          }}
+                          className="ct-input text-xs px-2 py-1.5 rounded-md max-w-[140px]"
+                          title="移动到文件夹"
+                        >
+                          <option value="">未归档</option>
+                          {folders.map((f) => (
+                            <option key={f.id} value={f.id}>
+                              {f.name}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                       <button
                         onClick={() => handleRegenerateSummary(selectedSavedSession)}
                         disabled={isRegeneratingSummary}
@@ -5657,6 +5957,164 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                       )}
                     </div>
                   </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeView === "folders" && (
+          <div className="ct-panel p-6 space-y-7 min-h-[78vh]">
+            {/* Header + new folder */}
+            <div className="flex flex-col gap-4">
+              <div>
+                <h2 className="text-2xl font-bold text-slate-100 tracking-tight flex items-center gap-2">
+                  <FolderOpen className="w-6 h-6 text-indigo-300" /> 文件夹
+                </h2>
+                <p className="text-sm text-slate-400 mt-1">
+                  管理你的所有语音转录记录 · 录音前请先选择或新建一个文件夹
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 p-3 rounded-xl bg-white/[0.03] border border-white/10">
+                <FolderPlus className="w-4 h-4 text-indigo-300 shrink-0" />
+                <input
+                  value={newFolderName}
+                  onChange={(e) => setNewFolderName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleCreateFolder();
+                  }}
+                  placeholder="新建文件夹名称…"
+                  className="ct-input flex-1 min-w-[160px] px-3 py-2 text-sm"
+                />
+                <div className="flex items-center gap-1.5">
+                  {FOLDER_COLOR_KEYS.map((c) => (
+                    <button
+                      key={c}
+                      type="button"
+                      onClick={() => setNewFolderColor(c)}
+                      className={`w-6 h-6 rounded-full bg-gradient-to-tr ${FOLDER_COLORS[c].grad} transition ${
+                        newFolderColor === c
+                          ? "ring-2 ring-white/80 scale-110"
+                          : "opacity-70 hover:opacity-100"
+                      }`}
+                      title={c}
+                      aria-label={`颜色 ${c}`}
+                    />
+                  ))}
+                </div>
+                <button
+                  onClick={handleCreateFolder}
+                  disabled={creatingFolder}
+                  className="px-4 py-2 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white font-semibold text-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+                >
+                  <Plus className="w-4 h-4" /> {creatingFolder ? "创建中…" : "新建文件夹"}
+                </button>
+              </div>
+            </div>
+
+            {/* Folder grid */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+              <button
+                onClick={() => {
+                  setOpenFolderId("__unfiled__");
+                  setActiveView("saved");
+                }}
+                className="group text-left focus:outline-none"
+              >
+                <div className="relative h-28 rounded-2xl bg-gradient-to-br from-slate-500 to-slate-600 shadow-lg group-hover:-translate-y-0.5 transition-transform overflow-hidden">
+                  <div className="absolute -top-1.5 left-5 w-16 h-4 rounded-t-lg bg-slate-400/90" />
+                  <div className="absolute bottom-3 left-4 right-4">
+                    <p className="text-white font-bold text-sm truncate">未归档</p>
+                    <p className="text-white/70 text-xs mt-0.5">
+                      {savedSessions.filter((s) => !s.folderId).length} 条记录
+                    </p>
+                  </div>
+                </div>
+              </button>
+
+              {folders.map((f) => (
+                <div key={f.id} className="group relative">
+                  <button
+                    onClick={() => {
+                      setOpenFolderId(f.id);
+                      setActiveView("saved");
+                    }}
+                    className="w-full text-left focus:outline-none"
+                  >
+                    <div
+                      className={`relative h-28 rounded-2xl bg-gradient-to-br ${folderGrad(
+                        f.color
+                      )} shadow-lg group-hover:-translate-y-0.5 transition-transform overflow-hidden`}
+                    >
+                      <div className="absolute -top-1.5 left-5 w-16 h-4 rounded-t-lg bg-white/25" />
+                      <div className="absolute bottom-3 left-4 right-4">
+                        <p className="text-white font-bold text-sm truncate">{f.name}</p>
+                        <p className="text-white/70 text-xs mt-0.5">
+                          {savedSessions.filter((s) => s.folderId === f.id).length} 条记录
+                        </p>
+                      </div>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => handleDeleteFolder(f)}
+                    title="删除文件夹"
+                    className="absolute top-2 right-2 p-1.5 rounded-lg bg-black/30 text-white/70 opacity-0 group-hover:opacity-100 hover:bg-black/50 hover:text-white transition"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {/* Recent recordings */}
+            <div>
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-base font-bold text-slate-100">最近录音</h3>
+                  <p className="text-xs text-slate-400 mt-0.5">快速回到你最新的转录记录</p>
+                </div>
+                <button
+                  onClick={openSavedSessions}
+                  className="text-xs font-semibold text-indigo-300 hover:text-indigo-200"
+                >
+                  查看全部 →
+                </button>
+              </div>
+              <div className="mt-3 space-y-2">
+                {savedSessions.length === 0 ? (
+                  <p className="text-sm text-slate-400 py-8 text-center">
+                    还没有录音。选择一个文件夹后，开始你的第一次同传。
+                  </p>
+                ) : (
+                  savedSessions.slice(0, 6).map((s) => {
+                    const folder = folders.find((ff) => ff.id === s.folderId);
+                    const dot = folder
+                      ? (FOLDER_COLORS[folder.color] || FOLDER_COLORS.indigo).dot
+                      : "#64748b";
+                    return (
+                      <button
+                        key={s.id}
+                        onClick={() => {
+                          selectSavedSession(s);
+                          setActiveView("saved");
+                        }}
+                        className="w-full text-left p-3 rounded-xl bg-white/[0.03] border border-white/10 hover:bg-white/[0.06] hover:border-white/20 transition flex items-center justify-between gap-3"
+                      >
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold text-slate-100 truncate">{s.title}</p>
+                          <p className="text-xs text-slate-400 mt-0.5">
+                            EN → ZH · {(s.transcripts || []).length} 句 ·{" "}
+                            {new Date(s.createdAt).toLocaleDateString()}
+                          </p>
+                        </div>
+                        <span className="shrink-0 inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-full bg-white/[0.06] text-slate-300 border border-white/10">
+                          <span className="w-2 h-2 rounded-full" style={{ background: dot }} />
+                          {folder ? folder.name : "未归档"}
+                        </span>
+                      </button>
+                    );
+                  })
                 )}
               </div>
             </div>

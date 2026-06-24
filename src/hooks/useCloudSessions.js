@@ -37,6 +37,7 @@ const normalizeSession = (row) => {
     durationSec: Number(row?.duration_sec || row?.durationSec || 0),
     wordCount: Number(row?.word_count || row?.wordCount || 0),
     mode: row?.mode || 'mic',
+    folderId: row?.folder_id || null,
     isTemporary: false,
     transcripts: transcripts.map(normalizeTranscript),
   };
@@ -65,7 +66,7 @@ export function useCloudSessions(userId) {
 
     const { data, error } = await supabase
       .from('sessions')
-      .select('id, title, summary, duration_sec, word_count, mode, created_at, updated_at')
+      .select('id, title, summary, duration_sec, word_count, mode, folder_id, created_at, updated_at')
       .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .range(offset, offset + PAGE_SIZE - 1);
@@ -139,7 +140,7 @@ export function useCloudSessions(userId) {
   }, []);
 
   // Save a new session (with transcripts)
-  const saveSession = useCallback(async ({ title, summary, durationSec, wordCount, mode, transcripts }) => {
+  const saveSession = useCallback(async ({ title, summary, durationSec, wordCount, mode, transcripts, folderId }) => {
     if (!userId) return null;
 
     // Insert session
@@ -152,6 +153,7 @@ export function useCloudSessions(userId) {
         duration_sec: durationSec || 0,
         word_count: wordCount || 0,
         mode: mode || 'mic',
+        folder_id: folderId || null,
       })
       .select()
       .single();
@@ -285,6 +287,21 @@ export function useCloudSessions(userId) {
     return { error };
   }, []);
 
+  // Move a session into a folder (folderId = null → 未归档 / Unfiled)
+  const moveSession = useCallback(async (sessionId, folderId) => {
+    const { error } = await supabase
+      .from('sessions')
+      .update({ folder_id: folderId || null, updated_at: new Date().toISOString() })
+      .eq('id', sessionId);
+
+    if (!error) {
+      setSessions(prev =>
+        prev.map(s => (s.id === sessionId ? { ...s, folderId: folderId || null } : s))
+      );
+    }
+    return { error };
+  }, []);
+
   return {
     sessions,
     loading,
@@ -297,5 +314,6 @@ export function useCloudSessions(userId) {
     updateTranscript,
     replaceTranscripts,
     deleteSession,
+    moveSession,
   };
 }
