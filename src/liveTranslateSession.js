@@ -59,9 +59,15 @@ export class LiveTranslateSession extends BaseAsrSession {
     // Ordered accumulation across turns. EN keyed by input-transcription item,
     // ZH keyed by response — independent cumulative strings (the App tracks each
     // with its own processedLength).
-    this._enItems = []; // { id, text, isFinal }
-    this._zhItems = []; // { id, text, isFinal }
-    this._loggedUnknown = new Set();
+    // Cumulative transcript accumulation, id-free: completed utterances/responses
+    // are appended permanently; the in-progress partial shows transiently. This
+    // avoids depending on item_id/response_id (DashScope may omit them) and uses
+    // only the event type (.completed/.done vs streaming) to decide.
+    this._enFinalParts = []; // completed source (EN) transcripts
+    this._enPartial = "";    // in-progress source partial
+    this._zhFinalParts = []; // completed translated (ZH) texts
+    this._zhPartial = "";    // in-progress translation (accumulated deltas)
+    this._seenTypes = new Set(); // one-shot raw-event logging for field tuning
     this._configSent = false; // one-shot session.update per connection
 
     this._player = null; // lazy AsrAudioPlayer when audioOutput is on
@@ -110,14 +116,26 @@ export class LiveTranslateSession extends BaseAsrSession {
   // no-op _sendFinish() is correct.
 
   _resetBuffers() {
-    this._enItems = [];
-    this._zhItems = [];
+    this._enFinalParts = [];
+    this._enPartial = "";
+    this._zhFinalParts = [];
+    this._zhPartial = "";
     if (this._player) this._player.reset();
   }
 
   _handleProtocolMessage(msg) {
     const type = msg && msg.type;
     if (!type || typeof type !== "string") return;
+
+    // DEBUG: log the first occurrence of each event type with its raw payload so
+    // the exact transcription/translation field names can be confirmed live.
+    // Remove once the protocol mapping is verified.
+    if (!this._seenTypes.has(type)) {
+      this._seenTypes.add(type);
+      try {
+        console.debug(`${this._tag}: first "${type}" =>`, JSON.stringify(msg).slice(0, 800));
+      } catch (_) {}
+    }
 
     if (type === "session.created") {
       // Configure exactly once, now that the session exists. Sending more than
@@ -143,15 +161,16 @@ export class LiveTranslateSession extends BaseAsrSession {
 
     // --- source (input) transcription -> English ---
     if (type.indexOf("input_audio_transcription") !== -1) {
-      const itemId = msg.item_id || msg.id || `en-${this._enItems.length}`;
-      const isFinal = /\.completed$/.test(type);
-      // partial uses `stash`; completed uses `transcript`.
-      const text = sanitizeText(msg.transcript ?? msg.stash ?? msg.text ?? msg.delta);
-      if (text || isFinal) {
-        this._markResult();
-        this._setItem(this._enItems, itemId, text, isFinal);
-        this._emit();
+      this._markResult();
+      if (/\.completed$/.test(type)) {
+        const t = sanitizeText(msg.transcript ?? msg.text ?? msg.stash ?? msg.delta);
+        if (t) this._enFinalParts.push(t);
+        this._enPartial = "";
+      } else {
+        // streaming partial (field `stash`, sometimes `text`/`delta`)
+        this._enPartial = sanitizeText(msg.stash ?? msg.text ?? msg.delta ?? msg.transcript);
       }
+      this._emit();
       return;
     }
 
@@ -159,13 +178,13 @@ export class LiveTranslateSession extends BaseAsrSession {
     // Text-only mode streams response.text.delta/.done; audio+text mode carries
     // the same text on response.audio_transcript.delta/.done.
     if (/^response\.(text|audio_transcript)\.(delta|done)$/.test(type)) {
-      const respId = msg.response_id || msg.item_id || `zh-${this._zhItems.length}`;
       this._markResult();
       if (/\.done$/.test(type)) {
-        this._setItem(this._zhItems, respId, sanitizeText(msg.text ?? msg.transcript), true);
+        const t = sanitizeText(msg.text ?? msg.transcript) || this._zhPartial.trim();
+        if (t) this._zhFinalParts.push(t);
+        this._zhPartial = "";
       } else {
-        const delta = stripDelta(msg.delta);
-        if (delta) this._appendDelta(this._zhItems, respId, delta);
+        this._zhPartial += stripDelta(msg.delta);
       }
       this._emit();
       return;
@@ -196,38 +215,14 @@ export class LiveTranslateSession extends BaseAsrSession {
       return;
     }
 
-    // Unknown event — log once to ease first-run field tuning.
-    if (!this._loggedUnknown.has(type)) {
-      this._loggedUnknown.add(type);
-      console.debug(`${this._tag}: unhandled event type "${type}"`, msg);
-    }
+    // Any other event (response.created/done, speech_started/stopped, …) needs
+    // no action; its shape was already captured by the one-shot logging above.
   }
 
-  // ---- accumulation helpers ----------------------------------------------
+  // ---- accumulation ------------------------------------------------------
 
-  // Replace-or-insert the text for an id. Source partials supersede the prior
-  // partial for the same item; the final `done`/`completed` replaces it. Guard
-  // against a late empty update clobbering good text.
-  _setItem(list, id, text, isFinal) {
-    const idx = list.findIndex((it) => it.id === id);
-    if (idx >= 0) {
-      list[idx] = { id, text: text || list[idx].text, isFinal: isFinal || list[idx].isFinal };
-    } else {
-      list.push({ id, text, isFinal });
-    }
-  }
-
-  // Append a streaming translation delta to a response item.
-  _appendDelta(list, id, delta) {
-    const idx = list.findIndex((it) => it.id === id);
-    if (idx >= 0) list[idx].text = `${list[idx].text}${delta}`;
-    else list.push({ id, text: delta, isFinal: false });
-  }
-
-  _join(list, finalOnly) {
-    return list
-      .filter((it) => (finalOnly ? it.isFinal : true))
-      .map((it) => it.text)
+  _join(parts, tail) {
+    return [...parts, tail]
       .filter(Boolean)
       .join(" ")
       .replace(/\s+/g, " ")
@@ -236,11 +231,11 @@ export class LiveTranslateSession extends BaseAsrSession {
 
   _emit() {
     this.onUpdate({
-      fullText: this._join(this._enItems, false),
-      finalText: this._join(this._enItems, true),
+      fullText: this._join(this._enFinalParts, this._enPartial),
+      finalText: this._join(this._enFinalParts, ""),
       confidence: 0,
-      translatedText: this._join(this._zhItems, false),
-      translatedFinalText: this._join(this._zhItems, true),
+      translatedText: this._join(this._zhFinalParts, this._zhPartial),
+      translatedFinalText: this._join(this._zhFinalParts, ""),
     });
   }
 
