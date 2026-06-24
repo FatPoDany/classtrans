@@ -746,37 +746,41 @@ const smartPunctuateEnglish = (input, forceTerminalPunctuation = false) => {
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
+// Pause-before-finalize thresholds. Lowered (was base 2800, clamp 2200–5500)
+// to cut the lag between speech and the settled translation for fast lectures.
+// Trade-off: slightly more chance of splitting mid-sentence — the qwen polish
+// pass re-joins/cleans those, so it's an acceptable exchange for responsiveness.
 const getAdaptivePauseThreshold = (text) => {
   const cleanText = (text || "").trim();
-  if (!cleanText) return 2800;
+  if (!cleanText) return 1800;
 
   const wordCount = cleanText.split(/\s+/).filter(Boolean).length;
-  let threshold = 2800;
+  let threshold = 1600;
 
   // 短句更容易是“思考停顿”，延迟一点再截断，降低漏字率
-  if (wordCount <= 4) threshold += 1200;
-  else if (wordCount <= 8) threshold += 600;
-  else if (wordCount >= 20) threshold -= 300;
+  if (wordCount <= 4) threshold += 900;
+  else if (wordCount <= 8) threshold += 400;
+  else if (wordCount >= 20) threshold -= 200;
 
   // 若明显已成句，适当提前截断，减少延迟
-  if (/[.!?…]$/.test(cleanText)) threshold -= 600;
-  else if (/[,;:]$/.test(cleanText)) threshold += 500;
+  if (/[.!?…]$/.test(cleanText)) threshold -= 400;
+  else if (/[,;:]$/.test(cleanText)) threshold += 300;
 
   // 快速连续语流更容易被过早切段，适当延后截断，降低跨块吞字
   if (wordCount >= 12 && !/[.!?…]$/.test(cleanText)) {
-    threshold += 700;
+    threshold += 400;
   }
 
   const tailToken = cleanText.split(/\s+/).pop() || "";
   // 末词太短通常仍在抖动更新阶段（例如 "a", "to"），延后收口
   if (!/[.!?…]$/.test(cleanText) && tailToken.length > 0 && tailToken.length <= 2) {
-    threshold += 500;
+    threshold += 300;
   }
 
   // 超长 active 文本避免无限等待
-  if (cleanText.length > 200) threshold -= 500;
+  if (cleanText.length > 200) threshold -= 300;
 
-  return clamp(threshold, 2200, 5500);
+  return clamp(threshold, 1100, 3200);
 };
 
 const normalizeComparableText = (text) =>
@@ -2414,7 +2418,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const transcriptsRef = useRef([]);
   const lastExpandedSidebarWidthRef = useRef(240);
 
-  const TRANSLATE_INTERVAL = 1200;
+  const TRANSLATE_INTERVAL = 700;
 
   const activeEnRef = useRef("");
   const activeZhRef = useRef("");
