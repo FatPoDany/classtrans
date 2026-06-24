@@ -69,34 +69,7 @@ export const setGlobalApiToken = (token) => { globalApiToken = token; };
 
 
 // ============================================================================
-// 引擎 1a：免费谷歌翻译公共接口 (作为最后兜底使用)
-// ============================================================================
-const translateTextBasic = async (text) => {
-  if (!text.trim()) return "";
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=${encodeURIComponent(
-    text
-  )}`;
-
-  try {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
-    const data = await response.json();
-    if (data && data[0]) {
-      let translated = "";
-      for (let i = 0; i < data[0].length; i++) {
-        if (data[0][i][0]) translated += data[0][i][0];
-      }
-      return translated;
-    }
-    return "[解析翻译结果失败]";
-  } catch (error) {
-    console.error("Basic translation request failed:", error);
-    return "[基础翻译异常]";
-  }
-};
-
-// ============================================================================
-// 引擎 1b：实时快译（模型由管理面板 Realtime 指定，例如 deepseek-v4-flash；Google 仅作异常兜底）
+// 引擎 1b：实时快译（模型由管理面板 Realtime 指定，例如 deepseek-v4-flash）
 // ============================================================================
 const REALTIME_TRANSLATE_SYSTEM_PROMPT =
   "你是专业的同传译者。把用户给出的英文翻译成简体中文，要求：忠实、准确、术语一致、口语自然。只输出译文本身，不要任何引号、不要解释、不要前后缀。";
@@ -141,16 +114,10 @@ const translateRealtimeWithModel = async (text) => {
   return result;
 };
 
-const translateRealtimeFast = async (text) => {
-  const trimmed = String(text || "").trim();
-  if (!trimmed) return "";
-  try {
-    return await translateRealtimeWithModel(trimmed);
-  } catch (err) {
-    console.warn("realtime translate failed, falling back to Google:", err);
-    return translateTextBasic(trimmed);
-  }
-};
+// No silent fallback: a realtime-translate failure surfaces to the caller (the
+// polish baseline returns "" on error; the two-stage interim loop logs and skips
+// that cycle). The admin-configured Realtime model is the single source.
+const translateRealtimeFast = (text) => translateRealtimeWithModel(text);
 
 // ============================================================================
 // 引擎 2：AI 深度引擎 (阿里云 DashScope) - 用于文本润色 & 生成课堂总结
