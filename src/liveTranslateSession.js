@@ -40,14 +40,6 @@ const arrayBufferToBase64 = (buf) => {
   return btoa(binary);
 };
 
-// Strip tags + zero-width chars from a streaming delta WITHOUT collapsing/
-// trimming spaces (deltas may carry meaningful leading/trailing spaces; the
-// final join trims). sanitizeText is used for whole-string fields.
-const stripDelta = (s) =>
-  String(s || "")
-    .replace(/<\/?[^>]+>/g, "")
-    .replace(/[​-‍﻿]/g, "");
-
 export class LiveTranslateSession extends BaseAsrSession {
   constructor(options) {
     super(options);
@@ -184,16 +176,19 @@ export class LiveTranslateSession extends BaseAsrSession {
     }
 
     // --- translated output -> Chinese ---
-    // Text-only mode streams response.text.delta/.done; audio+text mode carries
-    // the same text on response.audio_transcript.delta/.done.
-    if (/^response\.(text|audio_transcript)\.(delta|done)$/.test(type)) {
+    // Mirrors the source side: streaming partial is `response.{audio_transcript|
+    // text}.text` with the cumulative text in `stash`; final is `.done` with
+    // `transcript` (audio mode) / `text` (text-only mode). (`.delta` kept as a
+    // fallback in case a revision streams incrementally instead.)
+    if (/^response\.(text|audio_transcript)\.(text|delta|done)$/.test(type)) {
       this._markResult();
       if (/\.done$/.test(type)) {
-        const t = sanitizeText(msg.text ?? msg.transcript) || this._zhPartial.trim();
+        const t = sanitizeText(msg.transcript ?? msg.text);
         if (t) this._zhFinalParts.push(t);
         this._zhPartial = "";
       } else {
-        this._zhPartial += stripDelta(msg.delta);
+        // cumulative partial in `stash`; replace, don't append
+        this._zhPartial = sanitizeText(msg.stash ?? msg.text ?? msg.delta);
       }
       this._emit();
       return;
