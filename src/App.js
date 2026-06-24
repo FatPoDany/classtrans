@@ -132,6 +132,10 @@ const TRANSLATION_AUDIO_STORAGE_KEY = "classtrans.playTranslationAudio.v1";
 const DEFAULT_POLISH_MODEL = "qwen-plus";
 const DEFAULT_REALTIME_MODEL = "qwen-turbo";
 const DEFAULT_ASR_MODEL = "qwen3.5-livetranslate-flash-realtime";
+// livetranslate：模型的 server VAD 1s 就结束一个 turn（常把一句话或相邻句子切碎）。
+// 在每个整句边界后再等这么久、若无新句才真正收口气泡，从而把停顿较短的相邻句子归并到
+// 同一个气泡（停顿超过它才另起一个）。可按口味调大/调小。
+const LIVETRANSLATE_GROUP_MS = 1500;
 
 const normalizeLegacyPolishModelName = (name) => {
   const cleanName = String(name || "").trim();
@@ -3197,21 +3201,26 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         activeZhRef.current = activeZhTail;
       }
 
-      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
       if (turnFinal) {
-        // 一体化模型（livetranslate）通过 server VAD 给出的整句边界：在模型自己的边界上
-        // 用「已校正」的整句转录 + 译文收口气泡，避免本地静音定时器在说话人还没说完时
-        // 就把一句话切成两半（issue 1）。
-        finalizeCurrentBlock();
-      } else if (activeNewText.trim()) {
-        // 一体化模型靠 turnFinal 收口，这里只保留一个较长的兜底定时器（万一漏掉边界）；
-        // 两段式（Paraformer）仍用自适应停顿阈值。
-        const threshold = asrProvidesTranslationRef.current
-          ? Math.max(getAdaptivePauseThreshold(activeNewText), 8000)
-          : getAdaptivePauseThreshold(activeNewText);
+        // 一体化模型（livetranslate）的整句边界（server VAD + 已校正的整句）：不立即收口，
+        // 而是起一个分组定时器。若停顿很短、说话人很快继续，下一段的 partial 会取消它，把
+        // 相邻句子合并进同一个气泡；只有停顿超过 LIVETRANSLATE_GROUP_MS 才真正收口。这样既
+        // 不会在没说完时切句（issue 1），也能把短停顿的句子归并（issue 2），且收口的是模型
+        // 已校正的整句而非半截 partial。
         silenceTimerRef.current = setTimeout(() => {
           finalizeCurrentBlock();
-        }, threshold);
+        }, LIVETRANSLATE_GROUP_MS);
+      } else if (!asrProvidesTranslationRef.current && activeNewText.trim()) {
+        // 两段式（Paraformer）：维持原自适应停顿阈值。一体化模型的流式 partial 不在此设定时器
+        // ——已在上面清除任何待定收口，收口完全交给整句边界后的分组定时器。
+        const adaptiveThreshold = getAdaptivePauseThreshold(activeNewText);
+        silenceTimerRef.current = setTimeout(() => {
+          finalizeCurrentBlock();
+        }, adaptiveThreshold);
       }
     },
     [finalizeCurrentBlock]

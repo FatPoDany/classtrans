@@ -170,12 +170,16 @@ export class LiveTranslateSession extends BaseAsrSession {
         const t = sanitizeText(msg.transcript ?? msg.text);
         if (t) this._enFinalParts.push(t);
         this._enPartial = "";
+        // end of a source turn (server VAD) — a real boundary for the App's
+        // bubble grouping. Marked on both EN .completed and ZH .done because
+        // their order varies.
+        this._emit({ turnFinal: true });
       } else {
         this._enPartial = sanitizeText(
           [msg.text, msg.stash ?? msg.delta].filter(Boolean).join(" ")
         );
+        this._emit();
       }
-      this._emit();
       return;
     }
 
