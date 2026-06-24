@@ -96,12 +96,12 @@ const translateTextBasic = async (text) => {
 };
 
 // ============================================================================
-// 引擎 1b：qwen-turbo 实时快译 (取代 Google 公共接口作为主路径，可控、可观测)
+// 引擎 1b：实时快译（模型由管理面板 Realtime 指定，例如 deepseek-v4-flash；Google 仅作异常兜底）
 // ============================================================================
 const REALTIME_TRANSLATE_SYSTEM_PROMPT =
   "你是专业的同传译者。把用户给出的英文翻译成简体中文，要求：忠实、准确、术语一致、口语自然。只输出译文本身，不要任何引号、不要解释、不要前后缀。";
 
-const translateRealtimeWithQwen = async (text) => {
+const translateRealtimeWithModel = async (text) => {
   const trimmed = String(text || "").trim();
   if (!trimmed) return "";
 
@@ -122,13 +122,13 @@ const translateRealtimeWithQwen = async (text) => {
   });
 
   if (!response.ok) {
-    throw new Error(`qwen-turbo translate failed: ${response.status}`);
+    throw new Error(`realtime translate (${modelName}) failed: ${response.status}`);
   }
 
   const data = await response.json();
   if (data?.error) {
     const msg = typeof data.error === "string" ? data.error : data.error?.message;
-    throw new Error(msg || "qwen-turbo upstream error");
+    throw new Error(msg || `realtime translate (${modelName}) upstream error`);
   }
 
   const result = String(data?.choices?.[0]?.message?.content || "")
@@ -136,7 +136,7 @@ const translateRealtimeWithQwen = async (text) => {
     .replace(/\s+/g, " ")
     .trim();
 
-  if (!result) throw new Error("qwen-turbo empty response");
+  if (!result) throw new Error(`realtime translate (${modelName}) empty response`);
   recordAiUsage({ type: "realtime", model: modelName, usage: data?.usage });
   return result;
 };
@@ -145,9 +145,9 @@ const translateRealtimeFast = async (text) => {
   const trimmed = String(text || "").trim();
   if (!trimmed) return "";
   try {
-    return await translateRealtimeWithQwen(trimmed);
+    return await translateRealtimeWithModel(trimmed);
   } catch (err) {
-    console.warn("qwen-turbo realtime translate failed, falling back to Google:", err);
+    console.warn("realtime translate failed, falling back to Google:", err);
     return translateTextBasic(trimmed);
   }
 };
@@ -3469,7 +3469,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       lastFinalSessionStringRef.current = "";
       processedZhLengthRef.current = 0;
       lastTranslatedSessionStringRef.current = "";
-      asrProvidesTranslationRef.current = false;
+      // 一体化翻译模型（livetranslate）自带流式中文：从一开始就关闭 LLM 实时兜底翻译
+      // （及其 Google 兜底），由模型译文驱动气泡，避免测试时 deepseek/Google 兜底造成混淆。
+      // 两段式（Paraformer）仍为 false，照常走 LLM 实时翻译。
+      asrProvidesTranslationRef.current = isLiveTranslateModel(runtimeAsrModelName);
 
       setAsrStatus("connecting");
       setAsrErrorReason("");
