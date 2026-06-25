@@ -220,6 +220,16 @@ export class BaseAsrSession {
     this.sentences = [];
   }
 
+  // Reset transcript state when a renewal / reconnect starts a fresh task.
+  // Default: clear accumulation and emit empty fullText so the App realigns its
+  // processedLength (the new task numbers results from 0). One-pass models
+  // override this to preserve the visible transcript across recovery renewals
+  // so the bubble doesn't vanish mid-speech.
+  _resetTranscriptForNewTask(_reason) {
+    this._resetBuffers();
+    this.onUpdate({ fullText: "", finalText: "", confidence: 0, translatedText: "", translatedFinalText: "" });
+  }
+
   // ---- ready/error/result helpers (called by protocol hook) --------------
 
   _signalReady() {
@@ -623,11 +633,10 @@ export class BaseAsrSession {
       await this._openWebSocket();
       await this._startTaskWithRetry();
 
-      // The new task numbers results from 0 again. Drop accumulation and tell
-      // the consumer to realign cumulative-text bookkeeping (App.js listens for
-      // empty fullText after non-empty and resets processedLength).
-      this._resetBuffers();
-      this.onUpdate({ fullText: "", finalText: "", confidence: 0, translatedText: "", translatedFinalText: "" });
+      // Reset transcript state for the new task. Default clears + realigns the
+      // App; one-pass models preserve the visible text (except a safe-window
+      // rotation, which trims) — see _resetTranscriptForNewTask override.
+      this._resetTranscriptForNewTask(reason);
 
       this._isRenewing = false;
       this._reconnectAttempt = 0;
@@ -741,8 +750,7 @@ export class BaseAsrSession {
       await this._openWebSocket();
       await this._startTaskWithRetry();
 
-      this._resetBuffers();
-      this.onUpdate({ fullText: "", finalText: "", confidence: 0, translatedText: "", translatedFinalText: "" });
+      this._resetTranscriptForNewTask("reconnect");
 
       this._reconnectAttempt = 0;
       this._isReconnecting = false;

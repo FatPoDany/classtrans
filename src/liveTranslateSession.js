@@ -115,9 +115,34 @@ export class LiveTranslateSession extends BaseAsrSession {
     if (this._player) this._player.reset();
   }
 
+  // Recovery renewals (watchdog / reconnect) must NOT wipe the visible transcript
+  // mid-speech. The accumulation is id-free and the new task simply appends, so
+  // keep the committed turns and only drop the in-flight partial, re-emitting the
+  // preserved cumulative text (non-empty → the App keeps its processedLength and
+  // the bubble doesn't vanish). Only the proactive 14-min rotation — which runs
+  // at a safe window with no active speech — does a full reset to bound growth.
+  _resetTranscriptForNewTask(reason) {
+    this._enPartial = "";
+    this._zhPartial = "";
+    if (this._player) this._player.reset();
+    if (reason === "rotation") {
+      this._enFinalParts = [];
+      this._zhFinalParts = [];
+      this.onUpdate({ fullText: "", finalText: "", confidence: 0, translatedText: "", translatedFinalText: "" });
+    } else {
+      this._emit();
+    }
+  }
+
   _handleProtocolMessage(msg) {
     const type = msg && msg.type;
     if (!type || typeof type !== "string") return;
+
+    // Any model event (speech_started, response.*, transcription, …) is a sign of
+    // life — keep the watchdog fresh during active speech so it doesn't false-fire
+    // and renew mid-utterance. It only fires after a genuinely long total silence
+    // (when there's no active bubble to disrupt anyway).
+    this._markResult();
 
     if (type === "session.created") {
       // Configure exactly once, now that the session exists. Sending more than
@@ -154,7 +179,6 @@ export class LiveTranslateSession extends BaseAsrSession {
     // tentative tail in `stash`; the live hypothesis is text + stash. `.completed`
     // carries the authoritative full `transcript`.
     if (type.indexOf("input_audio_transcription") !== -1) {
-      this._markResult();
       if (/\.completed$/.test(type)) {
         const t = sanitizeText(msg.transcript ?? msg.text);
         if (t) this._enFinalParts.push(t);
@@ -178,7 +202,6 @@ export class LiveTranslateSession extends BaseAsrSession {
     // `transcript` (audio) / `text` (text-only) AND marks the end of the model's
     // turn (server VAD), so we flag turnFinal for the App to finalize the bubble.
     if (/^response\.(text|audio_transcript)\.(text|delta|done)$/.test(type)) {
-      this._markResult();
       if (/\.done$/.test(type)) {
         const t = sanitizeText(msg.transcript ?? msg.text);
         if (t) this._zhFinalParts.push(t);
@@ -194,7 +217,6 @@ export class LiveTranslateSession extends BaseAsrSession {
 
     // --- streamed translated speech ---
     if (type === "response.audio.delta") {
-      this._markResult();
       if (this.audioOutput && msg.delta) this._ensurePlayer().feed(msg.delta);
       return;
     }
