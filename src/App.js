@@ -136,6 +136,10 @@ const DEFAULT_ASR_MODEL = "qwen3.5-livetranslate-flash-realtime";
 // 在每个整句边界后再等这么久、若无新句才真正收口气泡，从而把停顿较短的相邻句子归并到
 // 同一个气泡（停顿超过它才另起一个）。可按口味调大/调小。
 const LIVETRANSLATE_GROUP_MS = 1500;
+// 单个 livetranslate 气泡的最大英文长度：整句边界（turnFinal）处若已积累超过该
+// 长度就立即收口，不再等停顿分组。防止连续快节奏对话把几十句挤进一个巨型气泡
+// —— 巨型块的 AI 润色更容易失败退化成 🛟 保底机翻，也不利于阅读定位。
+const LIVETRANSLATE_GROUP_MAX_CHARS = 500;
 
 const normalizeLegacyPolishModelName = (name) => {
   const cleanName = String(name || "").trim();
@@ -3224,9 +3228,14 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         // 相邻句子合并进同一个气泡；只有停顿超过 LIVETRANSLATE_GROUP_MS 才真正收口。这样既
         // 不会在没说完时切句（issue 1），也能把短停顿的句子归并（issue 2），且收口的是模型
         // 已校正的整句而非半截 partial。
-        silenceTimerRef.current = setTimeout(() => {
+        // 整句边界且气泡已经很长：立即收口，不再分组（见 GROUP_MAX_CHARS 注释）。
+        if (activeNewText.length >= LIVETRANSLATE_GROUP_MAX_CHARS) {
           finalizeCurrentBlock();
-        }, LIVETRANSLATE_GROUP_MS);
+        } else {
+          silenceTimerRef.current = setTimeout(() => {
+            finalizeCurrentBlock();
+          }, LIVETRANSLATE_GROUP_MS);
+        }
       } else if (!asrProvidesTranslationRef.current && activeNewText.trim()) {
         // 两段式（Paraformer）：维持原自适应停顿阈值。一体化模型的流式 partial 不在此设定时器
         // ——已在上面清除任何待定收口，收口完全交给整句边界后的分组定时器。
@@ -3457,6 +3466,71 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     }
   }, []);
 
+  // 收音轨道意外结束（蓝牙耳机断开、系统切换输入设备、权限被收回等）。
+  // mic 模式：自动重新申请麦克风并热替换进正在运行的会话 —— WebSocket/任务不动，
+  // 转录零丢失地继续；重取失败才干净停机（页面上已转录内容保留，修好设备后可
+  // 直接重新开始收音继续录）。tab 模式：无法代替用户重新选择共享源，
+  // startTabMode 里的 onended → stopTabMode 已负责优雅收尾，这里忽略。
+  const micRecoveryRef = useRef(false);
+  const handleAudioTrackEnded = useCallback(
+    async (mode) => {
+      if (mode !== "mic" || !shouldListenRef.current || micRecoveryRef.current) return;
+      micRecoveryRef.current = true;
+      const session = paraformerSessionRef.current;
+      try {
+        pushToast({
+          level: "warn",
+          text: "麦克风输入中断（设备断开或被系统切换），正在自动恢复…",
+          ttl: 4000,
+        });
+        // 先按用户选定的设备重试；失败等 1.5s（给系统时间把默认输入切回
+        // 内置麦克风，蓝牙断开时的常见情形）后回退到系统默认设备。
+        let newTrack = await prepareEnhancedMicCapture();
+        if (!newTrack) {
+          await new Promise((r) => setTimeout(r, 1500));
+          newTrack = await prepareEnhancedMicCapture("default");
+        }
+        // 恢复期间用户手动停了 / 会话已被换掉：不再插手
+        if (!shouldListenRef.current || !session || paraformerSessionRef.current !== session) {
+          return;
+        }
+        if (newTrack && typeof session.replaceAudioTrack === "function") {
+          try {
+            await session.replaceAudioTrack(newTrack);
+            pushToast({ level: "success", text: "麦克风已自动恢复，转录继续。", ttl: 4000 });
+            return;
+          } catch (err) {
+            console.error("热替换麦克风轨道失败:", err);
+          }
+        }
+        // 恢复失败：干净停机（不自动存档清屏——内容留在页面上，用户可继续）
+        shouldListenRef.current = false;
+        setListeningMode("none");
+        setIsPaused(false);
+        isPausedRef.current = false;
+        await stopParaformerSession();
+        stopMicCaptureEnhancer();
+        if (activeEnRef.current.trim()) finalizeCurrentBlock();
+        setAsrStatus("error");
+        setAsrErrorReason("麦克风输入中断，自动恢复失败");
+        pushToast({
+          level: "error",
+          text: "麦克风输入已断开且自动恢复失败，收音已停止。已转录内容仍在页面上，检查设备后可重新开始收音继续。",
+          ttl: 9000,
+        });
+      } finally {
+        micRecoveryRef.current = false;
+      }
+    },
+    [
+      finalizeCurrentBlock,
+      prepareEnhancedMicCapture,
+      pushToast,
+      stopMicCaptureEnhancer,
+      stopParaformerSession,
+    ]
+  );
+
   // 创建并启动一个 Paraformer 会话，把它绑到 paraformerSessionRef 上。
   // tab / mic 两个入口共用，确保会话生命周期与 onUpdate 路径一致。
   const startParaformerForMode = useCallback(
@@ -3530,6 +3604,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             onUpdate,
             onStatus,
             onError,
+            onTrackEnded: () => handleAudioTrackEnded(mode),
           })
         : new ParaformerSession({
             wsUrl: PARAFORMER_WS_URL,
@@ -3544,6 +3619,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             onUpdate,
             onStatus,
             onError,
+            onTrackEnded: () => handleAudioTrackEnded(mode),
           });
       setLiveTranslateActive(useLiveTranslate);
       paraformerSessionRef.current = session;
@@ -3558,7 +3634,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         throw err;
       }
     },
-    [applyTranscriptUpdate, pushToast, stopParaformerSession]
+    [applyTranscriptUpdate, handleAudioTrackEnded, pushToast, stopParaformerSession]
   );
 
   const stopTabMode = useCallback(async () => {

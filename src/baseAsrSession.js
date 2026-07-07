@@ -24,7 +24,9 @@
 
 const FRAME_SIZE = 1600; // 100 ms at 16 kHz
 const TARGET_SAMPLE_RATE = 16000;
-const TASK_STARTED_TIMEOUT_MS = 5000;
+// Relay + DashScope handshake can exceed 5 s on congested networks (seen in the
+// field as spurious "ASR session start timeout" on first click); give it 10 s.
+const TASK_STARTED_TIMEOUT_MS = 10_000;
 
 // DashScope occasionally returns spurious "free tier exhausted" task-failed
 // errors even when quota is available. Retry start a few times before
@@ -120,7 +122,7 @@ export const isRetriableTaskError = (msg) => {
 export { FRAME_SIZE, TARGET_SAMPLE_RATE, SILENCE_FRAME };
 
 export class BaseAsrSession {
-  constructor({ wsUrl, audioTrack, model, onUpdate, onError, onStatus, canRotateNow }) {
+  constructor({ wsUrl, audioTrack, model, onUpdate, onError, onStatus, onTrackEnded, canRotateNow }) {
     if (!wsUrl) throw new Error("BaseAsrSession: wsUrl is required");
     if (!audioTrack) throw new Error("BaseAsrSession: audioTrack is required");
 
@@ -130,6 +132,11 @@ export class BaseAsrSession {
     this.onUpdate = typeof onUpdate === "function" ? onUpdate : () => {};
     this.onError = typeof onError === "function" ? onError : () => {};
     this.onStatus = typeof onStatus === "function" ? onStatus : () => {};
+    // Fired once when the capture track dies (device unplugged / switched /
+    // permission revoked). The owner should either replaceAudioTrack() to
+    // resume seamlessly or stop() the session. Without a handler we fall back
+    // to a one-shot onError.
+    this.onTrackEnded = typeof onTrackEnded === "function" ? onTrackEnded : null;
     this.canRotateNow = typeof canRotateNow === "function" ? canRotateNow : () => true;
 
     this.ws = null;
@@ -158,6 +165,14 @@ export class BaseAsrSession {
     // Frames captured while the gate is closed, flushed on _signalReady.
     this._pendingAudio = [];
     this._pendingAudioBytes = 0;
+    // Dead-input latch: while the capture track is ended, renew/rotate would
+    // churn tasks that can never produce results (field logs showed hours of
+    // reconnect spam) — these flags freeze that machinery until the track is
+    // replaced or the session is stopped.
+    this._trackEnded = false;
+    this._trackEndedNotified = false;
+    this._boundTrackEnded = null;
+    this._trackEndedListenerTarget = null;
   }
 
   get _tag() {
@@ -358,7 +373,18 @@ export class BaseAsrSession {
       await ctx.resume().catch(() => {});
     }
 
-    await ctx.audioWorklet.addModule("/pcm16-worklet.js");
+    try {
+      await ctx.audioWorklet.addModule("/pcm16-worklet.js");
+    } catch (err) {
+      // Seen in the field as a one-off AbortError; a single retry recovers it.
+      console.warn(`${this._tag}: worklet module load failed, retrying once:`, err);
+      await new Promise((r) => setTimeout(r, 300));
+      await ctx.audioWorklet.addModule("/pcm16-worklet.js");
+    }
+
+    // Immediate dead-input detection (the watchdog's readyState poll is the
+    // 10 s fallback for tracks that end without firing the event).
+    this._armTrackEndedListener(this.audioTrack);
 
     const source = ctx.createMediaStreamSource(new MediaStream([this.audioTrack]));
     const worklet = new AudioWorkletNode(ctx, "pcm16-worklet", {
@@ -400,6 +426,69 @@ export class BaseAsrSession {
     this.workletNode = worklet;
   }
 
+  // ---- capture-track lifecycle ---------------------------------------------
+
+  _armTrackEndedListener(track) {
+    if (!track || typeof track.addEventListener !== "function") return;
+    this._disarmTrackEndedListener();
+    this._boundTrackEnded = () => this._handleTrackEnded();
+    track.addEventListener("ended", this._boundTrackEnded);
+    this._trackEndedListenerTarget = track;
+  }
+
+  _disarmTrackEndedListener() {
+    if (this._trackEndedListenerTarget && this._boundTrackEnded) {
+      try {
+        this._trackEndedListenerTarget.removeEventListener("ended", this._boundTrackEnded);
+      } catch (_) {}
+    }
+    this._boundTrackEnded = null;
+    this._trackEndedListenerTarget = null;
+  }
+
+  // The capture track died (Bluetooth headset dropped, OS switched devices,
+  // permission revoked). No renewal can help — there is no input — so latch
+  // _trackEnded (freezing watchdog renewals and rotation) and notify the owner
+  // exactly once: replaceAudioTrack() resumes seamlessly, stop() ends cleanly.
+  _handleTrackEnded() {
+    if (this.stopped || this._trackEndedNotified) return;
+    this._trackEnded = true;
+    this._trackEndedNotified = true;
+    console.error(`${this._tag}: audioTrack ended`);
+    if (this.onTrackEnded) {
+      this.onTrackEnded();
+    } else {
+      this.onError(new Error("音频轨道已结束，请重新开始同传"));
+    }
+  }
+
+  // Hot-swap a fresh capture track into the running pipeline (mic
+  // auto-recovery). The WebSocket/task keeps running, so the transcript is
+  // untouched — the new source simply starts feeding the existing worklet.
+  async replaceAudioTrack(newTrack) {
+    if (this.stopped) return;
+    if (!newTrack || newTrack.readyState === "ended") {
+      throw new Error("replaceAudioTrack: invalid or already-ended track");
+    }
+    this.audioTrack = newTrack;
+    this._armTrackEndedListener(newTrack);
+    if (this.audioContext && this.workletNode) {
+      if (this.sourceNode) {
+        try { this.sourceNode.disconnect(); } catch (_) {}
+      }
+      const source = this.audioContext.createMediaStreamSource(new MediaStream([newTrack]));
+      source.connect(this.workletNode);
+      this.sourceNode = source;
+      if (this.audioContext.state === "suspended") {
+        await this.audioContext.resume().catch(() => {});
+      }
+    }
+    this._trackEnded = false;
+    this._trackEndedNotified = false;
+    this._lastResultAt = Date.now(); // fresh watchdog grace for the new input
+    console.log(`${this._tag}: audio track replaced, capture resumed`);
+  }
+
   // ---- pending-audio buffer (uplink-gap bridging) --------------------------
 
   _bufferPendingAudio(buf) {
@@ -433,6 +522,7 @@ export class BaseAsrSession {
   }
 
   _teardownAudio() {
+    this._disarmTrackEndedListener();
     if (this.workletNode) {
       try { this.workletNode.port.onmessage = null; } catch (e) {}
       try { this.workletNode.disconnect(); } catch (e) {}
@@ -612,10 +702,12 @@ export class BaseAsrSession {
 
       this._ensureAudioContextRunning();
 
-      if (this.audioTrack && this.audioTrack.readyState === "ended") {
-        console.error(`${this._tag}: audioTrack ended`);
-        this.onError(new Error("音频轨道已结束，请重新开始同传"));
-        this._clearWatchdog();
+      // Dead input: renewing tasks can't produce results without audio.
+      // Notify once and hold (recovery or stop is the owner's call) instead of
+      // erroring + renewing every cycle — the endless reconnect churn seen in
+      // field logs after a mic dropped mid-meeting.
+      if (this._trackEnded || (this.audioTrack && this.audioTrack.readyState === "ended")) {
+        this._handleTrackEnded();
         return;
       }
 
@@ -739,6 +831,8 @@ export class BaseAsrSession {
         this._clearRotationCheckTimer();
         return;
       }
+      // No input → rotating would burn tasks for nothing; wait for recovery.
+      if (this._trackEnded) return;
       const dueAge = Date.now() - this._rotationDueAt;
       let safe = true;
       try { safe = !!this.canRotateNow(); } catch (e) { safe = true; }

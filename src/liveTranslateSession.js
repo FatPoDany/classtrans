@@ -182,11 +182,16 @@ export class LiveTranslateSession extends BaseAsrSession {
     if (type === "error") {
       const err = msg.error || {};
       const errMsg = err.message || err.code || msg.message || "realtime error";
-      // "model repeat output happened" is DashScope's repeat-guard — a transient
-      // hiccup; the server closes the socket and we auto-reconnect, so don't pop
-      // an error toast for it (only surface genuinely fatal errors). During
-      // startup (_readyReject set) always reject so the retry logic can react.
-      if (!this._readyReject && /repeat output|repeat detected|repetition/i.test(errMsg)) {
+      // "model repeat output happened" is DashScope's repeat-guard, and
+      // "session was closed because no response was generated for N seconds"
+      // is its long-silence cap — both are transient: the server closes the
+      // socket right after and we auto-reconnect, so don't pop an error toast
+      // (only surface genuinely fatal errors). During startup (_readyReject
+      // set) always reject so the retry logic can react.
+      if (
+        !this._readyReject &&
+        /repeat output|repeat detected|repetition|no response was generated/i.test(errMsg)
+      ) {
         console.warn(`${this._tag}: transient model error, recovering on reconnect: ${errMsg}`);
         return;
       }
