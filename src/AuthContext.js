@@ -88,6 +88,27 @@ export function AuthProvider({ children }) {
     return { data, error };
   }, []);
 
+  // 更新显示名称：写 auth 元数据 + profiles 行（RLS users_own_profile 允许本人
+  // 更新自己的行），随后刷新本地 profile 状态让侧栏/资料页立即生效。
+  const updateDisplayName = useCallback(async (displayName) => {
+    const name = String(displayName || '').trim();
+    if (!name) return { error: new Error('显示名称不能为空') };
+    const { data, error } = await supabase.auth.updateUser({
+      data: { display_name: name },
+    });
+    if (error) return { data, error };
+    const userId = data?.user?.id;
+    if (userId) {
+      const { error: profileError } = await supabase
+        .from('profiles')
+        .update({ display_name: name, updated_at: new Date().toISOString() })
+        .eq('id', userId);
+      if (profileError) return { data, error: profileError };
+      await fetchProfile(userId);
+    }
+    return { data, error: null };
+  }, []);
+
   const value = {
     user,
     session,
@@ -99,6 +120,7 @@ export function AuthProvider({ children }) {
     signOut,
     resetPassword,
     updatePassword,
+    updateDisplayName,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
