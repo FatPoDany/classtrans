@@ -34,6 +34,12 @@ import {
   Plus,
   Volume2,
   VolumeX,
+  Copy,
+  KeyRound,
+  CalendarDays,
+  Clock,
+  ShieldCheck,
+  BadgeCheck,
 } from "lucide-react";
 import { ParaformerSession } from "./paraformerSession";
 import { LiveTranslateSession } from "./liveTranslateSession";
@@ -136,6 +142,10 @@ const DEFAULT_ASR_MODEL = "qwen3.5-livetranslate-flash-realtime";
 // 在每个整句边界后再等这么久、若无新句才真正收口气泡，从而把停顿较短的相邻句子归并到
 // 同一个气泡（停顿超过它才另起一个）。可按口味调大/调小。
 const LIVETRANSLATE_GROUP_MS = 1500;
+// 单个 livetranslate 气泡的最大英文长度：整句边界（turnFinal）处若已积累超过该
+// 长度就立即收口，不再等停顿分组。防止连续快节奏对话把几十句挤进一个巨型气泡
+// —— 巨型块的 AI 润色更容易失败退化成 🛟 保底机翻，也不利于阅读定位。
+const LIVETRANSLATE_GROUP_MAX_CHARS = 500;
 
 const normalizeLegacyPolishModelName = (name) => {
   const cleanName = String(name || "").trim();
@@ -925,6 +935,10 @@ const normalizePolishSegments = (segments, rawEn) =>
 
 // 等多久 polish 还没出第一个 ZH delta，再启动 qwen-turbo 基线（用于质量门控对比 + 兜底）
 const POLISH_BASELINE_DELAY_MS = 2500;
+// Idle/stall timeouts (NOT total deadlines): the polish stream is aborted only
+// after this long with no new output, and the timer is re-armed on every chunk.
+// A long transcript (e.g. an 18-sentence bubble) legitimately streams for well
+// over 30s; killing it mid-output is what made long bubbles fail to polish.
 const POLISH_PRIMARY_TIMEOUT_MS = 30_000;
 const POLISH_FALLBACK_TIMEOUT_MS = 18_000;
 
@@ -982,10 +996,18 @@ const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) =>
 
     const controller = new AbortController();
     let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
+    // Idle stall timer: abort only after timeoutMs with NO bytes from upstream.
+    // Re-armed on every streamed chunk (see the read loop) so a long but
+    // steadily-progressing generation is never cut off mid-output.
+    let idleTimer = null;
+    const armIdleTimeout = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+    };
+    armIdleTimeout();
     const abortFromParent = () => controller.abort();
     if (signal) {
       if (signal.aborted) abortFromParent();
@@ -1072,6 +1094,7 @@ const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) =>
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        armIdleTimeout(); // bytes arriving — reset the idle stall timer
         sseBuffer += decoder.decode(value, { stream: true });
 
         let newlineIdx;
@@ -1084,10 +1107,10 @@ const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) =>
     } catch (error) {
       streamError =
         timedOut && !signal?.aborted
-          ? new Error(`AI polish timeout after ${Math.round(timeoutMs / 1000)}s`)
+          ? new Error(`AI polish stalled (no output for ${Math.round(timeoutMs / 1000)}s)`)
           : error;
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(idleTimer);
       if (signal) signal.removeEventListener?.("abort", abortFromParent);
       try { reader?.releaseLock(); } catch (e) {}
     }
@@ -2130,7 +2153,266 @@ export default function App() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// ProfileModal – 账户资料：个人信息展示 + 显示名称/密码自助修改
+// ---------------------------------------------------------------------------
+function ProfileModal({
+  user,
+  profile,
+  isAdmin,
+  onClose,
+  updateDisplayName,
+  updatePassword,
+  pushToast,
+  signOut,
+}) {
+  const currentName = (profile?.display_name || user?.user_metadata?.display_name || "").trim();
+  const [nameDraft, setNameDraft] = useState(currentName);
+  const [savingName, setSavingName] = useState(false);
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [savingPassword, setSavingPassword] = useState(false);
+
+  const avatarLetter = (currentName || user?.email || "U").charAt(0).toUpperCase();
+  const formatDateTime = (iso) => {
+    if (!iso) return "—";
+    try {
+      return new Date(iso).toLocaleString("zh-CN", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch (e) {
+      return "—";
+    }
+  };
+
+  const handleSaveName = async () => {
+    const next = nameDraft.trim();
+    if (!next) {
+      pushToast({ level: "warn", text: "显示名称不能为空", ttl: 3000 });
+      return;
+    }
+    if (next === currentName) return;
+    setSavingName(true);
+    try {
+      const { error } = await updateDisplayName(next);
+      if (error) {
+        pushToast({ level: "error", text: `显示名称保存失败：${error.message}`, ttl: 6000 });
+      } else {
+        pushToast({ level: "success", text: "显示名称已更新", ttl: 3000 });
+      }
+    } finally {
+      setSavingName(false);
+    }
+  };
+
+  const handleChangePassword = async () => {
+    if (newPassword.length < 6) {
+      pushToast({ level: "warn", text: "新密码至少需要 6 个字符", ttl: 3000 });
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      pushToast({ level: "warn", text: "两次输入的密码不一致", ttl: 3000 });
+      return;
+    }
+    setSavingPassword(true);
+    try {
+      const { error } = await updatePassword(newPassword);
+      if (error) {
+        pushToast({ level: "error", text: `密码修改失败：${error.message}`, ttl: 6000 });
+      } else {
+        setNewPassword("");
+        setConfirmPassword("");
+        pushToast({ level: "success", text: "密码已更新，下次登录请使用新密码", ttl: 5000 });
+      }
+    } finally {
+      setSavingPassword(false);
+    }
+  };
+
+  const handleCopyId = async () => {
+    try {
+      await navigator.clipboard.writeText(user?.id || "");
+      pushToast({ level: "success", text: "用户 ID 已复制", ttl: 2500 });
+    } catch (e) {
+      pushToast({ level: "warn", text: "复制失败，请手动选择复制", ttl: 3000 });
+    }
+  };
+
+  const fieldClass =
+    "w-full bg-white/[0.05] border border-white/10 text-slate-100 placeholder-slate-500 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all";
+
+  return (
+    <div
+      className="fixed inset-0 z-[90] bg-black/55 backdrop-blur-sm flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg ct-panel p-6 max-h-[88vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-bold text-slate-100 tracking-tight">账户资料</h3>
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-white/[0.08] transition-colors"
+            aria-label="关闭"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* ---- 身份概览 ---- */}
+        <div className="mt-4 flex items-center gap-4">
+          <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-2xl shrink-0 shadow-lg shadow-indigo-500/25">
+            {avatarLetter}
+          </div>
+          <div className="min-w-0">
+            <p className="text-base font-bold text-slate-100 truncate">
+              {currentName || user?.email || "用户"}
+            </p>
+            <p className="text-sm text-slate-400 truncate">{user?.email}</p>
+            <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+              <span
+                className={`inline-flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                  isAdmin ? "bg-amber-500/15 text-amber-300" : "bg-white/[0.06] text-slate-400"
+                }`}
+              >
+                <ShieldCheck className="w-3 h-3" />
+                {isAdmin ? "管理员" : "普通用户"}
+              </span>
+              {user?.email_confirmed_at && (
+                <span className="inline-flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/12 text-emerald-300">
+                  <BadgeCheck className="w-3 h-3" /> 邮箱已验证
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* ---- 账户详情 ---- */}
+        <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5">
+            <p className="text-xs text-slate-400 font-semibold flex items-center gap-1.5">
+              <CalendarDays className="w-3.5 h-3.5" /> 注册时间
+            </p>
+            <p className="text-sm font-semibold text-slate-100 mt-1">
+              {formatDateTime(user?.created_at)}
+            </p>
+          </div>
+          <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5">
+            <p className="text-xs text-slate-400 font-semibold flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5" /> 最近登录
+            </p>
+            <p className="text-sm font-semibold text-slate-100 mt-1">
+              {formatDateTime(user?.last_sign_in_at)}
+            </p>
+          </div>
+          <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 sm:col-span-2">
+            <p className="text-xs text-slate-400 font-semibold">用户 ID</p>
+            <div className="flex items-center gap-2 mt-1">
+              <p className="text-xs font-mono text-slate-300 truncate flex-1" title={user?.id || ""}>
+                {user?.id || "—"}
+              </p>
+              <button
+                onClick={handleCopyId}
+                className="p-1.5 rounded-md text-slate-400 hover:text-slate-100 hover:bg-white/[0.08] transition-colors shrink-0"
+                title="复制用户 ID"
+              >
+                <Copy className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* ---- 显示名称 ---- */}
+        <div className="mt-5">
+          <p className="text-sm font-bold text-slate-200 flex items-center gap-1.5">
+            <User className="w-4 h-4 text-indigo-300" /> 显示名称
+          </p>
+          <div className="flex items-center gap-2 mt-2">
+            <input
+              type="text"
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              placeholder="设置一个显示名称"
+              maxLength={40}
+              className={fieldClass}
+            />
+            <button
+              onClick={handleSaveName}
+              disabled={savingName || !nameDraft.trim() || nameDraft.trim() === currentName}
+              className="ct-btn-primary px-3.5 py-2 text-sm rounded-lg font-semibold shrink-0 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+            >
+              {savingName ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+              保存
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-500 mt-1.5">
+            显示名称用于侧栏与账户资料展示；留空时显示邮箱。
+          </p>
+        </div>
+
+        {/* ---- 修改密码 ---- */}
+        <div className="mt-5 pt-5 border-t border-white/10">
+          <p className="text-sm font-bold text-slate-200 flex items-center gap-1.5">
+            <KeyRound className="w-4 h-4 text-indigo-300" /> 修改密码
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+            <input
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="新密码（至少 6 个字符）"
+              autoComplete="new-password"
+              className={fieldClass}
+            />
+            <input
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              placeholder="再次输入新密码"
+              autoComplete="new-password"
+              className={fieldClass}
+            />
+          </div>
+          <button
+            onClick={handleChangePassword}
+            disabled={savingPassword || !newPassword || !confirmPassword}
+            className="mt-2.5 ct-btn-primary px-4 py-2 text-sm rounded-lg font-semibold disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+          >
+            {savingPassword ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+            更新密码
+          </button>
+        </div>
+
+        {/* ---- 底部操作 ---- */}
+        <div className="mt-6 pt-4 border-t border-white/10 flex items-center justify-between gap-2">
+          <button
+            onClick={() => signOut()}
+            className="flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-semibold text-rose-300 bg-rose-500/10 border border-rose-400/20 hover:bg-rose-500/20 transition-colors"
+          >
+            <LogOut className="w-4 h-4" /> 退出登录
+          </button>
+          <button
+            onClick={onClose}
+            className="ct-btn-ghost px-3.5 py-2 text-sm rounded-lg font-semibold"
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MainApp({ user, signOut, authSession, isAdmin }) {
+  // 账户资料：profile 行（display_name）+ 自助修改显示名/密码
+  const { profile, updatePassword, updateDisplayName } = useAuth();
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
   React.useEffect(() => { setGlobalApiToken(authSession?.access_token || ""); }, [authSession]);
   
   const { settings: globalSettings, loading: globalSettingsLoading, updateSettings } = useGlobalSettings();
@@ -2195,6 +2477,24 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   });
   const playTranslationAudioRef = useRef(playTranslationAudio);
   const [liveTranslateActive, setLiveTranslateActive] = useState(false);
+  // 首次开启译文朗读需要一次简短的任务重建（会话模态固定，见
+  // LiveTranslateSession.setAudioOutput）。期间按钮显示"开启中…"，由会话的
+  // onStatus(reason="audio-toggle") 驱动；带兜底超时防止卡住。
+  const [translationAudioPending, setTranslationAudioPendingState] = useState(false);
+  const translationAudioPendingTimerRef = useRef(null);
+  const setTranslationAudioPending = useCallback((on) => {
+    if (translationAudioPendingTimerRef.current) {
+      clearTimeout(translationAudioPendingTimerRef.current);
+      translationAudioPendingTimerRef.current = null;
+    }
+    setTranslationAudioPendingState(on);
+    if (on) {
+      translationAudioPendingTimerRef.current = setTimeout(() => {
+        setTranslationAudioPendingState(false);
+        translationAudioPendingTimerRef.current = null;
+      }, 12_000);
+    }
+  }, []);
 
   // 切换“朗读中文译文”。即时持久化，并对正在运行的 livetranslate 会话热更新输出模态。
   const toggleTranslationAudio = useCallback(() => {
@@ -3211,9 +3511,14 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         // 相邻句子合并进同一个气泡；只有停顿超过 LIVETRANSLATE_GROUP_MS 才真正收口。这样既
         // 不会在没说完时切句（issue 1），也能把短停顿的句子归并（issue 2），且收口的是模型
         // 已校正的整句而非半截 partial。
-        silenceTimerRef.current = setTimeout(() => {
+        // 整句边界且气泡已经很长：立即收口，不再分组（见 GROUP_MAX_CHARS 注释）。
+        if (activeNewText.length >= LIVETRANSLATE_GROUP_MAX_CHARS) {
           finalizeCurrentBlock();
-        }, LIVETRANSLATE_GROUP_MS);
+        } else {
+          silenceTimerRef.current = setTimeout(() => {
+            finalizeCurrentBlock();
+          }, LIVETRANSLATE_GROUP_MS);
+        }
       } else if (!asrProvidesTranslationRef.current && activeNewText.trim()) {
         // 两段式（Paraformer）：维持原自适应停顿阈值。一体化模型的流式 partial 不在此设定时器
         // ——已在上面清除任何待定收口，收口完全交给整句边界后的分组定时器。
@@ -3437,12 +3742,78 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     setLiveTranslateActive(false);
     setAsrStatus("idle");
     setAsrErrorReason("");
+    setTranslationAudioPending(false);
     try {
       await session.stop();
     } catch (e) {
       console.warn("Paraformer stop error:", e);
     }
-  }, []);
+  }, [setTranslationAudioPending]);
+
+  // 收音轨道意外结束（蓝牙耳机断开、系统切换输入设备、权限被收回等）。
+  // mic 模式：自动重新申请麦克风并热替换进正在运行的会话 —— WebSocket/任务不动，
+  // 转录零丢失地继续；重取失败才干净停机（页面上已转录内容保留，修好设备后可
+  // 直接重新开始收音继续录）。tab 模式：无法代替用户重新选择共享源，
+  // startTabMode 里的 onended → stopTabMode 已负责优雅收尾，这里忽略。
+  const micRecoveryRef = useRef(false);
+  const handleAudioTrackEnded = useCallback(
+    async (mode) => {
+      if (mode !== "mic" || !shouldListenRef.current || micRecoveryRef.current) return;
+      micRecoveryRef.current = true;
+      const session = paraformerSessionRef.current;
+      try {
+        pushToast({
+          level: "warn",
+          text: "麦克风输入中断（设备断开或被系统切换），正在自动恢复…",
+          ttl: 4000,
+        });
+        // 先按用户选定的设备重试；失败等 1.5s（给系统时间把默认输入切回
+        // 内置麦克风，蓝牙断开时的常见情形）后回退到系统默认设备。
+        let newTrack = await prepareEnhancedMicCapture();
+        if (!newTrack) {
+          await new Promise((r) => setTimeout(r, 1500));
+          newTrack = await prepareEnhancedMicCapture("default");
+        }
+        // 恢复期间用户手动停了 / 会话已被换掉：不再插手
+        if (!shouldListenRef.current || !session || paraformerSessionRef.current !== session) {
+          return;
+        }
+        if (newTrack && typeof session.replaceAudioTrack === "function") {
+          try {
+            await session.replaceAudioTrack(newTrack);
+            pushToast({ level: "success", text: "麦克风已自动恢复，转录继续。", ttl: 4000 });
+            return;
+          } catch (err) {
+            console.error("热替换麦克风轨道失败:", err);
+          }
+        }
+        // 恢复失败：干净停机（不自动存档清屏——内容留在页面上，用户可继续）
+        shouldListenRef.current = false;
+        setListeningMode("none");
+        setIsPaused(false);
+        isPausedRef.current = false;
+        await stopParaformerSession();
+        stopMicCaptureEnhancer();
+        if (activeEnRef.current.trim()) finalizeCurrentBlock();
+        setAsrStatus("error");
+        setAsrErrorReason("麦克风输入中断，自动恢复失败");
+        pushToast({
+          level: "error",
+          text: "麦克风输入已断开且自动恢复失败，收音已停止。已转录内容仍在页面上，检查设备后可重新开始收音继续。",
+          ttl: 9000,
+        });
+      } finally {
+        micRecoveryRef.current = false;
+      }
+    },
+    [
+      finalizeCurrentBlock,
+      prepareEnhancedMicCapture,
+      pushToast,
+      stopMicCaptureEnhancer,
+      stopParaformerSession,
+    ]
+  );
 
   // 创建并启动一个 Paraformer 会话，把它绑到 paraformerSessionRef 上。
   // tab / mic 两个入口共用，确保会话生命周期与 onUpdate 路径一致。
@@ -3473,9 +3844,11 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         if (phase === "started") {
           setAsrStatus("live");
           setAsrErrorReason("");
+          setTranslationAudioPending(false);
         }
         if (phase === "reconnecting") {
           setAsrStatus("connecting");
+          if (reason === "audio-toggle") setTranslationAudioPending(true);
           // Planned rotation / DashScope task-finished are part of the normal
           // long-session cycle. Update the pipeline pill briefly but don't pop
           // a toast — only true anomalies warrant one.
@@ -3498,6 +3871,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         const reason = err && err.message ? err.message : String(err);
         setAsrStatus("error");
         setAsrErrorReason(reason);
+        setTranslationAudioPending(false);
         pushToast({ level: "error", text: `${label}异常：${reason}`, ttl: 7000 });
       };
 
@@ -3517,6 +3891,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             onUpdate,
             onStatus,
             onError,
+            onTrackEnded: () => handleAudioTrackEnded(mode),
           })
         : new ParaformerSession({
             wsUrl: PARAFORMER_WS_URL,
@@ -3531,6 +3906,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             onUpdate,
             onStatus,
             onError,
+            onTrackEnded: () => handleAudioTrackEnded(mode),
           });
       setLiveTranslateActive(useLiveTranslate);
       paraformerSessionRef.current = session;
@@ -3545,7 +3921,13 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         throw err;
       }
     },
-    [applyTranscriptUpdate, pushToast, stopParaformerSession]
+    [
+      applyTranscriptUpdate,
+      handleAudioTrackEnded,
+      pushToast,
+      setTranslationAudioPending,
+      stopParaformerSession,
+    ]
   );
 
   const stopTabMode = useCallback(async () => {
@@ -4887,49 +5269,67 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           </div>
 
           <div className="mt-auto border-t border-white/10">
-            {!isSidebarCollapsed ? (
-              <div className="px-3 py-3 space-y-2">
-                <div className="flex items-center gap-2.5 px-1">
-                  <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-sm shrink-0 uppercase">
-                    {(user?.email || "U").charAt(0)}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm font-semibold text-slate-100 truncate" title={user?.email || ""}>
-                      {user?.email || "用户"}
-                    </p>
-                    <span
-                      className={`inline-block mt-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                        isAdmin ? "bg-amber-500/15 text-amber-300" : "bg-white/[0.06] text-slate-400"
-                      }`}
-                    >
-                      {isAdmin ? "管理员" : "已登录"}
-                    </span>
-                  </div>
+            {(() => {
+              const sidebarName =
+                (profile?.display_name || user?.user_metadata?.display_name || "").trim();
+              const avatarLetter = (sidebarName || user?.email || "U").charAt(0);
+              return !isSidebarCollapsed ? (
+                <div className="px-3 py-3 space-y-2">
+                  <button
+                    onClick={() => setProfileModalOpen(true)}
+                    className="w-full flex items-center gap-2.5 px-1.5 py-1.5 rounded-lg text-left hover:bg-white/[0.06] transition-colors group"
+                    title="查看账户资料"
+                  >
+                    <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-sm shrink-0 uppercase">
+                      {avatarLetter}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p
+                        className="text-sm font-semibold text-slate-100 truncate group-hover:text-white"
+                        title={user?.email || ""}
+                      >
+                        {sidebarName || user?.email || "用户"}
+                      </p>
+                      {sidebarName ? (
+                        <p className="text-[11px] text-slate-500 truncate">{user?.email}</p>
+                      ) : (
+                        <span
+                          className={`inline-block mt-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                            isAdmin ? "bg-amber-500/15 text-amber-300" : "bg-white/[0.06] text-slate-400"
+                          }`}
+                        >
+                          {isAdmin ? "管理员" : "已登录"}
+                        </span>
+                      )}
+                    </div>
+                    <ChevronDown className="w-3.5 h-3.5 text-slate-500 -rotate-90 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
+                  </button>
+                  <button
+                    onClick={() => signOut()}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold text-rose-300 bg-rose-500/10 border border-rose-400/20 hover:bg-rose-500/20 transition-colors"
+                  >
+                    <LogOut className="w-4 h-4" /> 退出登录
+                  </button>
                 </div>
-                <button
-                  onClick={() => signOut()}
-                  className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold text-rose-300 bg-rose-500/10 border border-rose-400/20 hover:bg-rose-500/20 transition-colors"
-                >
-                  <LogOut className="w-4 h-4" /> 退出登录
-                </button>
-              </div>
-            ) : (
-              <div className="py-3 flex flex-col items-center gap-2">
-                <div
-                  className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-sm uppercase"
-                  title={user?.email || "用户"}
-                >
-                  {(user?.email || "U").charAt(0)}
+              ) : (
+                <div className="py-3 flex flex-col items-center gap-2">
+                  <button
+                    onClick={() => setProfileModalOpen(true)}
+                    className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-sm uppercase hover:ring-2 hover:ring-indigo-300/50 transition-shadow"
+                    title={`账户资料 · ${user?.email || "用户"}`}
+                  >
+                    {avatarLetter}
+                  </button>
+                  <button
+                    onClick={() => signOut()}
+                    title="退出登录"
+                    className="p-2 rounded-lg text-rose-300 hover:bg-rose-500/15 transition-colors"
+                  >
+                    <LogOut className="w-4 h-4" />
+                  </button>
                 </div>
-                <button
-                  onClick={() => signOut()}
-                  title="退出登录"
-                  className="p-2 rounded-lg text-rose-300 hover:bg-rose-500/15 transition-colors"
-                >
-                  <LogOut className="w-4 h-4" />
-                </button>
-              </div>
-            )}
+              );
+            })()}
           </div>
         </div>
 
@@ -5017,14 +5417,6 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               <PictureInPicture className="w-4 h-4" />
             </button>
 
-            <button
-              onClick={clearTranscripts}
-              className="p-2 text-slate-500 hover:text-rose-300 hover:bg-rose-500/12 rounded-lg transition-colors border border-transparent hover:border-rose-400/30"
-              title="清空所有记录"
-            >
-              <Trash2 className="w-4 h-4" />
-            </button>
-
             {listeningMode === "none" && (
               <div className="relative" ref={folderMenuRef}>
                 <button
@@ -5107,19 +5499,32 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 {liveTranslateActive && (
                   <button
                     onClick={toggleTranslationAudio}
-                    title={playTranslationAudio ? "关闭中文译文朗读" : "朗读中文译文（实时语音）"}
+                    disabled={translationAudioPending}
+                    title={
+                      translationAudioPending
+                        ? "正在开启译文朗读（切换语音输出通道）…"
+                        : playTranslationAudio
+                        ? "关闭中文译文朗读"
+                        : "朗读中文译文（实时语音）"
+                    }
                     className={`flex items-center justify-center px-3 py-2 rounded-xl font-semibold text-sm border transition-colors ${
-                      playTranslationAudio
+                      translationAudioPending
+                        ? "bg-emerald-500/10 text-emerald-200/80 border-emerald-400/30 cursor-wait"
+                        : playTranslationAudio
                         ? "bg-emerald-500/20 text-emerald-200 border-emerald-400/40"
                         : "bg-black/30 text-slate-300 border-white/10 hover:text-slate-100"
                     }`}
                   >
-                    {playTranslationAudio ? (
+                    {translationAudioPending ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : playTranslationAudio ? (
                       <Volume2 className="w-4 h-4" />
                     ) : (
                       <VolumeX className="w-4 h-4" />
                     )}
-                    <span className="hidden lg:inline ml-1">译文朗读</span>
+                    <span className="hidden lg:inline ml-1">
+                      {translationAudioPending ? "开启中…" : "译文朗读"}
+                    </span>
                   </button>
                 )}
 
@@ -6467,6 +6872,19 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           />,
           pipMountNode
         )}
+
+      {profileModalOpen && (
+        <ProfileModal
+          user={user}
+          profile={profile}
+          isAdmin={isAdmin}
+          onClose={() => setProfileModalOpen(false)}
+          updateDisplayName={updateDisplayName}
+          updatePassword={updatePassword}
+          pushToast={pushToast}
+          signOut={signOut}
+        />
+      )}
 
       {sessionCompletionModal.open && (
         <div className="absolute inset-0 z-40 bg-black/55 backdrop-blur-sm flex items-center justify-center p-4">
