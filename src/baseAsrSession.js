@@ -62,6 +62,14 @@ const ROTATION_HARD_CEILING_MS = 3 * 60 * 1000;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_BASE_DELAY_MS = 1500;
 
+// While the uplink is down (task renewal / reconnect / initial handshake),
+// captured PCM is buffered instead of dropped and flushed into the task once
+// it's ready, so speech during the ~1-2 s gap still gets transcribed. Bounded;
+// on overflow the OLDEST frames are dropped so the retained audio stays
+// contiguous with the live stream that follows.
+const PENDING_AUDIO_MAX_MS = 15_000;
+const PENDING_AUDIO_MAX_BYTES = (TARGET_SAMPLE_RATE * 2 * PENDING_AUDIO_MAX_MS) / 1000;
+
 export const generateTaskId = () => {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID().replace(/-/g, "");
@@ -144,6 +152,12 @@ export class BaseAsrSession {
     this._reconnectAttempt = 0;
     this._isReconnecting = false;
     this._isRenewing = false;
+    // Audio uplink gate: only push PCM once the task is configured & ready
+    // (_signalReady). Sending audio before then corrupts the server input buffer.
+    this._audioReady = false;
+    // Frames captured while the gate is closed, flushed on _signalReady.
+    this._pendingAudio = [];
+    this._pendingAudioBytes = 0;
   }
 
   get _tag() {
@@ -189,6 +203,8 @@ export class BaseAsrSession {
       this._sendFinish();
     } catch (e) {}
 
+    this._pendingAudio = [];
+    this._pendingAudioBytes = 0;
     this._teardownAudio();
 
     if (this.ws) {
@@ -233,6 +249,8 @@ export class BaseAsrSession {
   // ---- ready/error/result helpers (called by protocol hook) --------------
 
   _signalReady() {
+    this._audioReady = true; // task configured & ready — open the audio uplink
+    this._flushPendingAudio(); // then replay whatever the gap buffered
     if (this._readyResolve) {
       this._readyResolve();
       this._readyResolve = null;
@@ -260,6 +278,14 @@ export class BaseAsrSession {
   // ---- internals ---------------------------------------------------------
 
   _openWebSocket() {
+    // Re-gate the audio uplink for this fresh connection: the task on the new
+    // socket is not configured yet. Pre-config audio (input_audio_buffer.append
+    // before session.update on Omni, or PCM before task-started on run-task)
+    // corrupts the server-side input buffer — the session handshakes but then
+    // returns no results. This bites hardest on renewal/reconnect, when the
+    // already-warm AudioWorklet would otherwise flood the socket the instant it
+    // opens. _signalReady() reopens the gate once the task is ready.
+    this._audioReady = false;
     return new Promise((resolve, reject) => {
       let ws;
       try {
@@ -350,12 +376,18 @@ export class BaseAsrSession {
     worklet.port.onmessage = (event) => {
       if (this.paused || this.stopped) return;
       const buf = event.data;
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try {
-          this._sendAudio(buf);
-          this._lastAudioSentAt = Date.now();
-        } catch (e) {}
+      // Hold audio until the task is ready (see _openWebSocket): pre-config
+      // audio corrupts the server input buffer, and mid-renewal there may be no
+      // socket at all. Buffer instead of dropping — _signalReady flushes it —
+      // so speech during a renewal/reconnect gap is transcribed, not lost.
+      if (!this._audioReady || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        this._bufferPendingAudio(buf);
+        return;
       }
+      try {
+        this._sendAudio(buf);
+        this._lastAudioSentAt = Date.now();
+      } catch (e) {}
     };
 
     // Silence keepalive: if AudioWorklet stops delivering frames (tab audio goes
@@ -366,6 +398,38 @@ export class BaseAsrSession {
     source.connect(worklet);
     this.sourceNode = source;
     this.workletNode = worklet;
+  }
+
+  // ---- pending-audio buffer (uplink-gap bridging) --------------------------
+
+  _bufferPendingAudio(buf) {
+    if (!buf || !buf.byteLength) return;
+    this._pendingAudio.push(buf);
+    this._pendingAudioBytes += buf.byteLength;
+    while (this._pendingAudioBytes > PENDING_AUDIO_MAX_BYTES && this._pendingAudio.length > 0) {
+      this._pendingAudioBytes -= this._pendingAudio.shift().byteLength;
+    }
+  }
+
+  _flushPendingAudio() {
+    if (this._pendingAudio.length === 0) return;
+    const frames = this._pendingAudio;
+    this._pendingAudio = [];
+    this._pendingAudioBytes = 0;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    console.log(
+      `${this._tag}: flushing ${frames.length} buffered audio frames (~${Math.round(
+        frames.reduce((n, f) => n + f.byteLength, 0) / (TARGET_SAMPLE_RATE * 2 / 1000)
+      )}ms) into the new task`
+    );
+    for (const buf of frames) {
+      try {
+        this._sendAudio(buf);
+      } catch (e) {
+        break;
+      }
+    }
+    this._lastAudioSentAt = Date.now();
   }
 
   _teardownAudio() {
@@ -589,7 +653,7 @@ export class BaseAsrSession {
   _startSilenceTimer() {
     this._clearSilenceTimer();
     this._silenceTimer = setInterval(() => {
-      if (this.stopped || this.paused || this._isRenewing) return;
+      if (this.stopped || this.paused || this._isRenewing || !this._audioReady) return;
       const elapsed = Date.now() - this._lastAudioSentAt;
       if (elapsed >= SILENCE_KEEPALIVE_INTERVAL_MS && this.ws && this.ws.readyState === WebSocket.OPEN) {
         try {

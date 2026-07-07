@@ -925,6 +925,10 @@ const normalizePolishSegments = (segments, rawEn) =>
 
 // 等多久 polish 还没出第一个 ZH delta，再启动 qwen-turbo 基线（用于质量门控对比 + 兜底）
 const POLISH_BASELINE_DELAY_MS = 2500;
+// Idle/stall timeouts (NOT total deadlines): the polish stream is aborted only
+// after this long with no new output, and the timer is re-armed on every chunk.
+// A long transcript (e.g. an 18-sentence bubble) legitimately streams for well
+// over 30s; killing it mid-output is what made long bubbles fail to polish.
 const POLISH_PRIMARY_TIMEOUT_MS = 30_000;
 const POLISH_FALLBACK_TIMEOUT_MS = 18_000;
 
@@ -982,10 +986,18 @@ const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) =>
 
     const controller = new AbortController();
     let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
+    // Idle stall timer: abort only after timeoutMs with NO bytes from upstream.
+    // Re-armed on every streamed chunk (see the read loop) so a long but
+    // steadily-progressing generation is never cut off mid-output.
+    let idleTimer = null;
+    const armIdleTimeout = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+    };
+    armIdleTimeout();
     const abortFromParent = () => controller.abort();
     if (signal) {
       if (signal.aborted) abortFromParent();
@@ -1072,6 +1084,7 @@ const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) =>
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        armIdleTimeout(); // bytes arriving — reset the idle stall timer
         sseBuffer += decoder.decode(value, { stream: true });
 
         let newlineIdx;
@@ -1084,10 +1097,10 @@ const polishWithAI = async (rawEn, { onUpdate, signal, contextHistory } = {}) =>
     } catch (error) {
       streamError =
         timedOut && !signal?.aborted
-          ? new Error(`AI polish timeout after ${Math.round(timeoutMs / 1000)}s`)
+          ? new Error(`AI polish stalled (no output for ${Math.round(timeoutMs / 1000)}s)`)
           : error;
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(idleTimer);
       if (signal) signal.removeEventListener?.("abort", abortFromParent);
       try { reader?.releaseLock(); } catch (e) {}
     }

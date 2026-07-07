@@ -61,6 +61,11 @@ export class LiveTranslateSession extends BaseAsrSession {
     this._zhPartial = "";    // in-progress translation (accumulated deltas)
     this._loggedUnknown = new Set(); // log each unrecognized event type once (debug)
     this._configSent = false; // one-shot session.update per connection
+    // Whether the CURRENT task was configured with the audio modality. The
+    // modality is fixed per task, so enabling spoken output on a text-only
+    // task needs a renewal — but a task that already speaks can be muted and
+    // un-muted locally with zero disruption (see setAudioOutput).
+    this._sessionHasAudio = false;
 
     this._player = null; // lazy AsrAudioPlayer when audioOutput is on
   }
@@ -78,18 +83,20 @@ export class LiveTranslateSession extends BaseAsrSession {
 
   _sendSessionUpdate() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const wantAudio = this.audioOutput;
     const session = {
-      modalities: this.audioOutput ? ["text", "audio"] : ["text"],
+      modalities: wantAudio ? ["text", "audio"] : ["text"],
       input_audio_format: "pcm",
       input_audio_transcription: { model: SOURCE_ASR_MODEL, language: this.sourceLang },
       translation: { language: this.target },
       turn_detection: { type: "server_vad" },
     };
-    if (this.audioOutput) session.output_audio_format = "pcm";
+    if (wantAudio) session.output_audio_format = "pcm";
     try {
       this.ws.send(
         JSON.stringify({ event_id: generateEventId(), type: "session.update", session })
       );
+      this._sessionHasAudio = wantAudio;
     } catch (e) {}
   }
 
@@ -115,23 +122,36 @@ export class LiveTranslateSession extends BaseAsrSession {
     if (this._player) this._player.reset();
   }
 
-  // Recovery renewals (watchdog / reconnect) must NOT wipe the visible transcript
-  // mid-speech. The accumulation is id-free and the new task simply appends, so
-  // keep the committed turns and only drop the in-flight partial, re-emitting the
-  // preserved cumulative text (non-empty → the App keeps its processedLength and
-  // the bubble doesn't vanish). Only the proactive 14-min rotation — which runs
-  // at a safe window with no active speech — does a full reset to bound growth.
+  // Recovery renewals (watchdog / audio-toggle / reconnect) must NOT wipe the
+  // visible transcript mid-speech. The old task can never `.completed` its
+  // in-flight turn (its socket is gone), so promote the current partials into
+  // the committed parts — the confirmed-prefix partial is the best record of
+  // that speech — and re-emit the same cumulative text. Dropping them instead
+  // could leave fullText EMPTY (nothing `.completed` yet, e.g. one long first
+  // utterance), and an empty emit is the App's session-reset signal: it wiped
+  // the whole visible bubble (the "click 译文朗读 → page goes blank" bug).
+  // The emit carries turnFinal so the App's group timer closes the bubble on
+  // the normal pause rules. Only the proactive 14-min rotation — which runs at
+  // a safe window with no active speech — does a full reset to bound growth.
   _resetTranscriptForNewTask(reason) {
-    this._enPartial = "";
-    this._zhPartial = "";
     if (this._player) this._player.reset();
     if (reason === "rotation") {
       this._enFinalParts = [];
       this._zhFinalParts = [];
+      this._enPartial = "";
+      this._zhPartial = "";
       this.onUpdate({ fullText: "", finalText: "", confidence: 0, translatedText: "", translatedFinalText: "" });
-    } else {
-      this._emit();
+      return;
     }
+    if (this._enPartial) {
+      this._enFinalParts.push(this._enPartial);
+      this._enPartial = "";
+    }
+    if (this._zhPartial) {
+      this._zhFinalParts.push(this._zhPartial);
+      this._zhPartial = "";
+    }
+    this._emit({ turnFinal: true });
   }
 
   _handleProtocolMessage(msg) {
@@ -276,20 +296,30 @@ export class LiveTranslateSession extends BaseAsrSession {
     return this._player;
   }
 
-  // Toggle spoken-translation output mid-session. The session's modality is
-  // fixed at creation (a live session.update is rejected), so switch by renewing
-  // the task — a brief reconnect that reconfigures with the new modalities.
-  // Called by the App's UI toggle.
+  // Toggle spoken-translation output mid-session. Called by the App's UI toggle.
+  // The task's modality is fixed at creation (a live session.update is rejected),
+  // but a renewal is only unavoidable in ONE direction: enabling speech on a
+  // text-only task. Muting never renews — keep the audio-capable task and just
+  // stop feeding/playing its deltas (response.audio.delta is gated on
+  // this.audioOutput) — and re-enabling on a task that already speaks resumes
+  // playback instantly. This keeps the toggle disruption-free except for the
+  // one required (and now transcript/audio-preserving) renewal.
   setAudioOutput(enabled) {
     const next = !!enabled;
     if (next === this.audioOutput) return;
     this.audioOutput = next;
-    if (next) {
-      this._ensurePlayer().enable();
-    } else if (this._player) {
-      this._player.disable();
+    if (!next) {
+      if (this._player) this._player.disable();
+      return;
     }
-    if (this.ws && !this.stopped && !this._isRenewing && !this._isReconnecting) {
+    this._ensurePlayer().enable();
+    if (
+      !this._sessionHasAudio &&
+      this.ws &&
+      !this.stopped &&
+      !this._isRenewing &&
+      !this._isReconnecting
+    ) {
       this._renewTask("audio-toggle");
     }
   }
