@@ -40,9 +40,19 @@ import {
   Clock,
   ShieldCheck,
   BadgeCheck,
+  Upload,
+  FileAudio,
 } from "lucide-react";
 import { ParaformerSession } from "./paraformerSession";
 import { LiveTranslateSession } from "./liveTranslateSession";
+import {
+  decodeAudioFileToMono16k,
+  planChunkRanges,
+  encodeWavPcm16Base64,
+  splitSentences,
+  groupSentencesIntoBubbles,
+  endsWithTerminalPunctuation,
+} from "./audioFileTranscriber";
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './AuthContext';
 import AuthPage from './pages/AuthPage';
@@ -188,6 +198,46 @@ const REALTIME_WS_BASE = PARAFORMER_WS_URL
   : "";
 const buildRealtimeWsUrl = (model) =>
   REALTIME_WS_BASE ? `${REALTIME_WS_BASE}?model=${encodeURIComponent(model)}` : "";
+
+// ============================================================================
+// 引擎 1c：音频文件切片转写（qwen3-asr-flash，经 /api/transcribe 代理）
+// ============================================================================
+// 上传的音频先在浏览器本地解码并按静音处切片（见 audioFileTranscriber.js），
+// 再逐片提交转写。与实时链路完全无关：不占用 ASR WebSocket，也不受实时
+// pacing / VAD 假设影响。
+const UPLOAD_ASR_CONCURRENCY = 3;
+const UPLOAD_POLISH_CONCURRENCY = 4;
+// 与实时路径共用同一气泡长度上限，保证润色质量与阅读体验一致。
+const UPLOAD_BUBBLE_MAX_CHARS = LIVETRANSLATE_GROUP_MAX_CHARS;
+
+const transcribeAudioChunkBase64 = async (audioBase64, { context = "", signal } = {}) => {
+  const response = await fetch("/api/transcribe", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": globalApiToken ? `Bearer ${globalApiToken}` : "",
+    },
+    body: JSON.stringify({ audio: audioBase64, format: "wav", context }),
+    signal,
+  });
+
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (e) {}
+
+  if (!response.ok || data?.error) {
+    const msg = data?.error
+      ? typeof data.error === "string"
+        ? data.error
+        : data.error?.message || JSON.stringify(data.error)
+      : `HTTP ${response.status}`;
+    const err = new Error(msg);
+    err.status = response.status;
+    throw err;
+  }
+  return String(data?.text || "").trim();
+};
 
 export const setGlobalModelName = (name) => {
   const cleanName = normalizeLegacyPolishModelName(name);
@@ -2995,6 +3045,388 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     [buildSessionPayload, cloudSaveSession, pushToast]
   );
 
+  // ===========================================================================
+  // 音频文件上传转写：本地解码切片 → /api/transcribe 逐片 ASR → AI 润色翻译
+  // → 生成纪要 → 存入当前文件夹。独立于实时录音链路（listeningMode 不变）。
+  // ===========================================================================
+  const [uploadJob, setUploadJob] = useState(null);
+  // { fileName, phase: 'decoding'|'transcribing'|'polishing'|'summary'|'saving'|'error',
+  //   asrDone/asrTotal, polishDone/polishTotal, durationSec, error, canSavePartial, preview[] }
+  const uploadJobAbortRef = useRef(null); // { aborted, controller } | null
+  const uploadPartialRef = useRef(null); // 中途失败时可保存的已完成片段
+  const uploadFileInputRef = useRef(null);
+
+  const saveUploadedTranscription = useCallback(
+    async ({ fileName, transcripts, durationSec, summary }) => {
+      const stats = getSessionStatsFromTranscripts(transcripts);
+      const folderId = currentFolderIdRef.current || null;
+      const title = `文件转写 · ${fileName}`;
+      try {
+        const saved = await cloudSaveSession({
+          title,
+          summary: summary || "",
+          durationSec: Math.round(durationSec || 0),
+          wordCount: stats.enWordCount,
+          mode: "upload",
+          transcripts,
+          folderId,
+        });
+        if (!saved) throw new Error("云端未返回保存结果");
+        setSelectedSavedSession(saved);
+        setActiveView("saved");
+        return true;
+      } catch (err) {
+        console.error("上传转写云端保存失败，已转为临时内存保存:", err);
+        const fallbackTempSession = {
+          fileName: `temp-upload-${Date.now()}`,
+          createdAt: new Date().toISOString(),
+          summary: summary || "",
+          transcripts,
+          title,
+          folderId,
+          isTemporary: true,
+        };
+        setTemporarySessions((prev) => [fallbackTempSession, ...prev]);
+        setSelectedSavedSession(fallbackTempSession);
+        setActiveView("saved");
+        pushToast({
+          level: "warn",
+          text: "云端保存失败，本次转写已临时保存在当前页面，请稍后重试导出或刷新前处理。",
+          ttl: 7000,
+        });
+        return true;
+      }
+    },
+    [cloudSaveSession, pushToast]
+  );
+
+  const cancelUploadJob = useCallback(() => {
+    const abort = uploadJobAbortRef.current;
+    if (abort) {
+      abort.aborted = true;
+      try {
+        abort.controller.abort();
+      } catch (e) {}
+    }
+    uploadPartialRef.current = null;
+    setUploadJob(null);
+    pushToast({ level: "info", text: "已取消文件转写。", ttl: 3000 });
+  }, [pushToast]);
+
+  // 任务中途失败（或用户主动停止）时，把已完成润色的片段保存成一个会话。
+  const savePartialUpload = useCallback(async () => {
+    const partial = uploadPartialRef.current;
+    if (!partial || !partial.transcripts || partial.transcripts.length === 0) return;
+    setUploadJob((prev) => (prev ? { ...prev, phase: "saving", error: "" } : prev));
+    await saveUploadedTranscription({
+      fileName: partial.fileName,
+      transcripts: partial.transcripts,
+      durationSec: partial.durationSec,
+      summary: "⚠️ 部分转写：任务未完整结束，已保存当时完成的片段。",
+    });
+    uploadPartialRef.current = null;
+    setUploadJob(null);
+    pushToast({ level: "success", text: "已保存已完成的转写片段。", ttl: 5000 });
+  }, [saveUploadedTranscription, pushToast]);
+
+  const stopAndSavePartialUpload = useCallback(async () => {
+    const abort = uploadJobAbortRef.current;
+    if (abort) {
+      abort.aborted = true;
+      try {
+        abort.controller.abort();
+      } catch (e) {}
+    }
+    await savePartialUpload();
+  }, [savePartialUpload]);
+
+  const runUploadTranscription = useCallback(
+    async (file) => {
+      if (!file) return;
+      if (listeningMode !== "none") {
+        pushToast({ level: "warn", text: "请先停止当前录音，再上传音频文件。", ttl: 4000 });
+        return;
+      }
+      if (!currentFolderIdRef.current) {
+        pushToast({ level: "warn", text: "请先在顶部选择或新建一个文件夹，再上传音频。", ttl: 4000 });
+        return;
+      }
+      if (uploadJobAbortRef.current) return; // 已有转写任务在进行
+
+      const abort = { aborted: false, controller: new AbortController() };
+      uploadJobAbortRef.current = abort;
+      uploadPartialRef.current = null;
+      // 用户主动取消（aborted=true）与内部失败中止都会 abort controller；
+      // bail() 统一用信号判断“该停了”。
+      const bail = () => abort.aborted || abort.controller.signal.aborted;
+      const patchJob = (patch) =>
+        setUploadJob((prev) =>
+          prev ? { ...prev, ...(typeof patch === "function" ? patch(prev) : patch) } : prev
+        );
+
+      const fileBaseName = String(file.name || "audio").replace(/\.[A-Za-z0-9]{1,8}$/, "");
+      setUploadJob({
+        fileName: file.name || "audio",
+        phase: "decoding",
+        asrDone: 0,
+        asrTotal: 0,
+        polishDone: 0,
+        polishTotal: 0,
+        durationSec: 0,
+        error: "",
+        canSavePartial: false,
+        preview: [],
+      });
+
+      let failedChunks = 0;
+
+      try {
+        // ---- 1) 本地解码 → 16 kHz 单声道 PCM --------------------------------
+        const decoded = await decodeAudioFileToMono16k(file);
+        if (bail()) return;
+
+        const ranges = planChunkRanges(decoded.samples, decoded.sampleRate);
+        if (ranges.length === 0) throw new Error("音频内容为空");
+        patchJob({
+          phase: "transcribing",
+          asrTotal: ranges.length,
+          durationSec: decoded.durationSec,
+        });
+
+        // 用户术语表作为识别上下文（qwen3-asr 支持 system 文本热词偏置）
+        const glossaryContext = (customGlossaryPairs || [])
+          .map((p) => String(p?.from || "").trim())
+          .filter(Boolean)
+          .slice(0, 200)
+          .join(", ");
+
+        // ---- 2) 逐片 ASR（并发 + 单片重试 + 连续失败断路）--------------------
+        const rawTexts = new Array(ranges.length).fill("");
+        let nextChunkIndex = 0;
+        let consecutiveFailures = 0;
+
+        const asrWorker = async () => {
+          while (true) {
+            if (bail()) return;
+            const i = nextChunkIndex++;
+            if (i >= ranges.length) return;
+            const base64 = encodeWavPcm16Base64(
+              decoded.samples,
+              decoded.sampleRate,
+              ranges[i].start,
+              ranges[i].end
+            );
+            let text = "";
+            let ok = false;
+            let lastErr = null;
+            for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+              try {
+                text = await transcribeAudioChunkBase64(base64, {
+                  context: glossaryContext,
+                  signal: abort.controller.signal,
+                });
+                ok = true;
+              } catch (err) {
+                lastErr = err;
+                if (bail()) return;
+                if (attempt === 0) await new Promise((r) => setTimeout(r, 2000));
+              }
+            }
+            if (ok) {
+              consecutiveFailures = 0;
+            } else {
+              failedChunks += 1;
+              consecutiveFailures += 1;
+              console.warn(`上传转写：第 ${i + 1}/${ranges.length} 段转写失败（已跳过）`, lastErr);
+              // 连续多片失败基本是系统性问题（配额 / 网络 / 服务端），直接中止
+              if (consecutiveFailures >= 3) {
+                throw new Error(`连续多段转写失败，已中止：${lastErr?.message || lastErr}`);
+              }
+            }
+            rawTexts[i] = text;
+            patchJob((prev) => ({
+              asrDone: prev.asrDone + 1,
+              preview:
+                ok && text
+                  ? [{ speaker: "", en: `…${text.slice(-260)}`, zh: "" }]
+                  : prev.preview,
+            }));
+          }
+        };
+        await Promise.all(Array.from({ length: UPLOAD_ASR_CONCURRENCY }, () => asrWorker()));
+        if (bail()) return;
+
+        // ---- 3) 组气泡：跨片携带未收尾的半句，按长度上限归组 -------------------
+        const bubbles = [];
+        let carry = "";
+        for (let i = 0; i < rawTexts.length; i++) {
+          const cleanText = applyClassroomGlossary(sanitizeRecognitionArtifacts(rawTexts[i]));
+          const combined = carry ? `${carry} ${cleanText}`.trim() : cleanText;
+          carry = "";
+          if (!combined) continue;
+          const groups = groupSentencesIntoBubbles(
+            splitSentences(combined),
+            UPLOAD_BUBBLE_MAX_CHARS
+          );
+          if (groups.length === 0) continue;
+          const isLastChunk = i === rawTexts.length - 1;
+          if (!isLastChunk && !endsWithTerminalPunctuation(groups[groups.length - 1])) {
+            carry = groups.pop() || "";
+            // 兜底：ASR 极端返回大段无句末标点文本时不无限携带，超 2 倍上限直接落袋
+            if (carry.length > UPLOAD_BUBBLE_MAX_CHARS * 2) {
+              bubbles.push(carry);
+              carry = "";
+            }
+          }
+          bubbles.push(...groups);
+        }
+        if (carry) bubbles.push(carry);
+        if (bubbles.length === 0) {
+          throw new Error("未能识别到任何语音内容（文件可能不含清晰人声）");
+        }
+        // 释放 PCM 大缓冲：后续润色/纪要阶段只用文本（长音频可省数百 MB 内存）
+        decoded.samples = null;
+
+        // ---- 4) AI 润色 + 翻译（并发池；失败降级为机翻）------------------------
+        patchJob({ phase: "polishing", polishTotal: bubbles.length, preview: [] });
+        const polishedSegments = new Array(bubbles.length).fill(null);
+        let nextBubbleIndex = 0;
+
+        const collectPartial = () => {
+          uploadPartialRef.current = {
+            fileName: fileBaseName,
+            durationSec: decoded.durationSec,
+            transcripts: polishedSegments.filter(Boolean).flat(),
+          };
+        };
+
+        const polishWorker = async () => {
+          while (true) {
+            if (bail()) return;
+            const i = nextBubbleIndex++;
+            if (i >= bubbles.length) return;
+            const rawEn = bubbles[i];
+            // 滚动上下文：取当前已完成的最近 2 个前置气泡（尽力而为）
+            const contextHistory = [];
+            for (let k = i - 1; k >= 0 && contextHistory.length < 2; k--) {
+              const segs = polishedSegments[k];
+              if (segs && segs.length) contextHistory.unshift(segs[segs.length - 1]);
+            }
+            let segments;
+            try {
+              const polished = await polishWithAI(rawEn, {
+                signal: abort.controller.signal,
+                contextHistory,
+              });
+              segments = polished.map((seg) => ({ ...seg, isPolished: true, confidence: 1 }));
+            } catch (err) {
+              if (bail()) return;
+              console.warn(
+                `上传转写：第 ${i + 1}/${bubbles.length} 段 AI 润色失败，降级为机翻`,
+                err
+              );
+              let zh = "";
+              try {
+                zh = await translateRealtimeFast(rawEn);
+              } catch (e2) {
+                zh = "（本段翻译失败，可稍后在会话详情中重新润色）";
+              }
+              if (bail()) return;
+              segments = [
+                { speaker: "👩‍🏫 主讲人", en: rawEn, zh, isPolished: false, confidence: 1 },
+              ];
+            }
+            polishedSegments[i] = segments;
+            collectPartial();
+            patchJob((prev) => ({
+              polishDone: prev.polishDone + 1,
+              preview: [...prev.preview, ...segments].slice(-3),
+              canSavePartial: true,
+            }));
+          }
+        };
+        await Promise.all(
+          Array.from({ length: UPLOAD_POLISH_CONCURRENCY }, () => polishWorker())
+        );
+        if (bail()) return;
+
+        const finalTranscripts = polishedSegments
+          .filter(Boolean)
+          .flat()
+          .filter((t) => t && (t.en || t.zh));
+        if (finalTranscripts.length === 0) throw new Error("转写结果为空");
+
+        // ---- 5) 纪要 + 保存 ---------------------------------------------------
+        patchJob({ phase: "summary" });
+        const fullText = finalTranscripts
+          .map(
+            (item) =>
+              `[${item.speaker || "主讲人"} - 英文]: ${item.en}\n[${item.speaker || "主讲人"} - 中文]: ${item.zh}`
+          )
+          .join("\n\n");
+        let summary = "";
+        try {
+          summary = await generateSummaryWithAI(fullText);
+        } catch (err) {
+          console.warn("上传转写：自动纪要生成失败，继续保存转录。", err);
+          summary = `⚠️ 自动纪要生成失败：${err.message}`;
+        }
+        if (bail()) return;
+
+        patchJob({ phase: "saving" });
+        await saveUploadedTranscription({
+          fileName: fileBaseName,
+          transcripts: finalTranscripts,
+          durationSec: decoded.durationSec,
+          summary,
+        });
+
+        uploadPartialRef.current = null;
+        setUploadJob(null);
+        pushToast({
+          level: "success",
+          text:
+            failedChunks > 0
+              ? `文件转写完成（${failedChunks} 段音频转写失败已跳过），已保存到当前文件夹。`
+              : "文件转写完成，已保存到当前文件夹。",
+          ttl: 6000,
+        });
+      } catch (err) {
+        if (abort.aborted) return; // 用户主动取消：cancelUploadJob 已清理
+        try {
+          abort.controller.abort(); // 停掉仍在飞行中的请求
+        } catch (e) {}
+        console.error("上传转写失败:", err);
+        setUploadJob((prev) =>
+          prev
+            ? {
+                ...prev,
+                phase: "error",
+                error: err?.message || String(err),
+                canSavePartial: !!(
+                  uploadPartialRef.current &&
+                  uploadPartialRef.current.transcripts &&
+                  uploadPartialRef.current.transcripts.length > 0
+                ),
+              }
+            : prev
+        );
+      } finally {
+        uploadJobAbortRef.current = null;
+      }
+    },
+    [listeningMode, customGlossaryPairs, pushToast, saveUploadedTranscription]
+  );
+
+  const handleUploadFileChosen = useCallback(
+    (event) => {
+      const file = event.target.files && event.target.files[0];
+      event.target.value = ""; // 允许重复选择同一个文件
+      if (file) runUploadTranscription(file);
+    },
+    [runUploadTranscription]
+  );
+
   const loadSavedSessionsFromFolder = useCallback(async () => {
     try {
       return await loadSessions(0);
@@ -5473,18 +5905,42 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             )}
 
             {listeningMode === "none" ? (
-              <button
-                onClick={startTabMode}
-                disabled={!currentFolderId}
-                className={`ct-btn-tab flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all ${
-                  !currentFolderId ? "opacity-50 cursor-not-allowed" : ""
-                }`}
-                title={currentFolder ? "系统音频录制（快捷键 T）：点击后在弹窗选择 Chrome 标签页 或 窗口" : "请先选择文件夹"}
-              >
-                <Headphones className="w-4 h-4" />
-                <span>系统音频</span>
-                <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-white/20 text-[10px] font-mono rounded border border-white/30">T</kbd>
-              </button>
+              <>
+                <button
+                  onClick={startTabMode}
+                  disabled={!currentFolderId}
+                  className={`ct-btn-tab flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all ${
+                    !currentFolderId ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
+                  title={currentFolder ? "系统音频录制（快捷键 T）：点击后在弹窗选择 Chrome 标签页 或 窗口" : "请先选择文件夹"}
+                >
+                  <Headphones className="w-4 h-4" />
+                  <span>系统音频</span>
+                  <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-white/20 text-[10px] font-mono rounded border border-white/30">T</kbd>
+                </button>
+                <button
+                  onClick={() => uploadFileInputRef.current && uploadFileInputRef.current.click()}
+                  disabled={!currentFolderId || !!uploadJob}
+                  className={`ct-btn-primary flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all ${
+                    !currentFolderId || uploadJob ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
+                  title={
+                    currentFolder
+                      ? "上传音频文件并转写（支持 m4a / mp3 / wav / aac 等）"
+                      : "请先选择文件夹"
+                  }
+                >
+                  <Upload className="w-4 h-4" />
+                  <span>上传音频</span>
+                </button>
+                <input
+                  ref={uploadFileInputRef}
+                  type="file"
+                  accept=".m4a,.mp3,.wav,.aac,.flac,.ogg,.opus,.mp4,.webm,audio/*"
+                  className="hidden"
+                  onChange={handleUploadFileChosen}
+                />
+              </>
             ) : (
               <div className="flex items-center space-x-2 shrink-0">
                 <div className="flex items-center justify-center px-3 py-1.5 bg-black/40 text-slate-100 rounded-lg text-sm font-mono font-bold tracking-wider border border-white/10 ml-1">
@@ -5630,6 +6086,177 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {uploadJob && (
+        <div className="fixed inset-0 z-[85] bg-black/55 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-lg ct-panel p-6 max-h-[88vh] overflow-y-auto">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-indigo-500/15 border border-indigo-400/30 flex items-center justify-center shrink-0">
+                <FileAudio className="w-5 h-5 text-indigo-300" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-base font-bold text-slate-100 tracking-tight">
+                  音频文件转写
+                </h3>
+                <p className="text-xs text-slate-400 truncate" title={uploadJob.fileName}>
+                  {uploadJob.fileName}
+                  {uploadJob.durationSec > 0 &&
+                    ` · ${Math.round(uploadJob.durationSec / 60)} 分钟`}
+                </p>
+              </div>
+            </div>
+
+            {uploadJob.phase === "error" ? (
+              <div className="mt-4 rounded-xl border border-rose-400/30 bg-rose-500/10 p-4">
+                <p className="text-sm font-semibold text-rose-200 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0" /> 转写失败
+                </p>
+                <p className="text-sm text-rose-100/90 mt-2 break-words leading-relaxed">
+                  {uploadJob.error}
+                </p>
+              </div>
+            ) : (
+              <div className="mt-4 space-y-2.5">
+                {[
+                  { key: "decoding", label: "解码音频（大文件可能需要一两分钟）" },
+                  {
+                    key: "transcribing",
+                    label: "语音识别",
+                    done: uploadJob.asrDone,
+                    total: uploadJob.asrTotal,
+                  },
+                  {
+                    key: "polishing",
+                    label: "AI 润色与翻译",
+                    done: uploadJob.polishDone,
+                    total: uploadJob.polishTotal,
+                  },
+                  { key: "summary", label: "生成课堂纪要" },
+                  { key: "saving", label: "保存到云端" },
+                ].map((step, idx, steps) => {
+                  const currentIdx = steps.findIndex((s) => s.key === uploadJob.phase);
+                  const state =
+                    idx < currentIdx ? "done" : idx === currentIdx ? "active" : "pending";
+                  const pct =
+                    step.total > 0
+                      ? Math.round((100 * (step.done || 0)) / step.total)
+                      : null;
+                  return (
+                    <div key={step.key}>
+                      <div className="flex items-center gap-2.5 text-sm">
+                        {state === "done" ? (
+                          <Check className="w-4 h-4 text-emerald-300 shrink-0" />
+                        ) : state === "active" ? (
+                          <Loader2 className="w-4 h-4 text-indigo-300 animate-spin shrink-0" />
+                        ) : (
+                          <span className="w-4 h-4 flex items-center justify-center shrink-0">
+                            <span className="w-1.5 h-1.5 rounded-full bg-slate-600" />
+                          </span>
+                        )}
+                        <span
+                          className={
+                            state === "active"
+                              ? "text-slate-100 font-medium"
+                              : state === "done"
+                              ? "text-slate-300"
+                              : "text-slate-500"
+                          }
+                        >
+                          {step.label}
+                          {step.total > 0 && (
+                            <span className="ml-1.5 font-mono text-xs opacity-80">
+                              {step.done}/{step.total}
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                      {state === "active" && pct !== null && (
+                        <div className="ml-7 mt-1.5 h-1.5 rounded-full bg-white/[0.07] overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-gradient-to-r from-indigo-400 to-purple-400 transition-all duration-500"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {uploadJob.preview && uploadJob.preview.length > 0 && uploadJob.phase !== "error" && (
+              <div className="mt-4 rounded-xl bg-black/25 border border-white/[0.07] p-3 max-h-48 overflow-y-auto space-y-2.5">
+                {uploadJob.preview.map((seg, i) => (
+                  <div key={i} className="text-xs leading-relaxed">
+                    {seg.speaker && (
+                      <div className="text-slate-400 font-semibold">{seg.speaker}</div>
+                    )}
+                    {seg.en && <div className="text-slate-300 break-words">{seg.en}</div>}
+                    {seg.zh && (
+                      <div className="text-slate-100 text-[13px] break-words mt-0.5">
+                        {seg.zh}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="mt-5 flex items-center justify-between gap-3">
+              <p className="text-[11px] text-slate-500 leading-snug flex-1">
+                {uploadJob.phase === "error"
+                  ? "可关闭窗口，或先保存已完成的片段。"
+                  : "转写在本页面进行，请保持页面打开。"}
+              </p>
+              <div className="flex items-center gap-2 shrink-0">
+                {uploadJob.phase === "error" ? (
+                  <>
+                    {uploadJob.canSavePartial && (
+                      <button
+                        onClick={savePartialUpload}
+                        className="ct-btn-primary px-3.5 py-2 rounded-xl font-semibold text-sm"
+                      >
+                        保存已完成部分
+                      </button>
+                    )}
+                    <button
+                      onClick={() => setUploadJob(null)}
+                      className="ct-btn-ghost px-3.5 py-2 rounded-xl font-semibold text-sm"
+                    >
+                      关闭
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    {uploadJob.canSavePartial &&
+                      (uploadJob.phase === "transcribing" ||
+                        uploadJob.phase === "polishing") && (
+                        <button
+                          onClick={stopAndSavePartialUpload}
+                          className="ct-btn-ghost px-3.5 py-2 rounded-xl font-semibold text-sm"
+                          title="停止转写，把目前已完成润色的片段保存为一个会话"
+                        >
+                          停止并保存
+                        </button>
+                      )}
+                    <button
+                      onClick={cancelUploadJob}
+                      disabled={uploadJob.phase === "saving"}
+                      className={`ct-btn-danger px-3.5 py-2 rounded-xl font-semibold text-sm ${
+                        uploadJob.phase === "saving"
+                          ? "opacity-50 cursor-not-allowed pointer-events-none"
+                          : ""
+                      }`}
+                    >
+                      取消
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
@@ -5868,7 +6495,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 </p>
                 <p className="text-sm text-slate-400 mt-1.5">
                   点击右上角 <strong className="text-emerald-300">【开始语音转录】</strong> 或{" "}
-                  <strong className="text-purple-300">【系统音频】</strong> 开始录音
+                  <strong className="text-purple-300">【系统音频】</strong> 开始录音，也可以{" "}
+                  <strong className="text-indigo-300">【上传音频】</strong> 转写已有的录音文件
                 </p>
               </>
             ) : (
@@ -5907,6 +6535,11 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 </li>
                 <li>
                   或者最简单的方法：直接用手机外放声音，让电脑麦克风听见即可！
+                </li>
+                <li>
+                  已有录音文件（如手机备忘录的 m4a）？点
+                  <strong className="text-indigo-300">【上传音频】</strong>
+                  直接转写整个文件，无需重新播放。
                 </li>
               </ol>
             </div>
