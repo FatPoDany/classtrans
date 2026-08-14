@@ -20,7 +20,6 @@ import {
   BookOpen,
   ChevronsLeft,
   ChevronsRight,
-  Cpu,
   Activity,
   Pencil,
   Check,
@@ -42,6 +41,8 @@ import {
   BadgeCheck,
   Upload,
   FileAudio,
+  AudioLines,
+  ArrowRight,
 } from "lucide-react";
 import { ParaformerSession } from "./paraformerSession";
 import { LiveTranslateSession } from "./liveTranslateSession";
@@ -59,7 +60,6 @@ import AuthPage from './pages/AuthPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 import { useCloudSettings } from './hooks/useCloudSettings';
 import { useGlobalSettings } from './hooks/useGlobalSettings';
-import { useCloudGlossary } from './hooks/useCloudGlossary';
 import { useCloudSessions } from './hooks/useCloudSessions';
 import { useCloudFolders } from './hooks/useCloudFolders';
 
@@ -2192,7 +2192,18 @@ const UsageView = ({ log, onClear }) => {
 export default function App() {
   const { user, loading: authLoading, signOut, session, isAdmin } = useAuth();
   
-  if (authLoading) return null; // Wait for initial auth check
+  if (authLoading) {
+    return (
+      <div className="ct-app-loading" role="status" aria-live="polite">
+        <div className="ct-brand-mark"><AudioLines /></div>
+        <div className="ct-loading-copy">
+          <strong>ClassTrans Pro</strong>
+          <span>正在准备你的工作台</span>
+        </div>
+        <Loader2 className="ct-spin" />
+      </div>
+    );
+  }
 
   return (
     <Routes>
@@ -2465,7 +2476,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   React.useEffect(() => { setGlobalApiToken(authSession?.access_token || ""); }, [authSession]);
   
-  const { settings: globalSettings, loading: globalSettingsLoading, updateSettings } = useGlobalSettings();
+  const { settings: globalSettings, updateSettings } = useGlobalSettings();
   const { aiModelName, realtimeModelName, summaryModelName, asrModelName } = globalSettings;
 
   // One-time migration: Clear old localStorage values to force sync from database
@@ -2692,7 +2703,6 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   // overrides + Tailwind utility overrides in index.css take effect.
   const { settings, updateSetting } = useCloudSettings(user.id);
   const theme = settings.theme || "dark";
-  const setTheme = (t) => updateSetting('theme', t);
   useEffect(() => {
     if (typeof document !== "undefined") {
       document.documentElement.setAttribute("data-theme", theme);
@@ -2702,9 +2712,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     } catch (e) {}
   }, [theme]);
   const toggleTheme = useCallback(() => {
-    // setTheme forwards its argument straight to updateSetting, so it is NOT a
-    // React state setter — passing a functional updater would store the
-    // function itself as the theme value. Compute the next value from `theme`.
+    // updateSetting is not a React state setter, so compute the next primitive
+    // value here instead of passing it a functional updater.
     updateSetting("theme", theme === "dark" ? "light" : "dark");
   }, [theme, updateSetting]);
   // Whole-bubble editor draft. shape: { scope, key, payload, enDraft, zhDraft }
@@ -2808,7 +2817,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
-  const fetchDevices = async () => {
+  const fetchDevices = useCallback(async () => {
     try {
       if (!navigator?.mediaDevices?.getUserMedia || !navigator?.mediaDevices?.enumerateDevices) {
         return;
@@ -2829,7 +2838,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     } catch (err) {
       console.warn("无法获取设备列表:", err);
     }
-  };
+  }, [selectedDeviceId]);
 
   // 计时器逻辑：finalizing 期间也停（按下停止后立刻冻结显示）
   useEffect(() => {
@@ -3550,7 +3559,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     };
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
+  }, [fetchDevices]);
 
   useEffect(() => {
     const handleMouseMove = (event) => {
@@ -4477,6 +4486,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     }
   }, [
     listeningMode,
+    pushToast,
     setErrorMsg,
     startParaformerForMode,
     stopMicCaptureEnhancer,
@@ -4747,17 +4757,33 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         }
         case "KeyM": {
           e.preventDefault();
+          if (h.listeningMode === "none" && !currentFolderIdRef.current) {
+            setIsDeviceMenuOpen(false);
+            setIsFolderMenuOpen(true);
+            pushToast({ level: "info", text: "请先选择归档文件夹，再开始麦克风录制", ttl: 3000 });
+            break;
+          }
           h.toggleMicMode();
           break;
         }
         case "KeyT": {
           e.preventDefault();
+          if (h.listeningMode === "none" && !currentFolderIdRef.current) {
+            setIsDeviceMenuOpen(false);
+            setIsFolderMenuOpen(true);
+            pushToast({ level: "info", text: "请先选择归档文件夹，再录制标签页音频", ttl: 3000 });
+            break;
+          }
           if (h.listeningMode === "tab") h.stopTabMode();
           else h.startTabMode();
           break;
         }
         case "Escape": {
-          if (h.listeningMode === "none") return;
+          if (h.listeningMode === "none") {
+            setIsDeviceMenuOpen(false);
+            setIsFolderMenuOpen(false);
+            return;
+          }
           e.preventDefault();
           if (h.listeningMode === "mic") h.toggleMicMode();
           else if (h.listeningMode === "tab") h.stopTabMode();
@@ -4770,7 +4796,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [pushToast]);
 
   const clearTranscripts = () => {
     setTranscripts([]);
@@ -5576,143 +5602,110 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         )
       : 0;
 
+  const navigationItems = [
+    { key: "home", label: "实时同传", hint: "开始或继续课堂", icon: Home, onSelect: () => setActiveView("home") },
+    { key: "folders", label: "课程文件夹", hint: "按课程分类整理", icon: FolderOpen, onSelect: openFoldersView },
+    { key: "saved", label: "历史课堂", hint: "搜索已保存内容", icon: BookOpen, onSelect: openSavedSessions },
+    { key: "glossary", label: "术语词典", hint: "维护专业词汇", icon: Settings, onSelect: openGlossaryModal },
+    { key: "usage", label: "AI 用量", hint: "查看模型消耗", icon: Activity, onSelect: () => setActiveView("usage") },
+    ...(isAdmin
+      ? [{ key: "admin", label: "后台管理", hint: "全局模型配置", icon: ShieldCheck, onSelect: () => setActiveView("admin"), admin: true }]
+      : []),
+  ];
+  const activeViewMeta =
+    navigationItems.find((item) => item.key === activeView) || navigationItems[0];
+  const ActiveViewIcon = activeViewMeta.icon;
+
+  const guideToFolder = (actionLabel) => {
+    setIsDeviceMenuOpen(false);
+    setIsFolderMenuOpen(true);
+    pushToast({
+      level: "info",
+      text: `请先选择归档文件夹，再${actionLabel}`,
+      ttl: 3000,
+    });
+  };
+
+  const requestMicRecording = () => {
+    if (!currentFolderId) return guideToFolder("开始麦克风录制");
+    toggleMicMode();
+  };
+
+  const requestTabRecording = () => {
+    if (!currentFolderId) return guideToFolder("录制标签页音频");
+    startTabMode();
+  };
+
+  const requestUpload = () => {
+    if (!currentFolderId) return guideToFolder("上传音频");
+    if (!uploadJob) uploadFileInputRef.current?.click();
+  };
+
   return (
-    <div className="h-screen flex font-sans relative overflow-hidden text-slate-100">
+    <div className="ct-app-shell h-screen flex font-sans relative overflow-hidden text-slate-100">
       <aside
         style={{ width: `${isSidebarCollapsed ? 72 : sidebarWidth}px` }}
         className="ct-sidebar h-full shrink-0 relative"
       >
         <div className="h-full flex flex-col">
-          <div className={`border-b border-white/10 ${isSidebarCollapsed ? "px-2 py-3" : "px-4 py-4"}`}>
+          <div className={`ct-sidebar-head ${isSidebarCollapsed ? "is-collapsed" : ""}`}>
             <div className="flex items-center justify-between gap-2">
-              {!isSidebarCollapsed && (
-                <div>
-                  <h2 className="text-lg font-bold text-slate-100 tracking-tight">ClassTrans Pro</h2>
-                  <p className="text-xs text-slate-400 mt-1">课堂控制台</p>
-                </div>
-              )}
+              <div className="ct-sidebar-brand">
+                <div className="ct-brand-mark ct-brand-mark-small"><AudioLines /></div>
+                {!isSidebarCollapsed && (
+                  <div className="ct-sidebar-expanded-only min-w-0">
+                    <h2>ClassTrans <span>Pro</span></h2>
+                    <p>AI 课堂工作台</p>
+                  </div>
+                )}
+              </div>
               <button
                 onClick={toggleSidebarCollapse}
-                className="h-8 w-8 rounded-lg border border-white/10 text-slate-400 hover:text-indigo-300 hover:border-indigo-400/40 hover:bg-indigo-500/10 flex items-center justify-center transition-colors"
+                className="ct-sidebar-collapse"
                 title={isSidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+                aria-label={isSidebarCollapsed ? "展开侧栏" : "收起侧栏"}
               >
                 {isSidebarCollapsed ? <ChevronsRight className="w-4 h-4" /> : <ChevronsLeft className="w-4 h-4" />}
               </button>
             </div>
           </div>
 
-          <div className={`space-y-2 overflow-y-auto ${isSidebarCollapsed ? "p-2" : "p-3"}`}>
-            <button
-              onClick={() => setActiveView("home")}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
-                activeView === "home"
-                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
-                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
-              }`}
-              title="首页（同传）"
-            >
-              <Home className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>首页（同传）</span>}
-            </button>
+          <div className={`ct-sidebar-nav overflow-y-auto ${isSidebarCollapsed ? "is-collapsed" : ""}`}>
+            {!isSidebarCollapsed && <div className="ct-sidebar-section ct-sidebar-expanded-only">工作空间</div>}
+            {navigationItems.slice(0, 3).map(({ key, label, hint, icon: Icon, onSelect }) => (
+              <button key={key} onClick={onSelect} className={`ct-nav-item ${activeView === key ? "is-active" : ""} ${isSidebarCollapsed ? "is-icon-only" : ""}`} title={isSidebarCollapsed ? label : hint} aria-current={activeView === key ? "page" : undefined}>
+                <span className="ct-nav-icon"><Icon /></span>
+                {!isSidebarCollapsed && <span className="ct-sidebar-expanded-only ct-nav-copy"><strong>{label}</strong><small>{hint}</small></span>}
+              </button>
+            ))}
 
-            <button
-              onClick={openFoldersView}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
-                activeView === "folders"
-                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
-                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
-              }`}
-              title="文件夹"
-            >
-              <FolderOpen className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>文件夹</span>}
-            </button>
+            {!isSidebarCollapsed && <div className="ct-sidebar-section ct-sidebar-expanded-only">工具与设置</div>}
+            {navigationItems.slice(3).map(({ key, label, hint, icon: Icon, onSelect, admin }) => (
+              <button key={key} onClick={onSelect} className={`ct-nav-item ${activeView === key ? "is-active" : ""} ${admin ? "is-admin" : ""} ${isSidebarCollapsed ? "is-icon-only" : ""}`} title={isSidebarCollapsed ? label : hint} aria-current={activeView === key ? "page" : undefined}>
+                <span className="ct-nav-icon"><Icon /></span>
+                {!isSidebarCollapsed && <span className="ct-sidebar-expanded-only ct-nav-copy"><strong>{label}</strong><small>{hint}</small></span>}
+              </button>
+            ))}
 
-            <button
-              onClick={openSavedSessions}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
-                activeView === "saved"
-                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
-                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
-              }`}
-              title="查看已保存"
-            >
-              <BookOpen className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>查看已保存</span>}
-            </button>
-
-            <button
-              onClick={openGlossaryModal}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
-                activeView === "glossary"
-                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
-                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
-              }`}
-              title="术语词典"
-            >
-              <Settings className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>术语词典</span>}
-            </button>
-
-
-            {isAdmin && (
-            <button
-              onClick={() => setActiveView("admin")}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
-                activeView === "admin"
-                  ? "bg-amber-500/15 text-amber-200 border-amber-400/30"
-                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
-              }`}
-              title="后台管理"
-            >
-              <Settings className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>后台管理</span>}
-            </button>
-            )}
-
-            <button
-              onClick={() => setActiveView("usage")}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors ${
-                activeView === "usage"
-                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
-                  : "bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100"
-              }`}
-              title="AI 用量"
-            >
-              <Activity className="w-4 h-4 shrink-0" />
-              {!isSidebarCollapsed && <span>AI 用量</span>}
-            </button>
-
-            <button
-              onClick={toggleTheme}
-              className={`w-full ${isSidebarCollapsed ? "justify-center" : "justify-start"} flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold border transition-colors bg-white/[0.03] text-slate-400 border-white/10 hover:bg-white/[0.08] hover:text-slate-100`}
-              title={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
-              aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
-            >
-              {theme === "dark" ? (
-                <Sun className="w-4 h-4 shrink-0" />
-              ) : (
-                <Moon className="w-4 h-4 shrink-0" />
-              )}
-              {!isSidebarCollapsed && (
-                <span>{theme === "dark" ? "浅色模式" : "深色模式"}</span>
-              )}
+            <button onClick={toggleTheme} className={`ct-nav-item ${isSidebarCollapsed ? "is-icon-only" : ""}`} title={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"} aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}>
+              <span className="ct-nav-icon">{theme === "dark" ? <Sun /> : <Moon />}</span>
+              {!isSidebarCollapsed && <span className="ct-sidebar-expanded-only ct-nav-copy"><strong>{theme === "dark" ? "浅色模式" : "深色模式"}</strong><small>切换界面主题</small></span>}
             </button>
           </div>
 
-          <div className="mt-auto border-t border-white/10">
+          <div className="ct-sidebar-account mt-auto">
             {(() => {
               const sidebarName =
                 (profile?.display_name || user?.user_metadata?.display_name || "").trim();
               const avatarLetter = (sidebarName || user?.email || "U").charAt(0);
               return !isSidebarCollapsed ? (
-                <div className="px-3 py-3 space-y-2">
+                <div className="ct-sidebar-expanded-only px-3 py-3 space-y-2">
                   <button
                     onClick={() => setProfileModalOpen(true)}
-                    className="w-full flex items-center gap-2.5 px-1.5 py-1.5 rounded-lg text-left hover:bg-white/[0.06] transition-colors group"
+                    className="ct-account-card group"
                     title="查看账户资料"
                   >
-                    <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-sm shrink-0 uppercase">
+                    <div className="ct-account-avatar">
                       {avatarLetter}
                     </div>
                     <div className="min-w-0 flex-1">
@@ -5738,16 +5731,16 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                   </button>
                   <button
                     onClick={() => signOut()}
-                    className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold text-rose-300 bg-rose-500/10 border border-rose-400/20 hover:bg-rose-500/20 transition-colors"
+                    className="ct-logout-button"
                   >
                     <LogOut className="w-4 h-4" /> 退出登录
                   </button>
                 </div>
               ) : (
-                <div className="py-3 flex flex-col items-center gap-2">
+                <div className="ct-sidebar-collapsed-account py-3 flex flex-col items-center gap-2">
                   <button
                     onClick={() => setProfileModalOpen(true)}
-                    className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white font-bold text-sm uppercase hover:ring-2 hover:ring-indigo-300/50 transition-shadow"
+                    className="ct-account-avatar"
                     title={`账户资料 · ${user?.email || "用户"}`}
                   >
                     {avatarLetter}
@@ -5768,286 +5761,145 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         {!isSidebarCollapsed && (
           <div
             onMouseDown={startSidebarResize}
-            className="absolute top-0 right-0 h-full w-1.5 cursor-col-resize hover:bg-indigo-400/30 transition-colors"
+            className="ct-sidebar-resizer absolute top-0 right-0 h-full w-1.5 cursor-col-resize"
             title="拖拽调整侧栏宽度"
           />
         )}
       </aside>
 
       <div className="flex-1 flex flex-col min-w-0 relative overflow-hidden">
-      <header className="ct-header sticky top-0 z-10 shrink-0">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
-          <div className="flex items-center space-x-3 w-full lg:w-auto justify-center lg:justify-start">
-            <div className="w-10 h-10 rounded-xl flex items-center justify-center relative overflow-hidden shrink-0 border border-white/10 shadow-[0_6px_20px_-6px_rgba(99,102,241,0.5)]">
-              <div className="absolute inset-0 bg-gradient-to-tr from-indigo-500 to-purple-500 z-0"></div>
-              <Globe className="w-5 h-5 text-white relative z-10" />
+      <header className="ct-header sticky top-0 z-40 shrink-0">
+        <div className="ct-topbar">
+          <div className="ct-page-context">
+            <div className="ct-page-context-icon"><ActiveViewIcon /></div>
+            <div className="ct-page-context-copy">
+              <span>WORKSPACE</span>
+              <h1>{activeViewMeta.label}</h1>
+              <p>{activeViewMeta.hint}</p>
             </div>
-            <div>
-              <h1 className="text-lg font-bold text-slate-100 leading-tight flex items-center tracking-tight">
-                ClassTrans{" "}
-                <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-300 to-purple-300 ml-1">
-                  Pro
-                </span>
-              </h1>
-              <p className="text-xs text-slate-400 font-medium">
-                同传翻译 · 智能纪要
-              </p>
+            <div className={`ct-workspace-state ${listeningMode !== "none" ? (isPaused ? "is-paused" : "is-live") : ""}`} aria-live="polite">
+              <i />
+              {listeningMode === "none" ? "准备就绪" : isPaused ? "录制已暂停" : "正在录制"}
             </div>
           </div>
 
-          <div className="w-full lg:w-auto flex items-center justify-end gap-2">
-            <div className="flex items-center flex-wrap gap-2 max-w-full pb-1 lg:pb-0 pr-1 overflow-visible">
-            <div className="relative" ref={deviceMenuRef}>
-              <button
-                onClick={() => {
-                  fetchDevices();
-                  setIsDeviceMenuOpen(!isDeviceMenuOpen);
-                }}
-                className="flex items-center space-x-1 px-3 py-1.5 bg-white/[0.06] text-slate-300 rounded-lg text-xs font-medium hover:bg-white/[0.10] transition-colors max-w-[150px] truncate border border-white/10"
-                title="选择录音设备"
-              >
-                <Settings className="w-3 h-3 shrink-0" />
-                <span className="truncate">{currentDeviceName}</span>
-                <ChevronDown className="w-3 h-3 shrink-0" />
-              </button>
+          <div className="ct-toolbar">
+            <div className="ct-toolbar-settings">
+              {(listeningMode === "none" || listeningMode === "mic") && (
+                <div className="relative" ref={deviceMenuRef}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      fetchDevices();
+                      setIsFolderMenuOpen(false);
+                      setIsDeviceMenuOpen((open) => !open);
+                    }}
+                    className={`ct-config-button ${isDeviceMenuOpen ? "is-open" : ""}`}
+                    title="选择录音设备"
+                    aria-haspopup="menu"
+                    aria-expanded={isDeviceMenuOpen}
+                  >
+                    <Mic />
+                    <span><small>输入设备</small><strong>{currentDeviceName}</strong></span>
+                    <ChevronDown className="ct-config-chevron" />
+                  </button>
 
-              {isDeviceMenuOpen && (
-                <div className="absolute top-full left-0 mt-1 w-64 ct-glass-strong rounded-xl shadow-2xl z-50 py-1 max-h-64 overflow-y-auto">
-                  {devices.length === 0 ? (
-                    <div className="px-4 py-3 text-xs text-slate-400">
-                      未检测到麦克风，请检查权限
+                  {isDeviceMenuOpen && (
+                    <div className="ct-control-menu" role="menu">
+                      <div className="ct-control-menu-title">选择输入设备</div>
+                      {devices.length === 0 ? (
+                        <div className="ct-control-menu-empty">未检测到麦克风，请检查浏览器权限</div>
+                      ) : devices.map((device) => (
+                        <button key={device.deviceId} type="button" role="menuitemradio" aria-checked={selectedDeviceId === device.deviceId} onClick={() => handleDeviceChange(device.deviceId)} className={selectedDeviceId === device.deviceId ? "is-selected" : ""}>
+                          <Mic />
+                          <span>{device.label || `麦克风 ${device.deviceId.substring(0, 5)}...`}</span>
+                          {selectedDeviceId === device.deviceId && <Check />}
+                        </button>
+                      ))}
                     </div>
-                  ) : (
-                    devices.map((device) => (
-                      <button
-                        key={device.deviceId}
-                        onClick={() => handleDeviceChange(device.deviceId)}
-                        className={`w-full text-left px-4 py-2 text-xs hover:bg-indigo-500/15 hover:text-indigo-200 transition-colors truncate ${
-                          selectedDeviceId === device.deviceId
-                            ? "bg-indigo-500/15 text-indigo-200 font-semibold"
-                            : "text-slate-300"
-                        }`}
-                      >
-                        {device.label ||
-                          `麦克风 ${device.deviceId.substring(0, 5)}...`}
-                      </button>
-                    ))
                   )}
                 </div>
               )}
-            </div>
 
-            <button
-              onClick={togglePip}
-              className={`p-2 rounded-lg transition-colors flex items-center justify-center border ${
-                pipWindow
-                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/30"
-                  : "text-slate-400 border-transparent hover:text-slate-100 hover:bg-white/[0.06] hover:border-white/10"
-              }`}
-              title={pipWindow ? "关闭悬浮气泡字幕" : "开启悬浮气泡字幕"}
-            >
-              <PictureInPicture className="w-4 h-4" />
-            </button>
+              {listeningMode === "none" && (
+                <div className="relative" ref={folderMenuRef}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsDeviceMenuOpen(false);
+                      setIsFolderMenuOpen((open) => !open);
+                    }}
+                    className={`ct-config-button ${!currentFolder ? "is-required" : ""} ${isFolderMenuOpen ? "is-open" : ""}`}
+                    title="选择本次录音的归档位置"
+                    aria-haspopup="menu"
+                    aria-expanded={isFolderMenuOpen}
+                  >
+                    <Folder />
+                    <span><small>保存至</small><strong>{currentFolder ? currentFolder.name : "请选择文件夹"}</strong></span>
+                    <ChevronDown className="ct-config-chevron" />
+                  </button>
 
-            {listeningMode === "none" && (
-              <div className="relative" ref={folderMenuRef}>
-                <button
-                  onClick={() => setIsFolderMenuOpen((o) => !o)}
-                  className={`flex items-center space-x-1 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors max-w-[170px] ${
-                    currentFolder
-                      ? "bg-white/[0.06] text-slate-200 border-white/10 hover:bg-white/[0.10]"
-                      : "bg-amber-500/12 text-amber-300 border-amber-400/30 hover:bg-amber-500/20"
-                  }`}
-                  title="选择录音要保存到的文件夹"
-                >
-                  <Folder className="w-3.5 h-3.5 shrink-0" />
-                  <span className="truncate">{currentFolder ? currentFolder.name : "选择文件夹"}</span>
-                  <ChevronDown className="w-3 h-3 shrink-0" />
-                </button>
-                {isFolderMenuOpen && (
-                  <div className="absolute top-full left-0 mt-1 w-60 ct-glass-strong rounded-xl shadow-2xl z-50 py-1 max-h-72 overflow-y-auto">
-                    {folders.length === 0 ? (
-                      <div className="px-4 py-3 text-xs text-slate-400">还没有文件夹</div>
-                    ) : (
-                      folders.map((f) => (
-                        <button
-                          key={f.id}
-                          onClick={() => {
-                            setCurrentFolderId(f.id);
-                            setIsFolderMenuOpen(false);
-                          }}
-                          className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2"
-                        >
-                          <span
-                            className="w-2.5 h-2.5 rounded-full shrink-0"
-                            style={{ background: (FOLDER_COLORS[f.color] || FOLDER_COLORS.indigo).dot }}
-                          />
-                          <span className="truncate text-slate-200 flex-1">{f.name}</span>
-                          {currentFolderId === f.id && <Check className="w-3.5 h-3.5 text-indigo-300 shrink-0" />}
+                  {isFolderMenuOpen && (
+                    <div className="ct-control-menu ct-folder-menu" role="menu">
+                      <div className="ct-control-menu-title">本次录音保存到</div>
+                      {folders.length === 0 ? (
+                        <div className="ct-control-menu-empty">还没有文件夹，请先新建一个</div>
+                      ) : folders.map((folder) => (
+                        <button key={folder.id} type="button" role="menuitemradio" aria-checked={currentFolderId === folder.id} onClick={() => { setCurrentFolderId(folder.id); setIsFolderMenuOpen(false); }} className={currentFolderId === folder.id ? "is-selected" : ""}>
+                          <span className="ct-folder-dot" style={{ background: (FOLDER_COLORS[folder.color] || FOLDER_COLORS.indigo).dot }} />
+                          <span>{folder.name}</span>
+                          {currentFolderId === folder.id && <Check />}
                         </button>
-                      ))
-                    )}
-                    <div className="border-t border-white/10 mt-1 pt-1">
-                      <button
-                        onClick={() => {
-                          setIsFolderMenuOpen(false);
-                          setOpenFolderId(null);
-                          setActiveView("folders");
-                        }}
-                        className="w-full text-left px-3 py-2 text-sm text-indigo-300 hover:bg-white/[0.06] flex items-center gap-2"
-                      >
-                        <FolderPlus className="w-4 h-4 shrink-0" /> 管理 / 新建文件夹
+                      ))}
+                      <button type="button" className="ct-control-menu-manage" onClick={() => { setIsFolderMenuOpen(false); setOpenFolderId(null); setActiveView("folders"); }}>
+                        <FolderPlus /> <span>管理或新建文件夹</span><ArrowRight />
                       </button>
                     </div>
-                  </div>
-                )}
-              </div>
-            )}
+                  )}
+                </div>
+              )}
+
+              <button type="button" onClick={togglePip} className={`ct-icon-button ${pipWindow ? "is-active" : ""}`} title={pipWindow ? "关闭悬浮字幕" : "打开悬浮字幕"} aria-label={pipWindow ? "关闭悬浮字幕" : "打开悬浮字幕"} aria-pressed={Boolean(pipWindow)}>
+                <PictureInPicture />
+              </button>
+            </div>
+
+            <div className="ct-toolbar-divider" />
 
             {listeningMode === "none" ? (
-              <>
-                <button
-                  onClick={startTabMode}
-                  disabled={!currentFolderId}
-                  className={`ct-btn-tab flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all ${
-                    !currentFolderId ? "opacity-50 cursor-not-allowed" : ""
-                  }`}
-                  title={currentFolder ? "系统音频录制（快捷键 T）：点击后在弹窗选择 Chrome 标签页 或 窗口" : "请先选择文件夹"}
-                >
-                  <Headphones className="w-4 h-4" />
-                  <span>系统音频</span>
-                  <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-white/20 text-[10px] font-mono rounded border border-white/30">T</kbd>
+              <div className="ct-start-actions">
+                <button type="button" onClick={requestTabRecording} className="ct-control-button ct-control-secondary" title="录制标签页或窗口中的系统音频（快捷键 T）">
+                  <Headphones /><span>标签页音频</span><kbd>T</kbd>
                 </button>
-                <button
-                  onClick={() => uploadFileInputRef.current && uploadFileInputRef.current.click()}
-                  disabled={!currentFolderId || !!uploadJob}
-                  className={`ct-btn-primary flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm transition-all ${
-                    !currentFolderId || uploadJob ? "opacity-50 cursor-not-allowed" : ""
-                  }`}
-                  title={
-                    currentFolder
-                      ? "上传音频文件并转写（支持 m4a / mp3 / wav / aac 等）"
-                      : "请先选择文件夹"
-                  }
-                >
-                  <Upload className="w-4 h-4" />
-                  <span>上传音频</span>
+                <button type="button" onClick={requestUpload} disabled={Boolean(uploadJob)} className="ct-control-button ct-control-upload" title="上传已有音频并自动转写">
+                  {uploadJob ? <Loader2 className="ct-spin" /> : <Upload />}<span>{uploadJob ? "处理中" : "上传音频"}</span>
                 </button>
-                <input
-                  ref={uploadFileInputRef}
-                  type="file"
-                  accept=".m4a,.mp3,.wav,.aac,.flac,.ogg,.opus,.mp4,.webm,audio/*"
-                  className="hidden"
-                  onChange={handleUploadFileChosen}
-                />
-              </>
+                <input ref={uploadFileInputRef} type="file" accept=".m4a,.mp3,.wav,.aac,.flac,.ogg,.opus,.mp4,.webm,audio/*" className="hidden" onChange={handleUploadFileChosen} />
+                <button type="button" onClick={requestMicRecording} className={`ct-control-button ct-control-primary ${!currentFolderId ? "is-guided" : ""}`} title="开始麦克风实时同传（快捷键 M）">
+                  <span className="ct-record-dot"><Mic /></span><span>麦克风录制</span><kbd>M</kbd>
+                </button>
+              </div>
             ) : (
-              <div className="flex items-center space-x-2 shrink-0">
-                <div className="flex items-center justify-center px-3 py-1.5 bg-black/40 text-slate-100 rounded-lg text-sm font-mono font-bold tracking-wider border border-white/10 ml-1">
-                  <span
-                    className={`w-2 h-2 rounded-full mr-2 ${
-                      isPaused ? "bg-amber-300" : "bg-rose-400 animate-pulse"
-                    }`}
-                  ></span>
-                  {formatTime(recordingTime)}
+              <div className="ct-recording-controls">
+                <div className={`ct-recording-clock ${isPaused ? "is-paused" : ""}`}>
+                  <span className="ct-recording-pulse" />
+                  <div><small>{listeningMode === "mic" ? "麦克风录制" : "标签页音频"}</small><strong>{formatTime(recordingTime)}</strong></div>
                 </div>
 
                 {liveTranslateActive && (
-                  <button
-                    onClick={toggleTranslationAudio}
-                    disabled={translationAudioPending}
-                    title={
-                      translationAudioPending
-                        ? "正在开启译文朗读（切换语音输出通道）…"
-                        : playTranslationAudio
-                        ? "关闭中文译文朗读"
-                        : "朗读中文译文（实时语音）"
-                    }
-                    className={`flex items-center justify-center px-3 py-2 rounded-xl font-semibold text-sm border transition-colors ${
-                      translationAudioPending
-                        ? "bg-emerald-500/10 text-emerald-200/80 border-emerald-400/30 cursor-wait"
-                        : playTranslationAudio
-                        ? "bg-emerald-500/20 text-emerald-200 border-emerald-400/40"
-                        : "bg-black/30 text-slate-300 border-white/10 hover:text-slate-100"
-                    }`}
-                  >
-                    {translationAudioPending ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : playTranslationAudio ? (
-                      <Volume2 className="w-4 h-4" />
-                    ) : (
-                      <VolumeX className="w-4 h-4" />
-                    )}
-                    <span className="hidden lg:inline ml-1">
-                      {translationAudioPending ? "开启中…" : "译文朗读"}
-                    </span>
+                  <button type="button" onClick={toggleTranslationAudio} disabled={translationAudioPending} title={translationAudioPending ? "正在切换语音输出通道…" : playTranslationAudio ? "关闭中文译文朗读" : "朗读中文译文"} className={`ct-icon-button ct-audio-button ${playTranslationAudio ? "is-active" : ""}`} aria-pressed={playTranslationAudio}>
+                    {translationAudioPending ? <Loader2 className="ct-spin" /> : playTranslationAudio ? <Volume2 /> : <VolumeX />}
                   </button>
                 )}
 
-                {isPaused ? (
-                  <button
-                    onClick={togglePause}
-                    disabled={isFinalizingSession}
-                    title={isFinalizingSession ? "正在收尾，请稍候" : "继续收音（Space）"}
-                    className={`ct-btn-success flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm ${
-                      isFinalizingSession ? "opacity-50 cursor-not-allowed pointer-events-none" : ""
-                    }`}
-                  >
-                    <Play className="w-4 h-4 fill-current" />
-                    <span className="hidden sm:inline">继续收音</span>
-                    <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-white/20 text-[10px] font-mono rounded border border-white/30">Space</kbd>
-                  </button>
-                ) : (
-                  <button
-                    onClick={togglePause}
-                    disabled={isFinalizingSession}
-                    title={isFinalizingSession ? "正在收尾，请稍候" : "暂时挂起（Space）"}
-                    className={`ct-btn-warn flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm ${
-                      isFinalizingSession ? "opacity-50 cursor-not-allowed pointer-events-none" : ""
-                    }`}
-                  >
-                    <Pause className="w-4 h-4 fill-current" />
-                    <span className="hidden sm:inline">暂时挂起</span>
-                    <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-amber-300/15 text-[10px] font-mono rounded border border-amber-300/40">Space</kbd>
-                  </button>
-                )}
-
-                <button
-                  onClick={listeningMode === "mic" ? toggleMicMode : stopTabMode}
-                  disabled={isFinalizingSession}
-                  title={isFinalizingSession ? "正在收尾，请稍候" : "彻底停止（Esc）"}
-                  className={`ct-btn-danger flex items-center space-x-1 px-4 py-2 rounded-xl font-semibold text-sm ${
-                    isFinalizingSession ? "opacity-50 cursor-not-allowed pointer-events-none" : ""
-                  }`}
-                >
-                  <Square className="w-4 h-4 fill-current" />
-                  <span className="hidden sm:inline">
-                    {isFinalizingSession ? "收尾中…" : "彻底停止"}
-                  </span>
-                  {!isFinalizingSession && (
-                    <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-rose-300/15 text-[10px] font-mono rounded border border-rose-300/40">Esc</kbd>
-                  )}
+                <button type="button" onClick={togglePause} disabled={isFinalizingSession} className={`ct-control-button ${isPaused ? "ct-control-resume" : "ct-control-pause"}`} title={isFinalizingSession ? "正在完成课堂纪要" : isPaused ? "继续收音（Space）" : "暂停收音（Space）"}>
+                  {isPaused ? <Play /> : <Pause />}<span>{isPaused ? "继续" : "暂停"}</span><kbd>Space</kbd>
+                </button>
+                <button type="button" onClick={listeningMode === "mic" ? toggleMicMode : stopTabMode} disabled={isFinalizingSession} className="ct-control-button ct-control-stop" title={isFinalizingSession ? "正在完成课堂纪要" : "停止录制、保存并生成纪要（Esc）"}>
+                  {isFinalizingSession ? <Loader2 className="ct-spin" /> : <Square />}<span>{isFinalizingSession ? "正在收尾" : "停止并保存"}</span><kbd>Esc</kbd>
                 </button>
               </div>
             )}
-            </div>
-
-            <div className="shrink-0">
-              {listeningMode === "none" ? (
-                <button
-                  onClick={toggleMicMode}
-                  disabled={!currentFolderId}
-                  className={`ct-btn-success flex items-center space-x-2 px-4 py-2 rounded-xl font-semibold text-sm ${
-                    !currentFolderId ? "opacity-50 cursor-not-allowed" : ""
-                  }`}
-                  title={currentFolder ? "开始语音转录（快捷键 M）。设备从左侧下拉菜单选择。" : "请先选择文件夹"}
-                >
-                  <Play className="w-4 h-4" />
-                  <span>开始语音转录</span>
-                  <kbd className="hidden md:inline-block ml-1 px-1.5 py-0.5 bg-white/20 text-[10px] font-mono rounded border border-white/30">M</kbd>
-                </button>
-              ) : null}
-            </div>
           </div>
         </div>
       </header>
@@ -6476,73 +6328,35 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         {activeView === "home" && (
           <>
         {transcripts.length === 0 && !activeEn && listeningMode === "none" && (
-          <div className="flex-1 flex flex-col items-center justify-center mt-10 md:mt-20">
-            <div className="relative">
-              <div className="absolute inset-0 rounded-full bg-indigo-500/20 blur-2xl"></div>
-              <Mic className="w-16 h-16 mb-4 stroke-[1.5] text-indigo-300 relative" />
+          <div className="ct-empty-state">
+            <div className="ct-empty-visual">
+              <div className="ct-empty-rings" />
+              <div className="ct-empty-mic"><Mic /></div>
+              <span className="ct-empty-wave is-one" />
+              <span className="ct-empty-wave is-two" />
             </div>
-            {currentFolder ? (
-              <>
-                <p className="text-lg text-slate-200 font-medium tracking-wide mt-2">
-                  当前文件夹：
-                  <span className="inline-flex items-center gap-1.5 ml-1 align-middle">
-                    <span
-                      className="w-2.5 h-2.5 rounded-full"
-                      style={{ background: (FOLDER_COLORS[currentFolder.color] || FOLDER_COLORS.indigo).dot }}
-                    />
-                    <strong className="text-indigo-200">{currentFolder.name}</strong>
-                  </span>
-                </p>
-                <p className="text-sm text-slate-400 mt-1.5">
-                  点击右上角 <strong className="text-emerald-300">【开始语音转录】</strong> 或{" "}
-                  <strong className="text-purple-300">【系统音频】</strong> 开始录音，也可以{" "}
-                  <strong className="text-indigo-300">【上传音频】</strong> 转写已有的录音文件
-                </p>
-              </>
+
+            <div className="ct-empty-kicker">YOUR NEXT CLASS</div>
+            <h2>{currentFolder ? '准备好记录下一堂课了吗？' : '从选择一个课程文件夹开始'}</h2>
+            <p>
+              {currentFolder
+                ? <>内容将自动归档到 <strong><span className="ct-folder-dot" style={{ background: (FOLDER_COLORS[currentFolder.color] || FOLDER_COLORS.indigo).dot }} />{currentFolder.name}</strong>，停止后自动生成课堂纪要。</>
+                : '录音、译文与 AI 纪要会按文件夹自动归档，之后查找更轻松。'}
+            </p>
+
+            {!currentFolder ? (
+              <button type="button" onClick={() => { setOpenFolderId(null); setActiveView("folders"); }} className="ct-empty-primary">
+                <FolderPlus /> 选择或新建文件夹 <ArrowRight />
+              </button>
             ) : (
-              <>
-                <p className="text-lg text-slate-200 font-medium tracking-wide mt-2">
-                  先选择一个<strong className="text-indigo-200">文件夹</strong>，再开始录音
-                </p>
-                <button
-                  onClick={() => {
-                    setOpenFolderId(null);
-                    setActiveView("folders");
-                  }}
-                  className="mt-4 inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-indigo-500 hover:bg-indigo-400 text-white font-semibold text-sm transition-colors"
-                >
-                  <FolderPlus className="w-4 h-4" /> 选择 / 新建文件夹
-                </button>
-              </>
+              <div className="ct-empty-actions">
+                <button type="button" onClick={requestMicRecording}><span><Mic /></span><strong>麦克风录制</strong><small>线下课堂或会议</small></button>
+                <button type="button" onClick={requestTabRecording}><span><Headphones /></span><strong>标签页音频</strong><small>网课与在线视频</small></button>
+                <button type="button" onClick={requestUpload}><span><Upload /></span><strong>上传音频</strong><small>处理已有录音</small></button>
+              </div>
             )}
-            <div className="ct-card text-sm mt-6 text-left max-w-md p-5 leading-relaxed text-slate-300">
-              <div className="text-slate-100 font-semibold mb-2">💡 如何转录网课视频？</div>
-              <ol className="list-decimal pl-5 space-y-1.5">
-                <li>
-                  先在顶部<strong className="text-indigo-300">选择文件夹</strong>，录音会自动归档到该文件夹并保存到云端。
-                </li>
-                <li>
-                  推荐点
-                  <strong className="text-purple-300">【系统音频】</strong>，在弹窗中选择
-                  <strong className="text-purple-300">【Chrome 标签页】</strong>或
-                  <strong className="text-purple-300">【窗口】</strong>并勾选
-                  <strong className="text-purple-300">【共享音频】</strong>。
-                </li>
-                <li>
-                  左侧下拉框选择
-                  <strong className="text-indigo-300">【立体声混音 / Stereo Mix】</strong>
-                  或使用虚拟声卡（如 VB-Cable）。
-                </li>
-                <li>
-                  或者最简单的方法：直接用手机外放声音，让电脑麦克风听见即可！
-                </li>
-                <li>
-                  已有录音文件（如手机备忘录的 m4a）？点
-                  <strong className="text-indigo-300">【上传音频】</strong>
-                  直接转写整个文件，无需重新播放。
-                </li>
-              </ol>
-            </div>
+
+            <div className="ct-empty-tip"><Sparkles /><span><strong>小提示</strong> 录制网课时请选择“标签页音频”，并在浏览器弹窗中勾选共享音频。</span></div>
           </div>
         )}
 
@@ -7564,10 +7378,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         </div>
       )}
 
-      <footer className="text-center py-4 text-xs text-slate-500 flex flex-wrap items-center justify-center gap-2 shrink-0 border-t border-white/10 bg-black/20 backdrop-blur-sm">
-        <span>Dual Mode Translation Engine</span>
-        <span className="hidden sm:inline w-1 h-1 rounded-full bg-slate-600"></span>
-        <span>Aliyun DashScope & Paraformer Realtime</span>
+      <footer className="ct-app-footer">
+        <span><ShieldCheck /> 云端安全同步</span>
+        <i />
+        <span>AI 同传与智能纪要已就绪</span>
       </footer>
       </div>
     </div>
