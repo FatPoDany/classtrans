@@ -1,9 +1,10 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { supabase } from '../supabaseClient';
 
 // Palette keys shared with the UI (App.js FOLDER_COLORS). Stored as a key so the
 // theme controls the actual color values.
 export const DEFAULT_FOLDER_COLOR = 'indigo';
+const FOLDER_CACHE_TTL_MS = 30_000;
 
 const normalizeFolder = (row) => ({
   id: row?.id,
@@ -21,23 +22,50 @@ const supabaseErrorText = (error) => {
 export function useCloudFolders(userId) {
   const [folders, setFolders] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [initialized, setInitialized] = useState(false);
+  const foldersRef = useRef([]);
+  const requestRef = useRef(null);
+  const lastLoadedAtRef = useRef(0);
 
-  const loadFolders = useCallback(async () => {
+  useEffect(() => {
+    foldersRef.current = folders;
+  }, [folders]);
+
+  const loadFolders = useCallback(async ({ force = false } = {}) => {
     if (!userId) return [];
-    setLoading(true);
-    const { data, error } = await supabase
-      .from('folders')
-      .select('id, name, color, created_at')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: true });
-    setLoading(false);
-    if (error) {
-      console.error('Failed to load folders:', error);
-      return [];
+    const cacheIsFresh = Date.now() - lastLoadedAtRef.current < FOLDER_CACHE_TTL_MS;
+    if (!force && cacheIsFresh) return foldersRef.current;
+    if (requestRef.current) return requestRef.current;
+
+    const request = (async () => {
+      setLoading(true);
+      try {
+        const { data, error } = await supabase
+          .from('folders')
+          .select('id, name, color, created_at')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: true });
+        if (error) {
+          console.error('Failed to load folders:', error);
+          return [];
+        }
+        const normalized = (data || []).map(normalizeFolder);
+        foldersRef.current = normalized;
+        setFolders(normalized);
+        lastLoadedAtRef.current = Date.now();
+        return normalized;
+      } finally {
+        setLoading(false);
+        setInitialized(true);
+      }
+    })();
+
+    requestRef.current = request;
+    try {
+      return await request;
+    } finally {
+      if (requestRef.current === request) requestRef.current = null;
     }
-    const normalized = (data || []).map(normalizeFolder);
-    setFolders(normalized);
-    return normalized;
   }, [userId]);
 
   const createFolder = useCallback(
@@ -86,5 +114,5 @@ export function useCloudFolders(userId) {
     return { error };
   }, []);
 
-  return { folders, loading, loadFolders, createFolder, updateFolder, deleteFolder };
+  return { folders, loading, initialized, loadFolders, createFolder, updateFolder, deleteFolder };
 }

@@ -2658,6 +2658,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const {
     sessions: cloudSessions,
+    loading: cloudSessionsLoading,
+    initialized: cloudSessionsInitialized,
     loadSessions,
     getSession: cloudGetSession,
     saveSession: cloudSaveSession,
@@ -2670,11 +2672,14 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
   const savedSessions = cloudSessions;
   const [temporarySessions, setTemporarySessions] = useState([]);
   const [selectedSavedSession, setSelectedSavedSession] = useState(null);
+  const [loadingSavedSessionId, setLoadingSavedSessionId] = useState(null);
   const [savedSessionsQuery, setSavedSessionsQuery] = useState("");
 
   // ---- Cloud folders (organize recordings) --------------------------------
   const {
     folders,
+    loading: cloudFoldersLoading,
+    initialized: cloudFoldersInitialized,
     loadFolders,
     createFolder: cloudCreateFolder,
     updateFolder: cloudUpdateFolder,
@@ -3436,9 +3441,9 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     [runUploadTranscription]
   );
 
-  const loadSavedSessionsFromFolder = useCallback(async () => {
+  const loadSavedSessionsFromFolder = useCallback(async ({ force = false } = {}) => {
     try {
-      return await loadSessions(0);
+      return await loadSessions(0, { force });
     } catch (err) {
       console.error("加载云端会话失败:", err);
       setErrorMsg("读取云端历史会话失败，请稍后重试。");
@@ -3446,11 +3451,13 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     }
   }, [loadSessions, setErrorMsg]);
 
-  const openFoldersView = useCallback(async () => {
+  const openFoldersView = useCallback(() => {
     setOpenFolderId(null);
-    await Promise.all([loadFolders(), loadSavedSessionsFromFolder()]);
     setActiveView("folders");
-    return true;
+    // 缓存内容立即可见；过期数据在后台静默刷新，不阻塞页面切换。
+    Promise.all([loadFolders(), loadSavedSessionsFromFolder()]).catch((err) => {
+      console.error("后台刷新文件夹视图失败:", err);
+    });
   }, [loadFolders, loadSavedSessionsFromFolder]);
 
   const handleCreateFolder = async () => {
@@ -3493,7 +3500,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     if (openFolderId === folder.id) setOpenFolderId(null);
     // Sessions whose folder was deleted are now 未归档 (DB ON DELETE SET NULL);
     // refresh so the local list reflects that.
-    await loadSavedSessionsFromFolder();
+    await loadSavedSessionsFromFolder({ force: true });
     pushToast({ level: "success", text: "文件夹已删除", ttl: 2500 });
   };
 
@@ -4891,34 +4898,85 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     });
   };
 
-  const openSavedSessions = async () => {
-    setOpenFolderId(null);
-    const loaded = await loadSavedSessionsFromFolder();
-    setSelectedSavedSession((prev) => {
-      if (prev) {
-        return loaded.find((session) => session.fileName === prev.fileName) || prev;
-      }
-      return loaded[0] || allSavedSessions[0] || null;
-    });
-    setActiveView("saved");
-  };
-
   const selectSavedSession = useCallback(
     async (session) => {
       if (!session) return;
       setSelectedSavedSession(session);
-      if (session.isTemporary || !session.id) return;
+      if (session.isTemporary || !session.id || session.transcriptsLoaded) return;
 
+      setLoadingSavedSessionId(session.id);
       try {
         const fullSession = await cloudGetSession(session.id);
-        if (fullSession) setSelectedSavedSession(fullSession);
+        if (fullSession) {
+          setSelectedSavedSession((current) =>
+            current?.id === fullSession.id ? fullSession : current
+          );
+        }
       } catch (err) {
         console.error("加载云端会话详情失败:", err);
         pushToast({ level: "error", text: "加载会话详情失败，请重试", ttl: 5000 });
+      } finally {
+        setLoadingSavedSessionId((currentId) =>
+          currentId === session.id ? null : currentId
+        );
       }
     },
     [cloudGetSession, pushToast]
   );
+
+  const mergeSelectedSessionMetadata = useCallback((loaded) => {
+    setSelectedSavedSession((current) => {
+      if (!current) return loaded[0] || null;
+      const refreshed = loaded.find((session) => session.id === current.id);
+      if (!refreshed) return current;
+      return current.transcriptsLoaded
+        ? { ...refreshed, transcripts: current.transcripts, transcriptsLoaded: true }
+        : refreshed;
+    });
+  }, []);
+
+  const openSavedSessions = useCallback(() => {
+    setOpenFolderId(null);
+    setActiveView("saved");
+
+    const cachedFirst = [...savedSessions, ...temporarySessions].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )[0];
+    const cachedSelection = selectedSavedSession || cachedFirst || null;
+    if (cachedSelection) selectSavedSession(cachedSelection);
+
+    // 立即展示缓存；列表过期时只在后台刷新概要。首次加载结束后再懒加载首条详情。
+    loadSavedSessionsFromFolder().then((loaded) => {
+      const safeLoaded = Array.isArray(loaded) ? loaded : [];
+      mergeSelectedSessionMetadata(safeLoaded);
+      if (!cachedSelection && safeLoaded[0]) selectSavedSession(safeLoaded[0]);
+    });
+  }, [loadSavedSessionsFromFolder, mergeSelectedSessionMetadata, savedSessions, selectSavedSession, selectedSavedSession, temporarySessions]);
+
+  const refreshSavedSessions = useCallback(async () => {
+    const loaded = await loadSavedSessionsFromFolder({ force: true });
+    const safeLoaded = Array.isArray(loaded) ? loaded : [];
+    mergeSelectedSessionMetadata(safeLoaded);
+  }, [loadSavedSessionsFromFolder, mergeSelectedSessionMetadata]);
+
+  const openSavedFolder = useCallback((folderId) => {
+    setOpenFolderId(folderId);
+    setActiveView("saved");
+    const matchesFolder = (session) =>
+      folderId === "__unfiled__" ? !session.folderId : session.folderId === folderId;
+    const cachedFirst = [...savedSessions, ...temporarySessions]
+      .filter(matchesFolder)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+
+    if (cachedFirst) selectSavedSession(cachedFirst);
+    else setSelectedSavedSession(null);
+
+    loadSavedSessionsFromFolder().then((loaded) => {
+      if (cachedFirst) return;
+      const first = (Array.isArray(loaded) ? loaded : []).find(matchesFolder);
+      if (first) selectSavedSession(first);
+    });
+  }, [loadSavedSessionsFromFolder, savedSessions, selectSavedSession, temporarySessions]);
 
   const formatSessionToHtml = useCallback((session) => {
     const summaryMarkdownHtml = renderMarkdownToSafeHtml(session?.summary || "（该会话未保存纪要）");
@@ -6598,10 +6656,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
                 <h3 className="font-bold text-slate-100 text-sm">已保存会话</h3>
                 <button
-                  onClick={openSavedSessions}
-                  className="text-xs px-2.5 py-1 rounded-md border border-white/10 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
+                  onClick={refreshSavedSessions}
+                  disabled={cloudSessionsLoading}
+                  className="text-xs px-2.5 py-1 rounded-md border border-white/10 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100 disabled:opacity-50 flex items-center gap-1.5"
                 >
-                  刷新
+                  {cloudSessionsLoading && <Loader2 className="w-3 h-3 animate-spin" />}
+                  {cloudSessionsLoading ? "刷新中" : "刷新"}
                 </button>
               </div>
               <div className="px-3 py-2 border-b border-white/10">
@@ -6630,7 +6690,13 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 </div>
               )}
               <div className="overflow-y-auto flex-1">
-                {filteredSavedSessions.length === 0 ? (
+                {cloudSessionsLoading && !cloudSessionsInitialized && allSavedSessions.length === 0 ? (
+                  <div className="ct-session-list-skeleton" aria-label="正在加载历史课堂">
+                    {[0, 1, 2, 3, 4].map((item) => (
+                      <div key={item}><i /><span /></div>
+                    ))}
+                  </div>
+                ) : filteredSavedSessions.length === 0 ? (
                   <p className="text-xs text-slate-400 px-4 py-5">
                     {allSavedSessions.length === 0
                       ? "暂无已保存会话。"
@@ -6725,7 +6791,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 {selectedSavedSession && (
                   <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
                     <p className="text-xs text-slate-400">
-                      {new Date(selectedSavedSession.createdAt).toLocaleString()} · {selectedSavedSession.transcripts.length} 条转录
+                      {new Date(selectedSavedSession.createdAt).toLocaleString()} · {loadingSavedSessionId === selectedSavedSession.id ? "正在加载转录…" : `${selectedSavedSession.transcripts.length} 条转录`}
                     </p>
                     <div className="flex items-center gap-2">
                       {!selectedSavedSession.isTemporary && (
@@ -6756,9 +6822,9 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                       )}
                       <button
                         onClick={() => handleRegenerateSummary(selectedSavedSession)}
-                        disabled={isRegeneratingSummary}
+                        disabled={isRegeneratingSummary || loadingSavedSessionId === selectedSavedSession.id}
                         className={`ct-btn-primary text-xs px-3 py-1.5 rounded-md font-semibold flex items-center gap-1.5 ${
-                          isRegeneratingSummary ? "opacity-60 cursor-not-allowed pointer-events-none" : ""
+                          isRegeneratingSummary || loadingSavedSessionId === selectedSavedSession.id ? "opacity-60 cursor-not-allowed pointer-events-none" : ""
                         }`}
                         title="基于当前转录内容重新生成课堂纪要并保存到云端"
                       >
@@ -6776,13 +6842,15 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                       </button>
                       <button
                         onClick={() => exportSavedSessionToWord(selectedSavedSession)}
-                        className="ct-btn-ghost text-xs px-3 py-1.5 rounded-md font-semibold"
+                        disabled={loadingSavedSessionId === selectedSavedSession.id}
+                        className="ct-btn-ghost text-xs px-3 py-1.5 rounded-md font-semibold disabled:opacity-50"
                       >
                         导出 Word
                       </button>
                       <button
                         onClick={() => exportSavedSessionToPdf(selectedSavedSession)}
-                        className="ct-btn-ghost text-xs px-3 py-1.5 rounded-md font-semibold"
+                        disabled={loadingSavedSessionId === selectedSavedSession.id}
+                        className="ct-btn-ghost text-xs px-3 py-1.5 rounded-md font-semibold disabled:opacity-50"
                       >
                         导出 PDF
                       </button>
@@ -6800,6 +6868,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               <div className="flex-1 overflow-y-auto p-6 space-y-5">
                 {!selectedSavedSession ? (
                   <div className="text-sm text-slate-400">选择一条会话后，这里会展示转录内容与课堂纪要。</div>
+                ) : loadingSavedSessionId === selectedSavedSession.id ? (
+                  <div className="ct-session-detail-skeleton" role="status" aria-live="polite">
+                    <div className="ct-detail-loading-title"><Loader2 className="animate-spin" /> 正在加载课堂详情</div>
+                    <div className="ct-detail-skeleton-card"><i /><span /><span /><span /></div>
+                    <div className="ct-detail-skeleton-card is-short"><i /><span /><span /></div>
+                  </div>
                 ) : (
                   <>
                     <div className="rounded-2xl border border-indigo-400/20 bg-indigo-500/[0.06] p-5">
@@ -7009,11 +7083,12 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
 
             {/* Folder grid */}
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+              {cloudFoldersLoading && !cloudFoldersInitialized && folders.length === 0 ? (
+                [0, 1, 2, 3].map((item) => <div key={item} className="ct-folder-skeleton" />)
+              ) : (
+                <>
               <button
-                onClick={() => {
-                  setOpenFolderId("__unfiled__");
-                  setActiveView("saved");
-                }}
+                onClick={() => openSavedFolder("__unfiled__")}
                 className="group text-left focus:outline-none"
               >
                 <div className="relative h-28 rounded-2xl bg-gradient-to-br from-slate-500 to-slate-600 shadow-lg group-hover:-translate-y-0.5 transition-transform overflow-hidden">
@@ -7075,10 +7150,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 ) : (
                   <div key={f.id} className="group relative">
                     <button
-                      onClick={() => {
-                        setOpenFolderId(f.id);
-                        setActiveView("saved");
-                      }}
+                      onClick={() => openSavedFolder(f.id)}
                       className="w-full text-left focus:outline-none"
                     >
                       <div
@@ -7114,6 +7186,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                   </div>
                 )
               )}
+                </>
+              )}
             </div>
 
             {/* Recent recordings */}
@@ -7131,7 +7205,11 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                 </button>
               </div>
               <div className="mt-3 space-y-2">
-                {savedSessions.length === 0 ? (
+                {cloudSessionsLoading && !cloudSessionsInitialized && savedSessions.length === 0 ? (
+                  <div className="ct-recent-skeleton">
+                    {[0, 1, 2].map((item) => <div key={item}><i /><span /></div>)}
+                  </div>
+                ) : savedSessions.length === 0 ? (
                   <p className="text-sm text-slate-400 py-8 text-center">
                     还没有录音。选择一个文件夹后，开始你的第一次同传。
                   </p>
@@ -7153,7 +7231,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                         <div className="min-w-0">
                           <p className="text-sm font-semibold text-slate-100 truncate">{s.title}</p>
                           <p className="text-xs text-slate-400 mt-0.5">
-                            EN → ZH · {(s.transcripts || []).length} 句 ·{" "}
+                            EN → ZH · {s.wordCount > 0 ? `${s.wordCount} 词` : "已保存"} ·{" "}
                             {new Date(s.createdAt).toLocaleDateString()}
                           </p>
                         </div>

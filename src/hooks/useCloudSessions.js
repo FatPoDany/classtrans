@@ -1,7 +1,8 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { supabase } from '../supabaseClient';
 
 const PAGE_SIZE = 20;
+const LIST_CACHE_TTL_MS = 30_000;
 
 // Build a human-readable string from a Supabase/PostgREST error so failures
 // (e.g. missing table GRANTs / RLS policies) are visible instead of silent.
@@ -21,7 +22,8 @@ const normalizeTranscript = (row, fallbackIndex = 0) => ({
 });
 
 const normalizeSession = (row) => {
-  const transcripts = Array.isArray(row?.transcripts)
+  const hasTranscriptPayload = Array.isArray(row?.transcripts);
+  const transcripts = hasTranscriptPayload
     ? [...row.transcripts].sort(
         (a, b) => Number(a?.sort_order || 0) - Number(b?.sort_order || 0)
       )
@@ -40,6 +42,7 @@ const normalizeSession = (row) => {
     folderId: row?.folder_id || null,
     isTemporary: false,
     transcripts: transcripts.map(normalizeTranscript),
+    transcriptsLoaded: row?.transcriptsLoaded === true || hasTranscriptPayload,
   };
 };
 
@@ -58,62 +61,74 @@ export function useCloudSessions(userId) {
   const [sessions, setSessions] = useState([]);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
+  const [initialized, setInitialized] = useState(false);
+  const sessionsRef = useRef([]);
+  const listRequestRef = useRef(null);
+  const detailRequestsRef = useRef(new Map());
+  const lastLoadedAtRef = useRef(0);
 
-  // Load sessions (paginated)
-  const loadSessions = useCallback(async (offset = 0) => {
-    if (!userId) return;
-    setLoading(true);
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
-    const { data, error } = await supabase
-      .from('sessions')
-      .select('id, title, summary, duration_sec, word_count, mode, folder_id, created_at, updated_at')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .range(offset, offset + PAGE_SIZE - 1);
+  // 列表只读取会话概要；完整转录在 getSession 中按需加载。短时间内复用缓存，
+  // 并合并已加载过的详情，避免后台刷新把本地详情清空。
+  const loadSessions = useCallback(async (offset = 0, { force = false } = {}) => {
+    if (!userId) return [];
+    const isFirstPage = offset === 0;
+    const cacheIsFresh = Date.now() - lastLoadedAtRef.current < LIST_CACHE_TTL_MS;
+    if (isFirstPage && !force && cacheIsFresh) return sessionsRef.current;
+    if (isFirstPage && listRequestRef.current) return listRequestRef.current;
 
-    if (!error) {
-      const sessionRows = data || [];
-      const sessionIds = sessionRows.map(s => s.id).filter(Boolean);
-      const transcriptsBySession = new Map();
+    const request = (async () => {
+      setLoading(true);
+      try {
+        const { data, error } = await supabase
+          .from('sessions')
+          .select('id, title, summary, duration_sec, word_count, mode, folder_id, created_at, updated_at')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false })
+          .range(offset, offset + PAGE_SIZE - 1);
 
-      if (sessionIds.length > 0) {
-        const { data: txRows, error: txError } = await supabase
-          .from('transcripts')
-          .select('id, session_id, speaker, en_text, zh_text, is_polished, confidence, sort_order, created_at')
-          .in('session_id', sessionIds)
-          .order('sort_order', { ascending: true });
-
-        if (txError) {
-          console.error('Failed to load session transcripts:', txError);
-        } else {
-          for (const row of txRows || []) {
-            const key = row.session_id;
-            if (!transcriptsBySession.has(key)) transcriptsBySession.set(key, []);
-            transcriptsBySession.get(key).push(row);
-          }
+        if (error) {
+          console.error('Failed to load sessions:', error);
+          return [];
         }
-      }
 
-      const normalized = sessionRows.map(session =>
-        normalizeSession({
-          ...session,
-          transcripts: transcriptsBySession.get(session.id) || [],
-        })
-      );
-
-      if (offset === 0) {
-        setSessions(normalized);
-      } else {
-        setSessions(prev => [...prev, ...normalized]);
+        const sessionRows = data || [];
+        const normalized = sessionRows.map(normalizeSession);
+        setSessions((previous) => {
+          const previousById = new Map(previous.map((session) => [session.id, session]));
+          const merged = normalized.map((session) => {
+            const cached = previousById.get(session.id);
+            return cached?.transcriptsLoaded
+              ? { ...session, transcripts: cached.transcripts, transcriptsLoaded: true }
+              : session;
+          });
+          const next = isFirstPage
+            ? merged
+            : [
+                ...previous,
+                ...merged.filter((session) => !previousById.has(session.id)),
+              ];
+          sessionsRef.current = next;
+          return next;
+        });
+        setHasMore(sessionRows.length === PAGE_SIZE);
+        if (isFirstPage) lastLoadedAtRef.current = Date.now();
+        return normalized;
+      } finally {
+        setLoading(false);
+        setInitialized(true);
       }
-      setHasMore(sessionRows.length === PAGE_SIZE);
-      setLoading(false);
-      return normalized;
-    } else {
-      console.error('Failed to load sessions:', error);
+    })();
+
+    if (isFirstPage) listRequestRef.current = request;
+    try {
+      return await request;
+    } finally {
+      if (isFirstPage && listRequestRef.current === request) listRequestRef.current = null;
     }
-    setLoading(false);
-    return [];
   }, [userId]);
 
   // Load more (next page)
@@ -123,20 +138,45 @@ export function useCloudSessions(userId) {
 
   // Get a single session with its transcripts
   const getSession = useCallback(async (sessionId) => {
-    const [sessionRes, transcriptsRes] = await Promise.all([
-      supabase.from('sessions').select('*').eq('id', sessionId).single(),
-      supabase.from('transcripts').select('*').eq('session_id', sessionId).order('sort_order'),
-    ]);
-
-    if (sessionRes.error || transcriptsRes.error) {
-      console.error('Failed to load session:', sessionRes.error || transcriptsRes.error);
-      return null;
+    const cached = sessionsRef.current.find(
+      (session) => session.id === sessionId && session.transcriptsLoaded
+    );
+    if (cached) return cached;
+    if (detailRequestsRef.current.has(sessionId)) {
+      return detailRequestsRef.current.get(sessionId);
     }
 
-    return normalizeSession({
-      ...sessionRes.data,
-      transcripts: transcriptsRes.data || [],
-    });
+    const request = (async () => {
+      const [sessionRes, transcriptsRes] = await Promise.all([
+        supabase.from('sessions').select('*').eq('id', sessionId).single(),
+        supabase.from('transcripts').select('*').eq('session_id', sessionId).order('sort_order'),
+      ]);
+
+      if (sessionRes.error || transcriptsRes.error) {
+        console.error('Failed to load session:', sessionRes.error || transcriptsRes.error);
+        return null;
+      }
+
+      const normalized = normalizeSession({
+        ...sessionRes.data,
+        transcripts: transcriptsRes.data || [],
+      });
+      setSessions((previous) => {
+        const next = previous.map((session) =>
+          session.id === sessionId ? normalized : session
+        );
+        sessionsRef.current = next;
+        return next;
+      });
+      return normalized;
+    })();
+
+    detailRequestsRef.current.set(sessionId, request);
+    try {
+      return await request;
+    } finally {
+      detailRequestsRef.current.delete(sessionId);
+    }
   }, []);
 
   // Save a new session (with transcripts)
@@ -305,6 +345,7 @@ export function useCloudSessions(userId) {
   return {
     sessions,
     loading,
+    initialized,
     hasMore,
     loadSessions,
     loadMore,
