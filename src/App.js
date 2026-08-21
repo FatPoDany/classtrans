@@ -147,7 +147,7 @@ const TRANSLATION_AUDIO_STORAGE_KEY = "classtrans.playTranslationAudio.v1";
 
 const DEFAULT_POLISH_MODEL = "qwen-plus";
 const DEFAULT_REALTIME_MODEL = "qwen-turbo";
-const DEFAULT_ASR_MODEL = "qwen3.5-livetranslate-flash-realtime";
+const DEFAULT_ASR_MODEL = "paraformer-realtime-v2";
 // livetranslate：模型的 server VAD 1s 就结束一个 turn（常把一句话或相邻句子切碎）。
 // 在每个整句边界后再等这么久、若无新句才真正收口气泡，从而把停顿较短的相邻句子归并到
 // 同一个气泡（停顿超过它才另起一个）。可按口味调大/调小。
@@ -160,6 +160,18 @@ const LIVETRANSLATE_GROUP_MAX_CHARS = 500;
 const normalizeLegacyPolishModelName = (name) => {
   const cleanName = String(name || "").trim();
   return cleanName === "qwen3.5-122b-a10b" ? DEFAULT_POLISH_MODEL : cleanName;
+};
+
+// 一体化语音翻译模型（Qwen LiveTranslate，Omni-Realtime 协议）：与 Paraformer/Gummy 的
+// run-task 协议不同，需要走中继的 /realtime 路由并自带译文。
+const isLiveTranslateModel = (name) => /livetranslate/i.test(String(name || "").trim());
+
+// Qwen LiveTranslate 已下架：任何残留在数据库 / localStorage 里的 livetranslate 模型名
+// 都会连不上（Omni-Realtime 路由直接报错），这里统一改写回两段式的 Paraformer，
+// 让实时链路自动退回 "Paraformer 识别 + LLM 实时翻译"。
+const normalizeLegacyAsrModelName = (name) => {
+  const cleanName = String(name || "").trim();
+  return isLiveTranslateModel(cleanName) ? DEFAULT_ASR_MODEL : cleanName;
 };
 
 let runtimeModelName = DEFAULT_POLISH_MODEL;
@@ -177,7 +189,7 @@ try {
     runtimeSummaryModelName = normalizeLegacyPolishModelName(
       ls.getItem(SUMMARY_MODEL_STORAGE_KEY) || ""
     );
-    const a = ls.getItem(ASR_MODEL_STORAGE_KEY);
+    const a = normalizeLegacyAsrModelName(ls.getItem(ASR_MODEL_STORAGE_KEY) || "");
     if (a) runtimeAsrModelName = a;
   }
 } catch (err) {}
@@ -185,10 +197,6 @@ try {
 // 仅 Paraformer 系列支持 vocabulary_id 热词偏置；切到 Gummy 等其他系列时跳过
 const isParaformerFamilyModel = (name) =>
   /^paraformer-/i.test(String(name || "").trim());
-
-// 一体化语音翻译模型（Qwen LiveTranslate，Omni-Realtime 协议）：与 Paraformer/Gummy 的
-// run-task 协议不同，需要走中继的 /realtime 路由并自带译文。
-const isLiveTranslateModel = (name) => /livetranslate/i.test(String(name || "").trim());
 
 // 由 Paraformer 中继地址推导 Realtime 中继地址：/asr → /realtime，附带 model 查询参数。
 const REALTIME_WS_BASE = PARAFORMER_WS_URL
@@ -272,7 +280,7 @@ const setGlobalSummaryModelName = (name) => {
 };
 
 const setGlobalAsrModelName = (name) => {
-  const cleanName = String(name || "").trim() || DEFAULT_ASR_MODEL;
+  const cleanName = normalizeLegacyAsrModelName(name) || DEFAULT_ASR_MODEL;
   runtimeAsrModelName = cleanName;
   try {
     window.localStorage.setItem(ASR_MODEL_STORAGE_KEY, cleanName);
@@ -2763,7 +2771,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
     setModelDraft(aiModelName || "");
     setRealtimeModelDraft(realtimeModelName || "");
     setSummaryModelDraft(summaryModelName || "");
-    setAsrModelDraft(asrModelName || "");
+    setAsrModelDraft(normalizeLegacyAsrModelName(asrModelName) || DEFAULT_ASR_MODEL);
   }, [aiModelName, realtimeModelName, summaryModelName, asrModelName]);
 
   const [aiUsageLog, setAiUsageLog] = useState(() => readUsageLog());
@@ -7341,7 +7349,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                   type="text"
                   value={asrModelDraft}
                   onChange={(e) => setAsrModelDraft(e.target.value)}
-                  placeholder="例如 qwen3.5-livetranslate-flash-realtime"
+                  placeholder="例如 paraformer-realtime-v2"
                   className="ct-input w-full p-3 text-sm font-mono"
                 />
               </div>
