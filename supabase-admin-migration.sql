@@ -18,10 +18,24 @@ INSERT INTO public.global_settings (key, value) VALUES
   ('realtime_model_name', 'qwen-turbo'),
   ('summary_model_name', 'qwen-plus'),
   ('asr_model_name', 'paraformer-realtime-v2')
-ON CONFLICT (key) DO UPDATE
-  SET value = EXCLUDED.value,
-      updated_at = now()
-  WHERE public.global_settings.value = 'qwen3.5-122b-a10b';
+ON CONFLICT (key) DO NOTHING;
+
+-- Migrate retired legacy defaults without overwriting deliberate admin choices.
+UPDATE public.global_settings
+SET value = CASE key
+      WHEN 'ai_model_name' THEN 'qwen-plus'
+      WHEN 'realtime_model_name' THEN 'qwen-turbo'
+      WHEN 'summary_model_name' THEN 'qwen-plus'
+    END,
+    updated_at = now()
+WHERE key IN ('ai_model_name', 'realtime_model_name', 'summary_model_name')
+  AND value = 'qwen3.5-122b-a10b';
+
+UPDATE public.global_settings
+SET value = 'paraformer-realtime-v2',
+    updated_at = now()
+WHERE key = 'asr_model_name'
+  AND value ILIKE '%livetranslate%';
 
 -- 4. Enable RLS
 ALTER TABLE public.global_settings ENABLE ROW LEVEL SECURITY;

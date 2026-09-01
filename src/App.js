@@ -166,9 +166,8 @@ const normalizeLegacyPolishModelName = (name) => {
 // run-task 协议不同，需要走中继的 /realtime 路由并自带译文。
 const isLiveTranslateModel = (name) => /livetranslate/i.test(String(name || "").trim());
 
-// Qwen LiveTranslate 已下架：任何残留在数据库 / localStorage 里的 livetranslate 模型名
-// 都会连不上（Omni-Realtime 路由直接报错），这里统一改写回两段式的 Paraformer，
-// 让实时链路自动退回 "Paraformer 识别 + LLM 实时翻译"。
+// Qwen LiveTranslate 不再作为免费 ASR 链路使用：把数据库 / localStorage 中残留的
+// livetranslate 模型名统一迁移回两段式的 Paraformer，避免意外进入付费的 /realtime 路由。
 const normalizeLegacyAsrModelName = (name) => {
   const cleanName = String(name || "").trim();
   return isLiveTranslateModel(cleanName) ? DEFAULT_ASR_MODEL : cleanName;
@@ -2991,6 +2990,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           // 排除尚未 polish 完成的占位 / 流式块，避免把"AI 深度纠错与润色中..."
           // 或半截渐入的 ZH 文本写进存档
           !item.isTranslating &&
+          !item.isBaselineWhilePolishing &&
           !item.isStreamingPolish &&
           !/识别中/.test(String(item.speaker || "")) &&
           !item.en.includes("⚠️") &&
@@ -3671,6 +3671,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         (t) =>
           t &&
           !t.isTranslating &&
+          !t.isBaselineWhilePolishing &&
           t.en &&
           t.zh &&
           t.zh !== "..." &&
@@ -3690,6 +3691,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
         confidence: blockConfidence,
         lowConfidence: blockConfidence < 0.65,
         isTranslating: true,
+        isBaselineWhilePolishing: false,
         isStreamingPolish: false,
         isPolished: false,
         fromTab: isTabCapture,
@@ -3774,6 +3776,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           zh: liveZh,
           speaker: liveSpeaker || cur.speaker,
           isTranslating: false,
+          isBaselineWhilePolishing: false,
           isStreamingPolish: true,
         };
         return updated;
@@ -3793,6 +3796,7 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           confidence: blockConfidence,
           lowConfidence: blockConfidence < 0.65,
           isTranslating: false,
+          isBaselineWhilePolishing: false,
           isStreamingPolish: false,
           isPolished,
           fromTab: isTabCapture,
@@ -3888,6 +3892,29 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             setActiveZh(zh);
             activeZhRef.current = zh;
             lastTranslatedEnRef.current = textToTranslate;
+          } else if (zh) {
+            // Paraformer 的文本机译可能比停顿收口稍晚返回。旧逻辑会因为 block id
+            // 已切换而直接丢弃结果，导致用户只能看到占位符，直到 polish 开始输出。
+            // 若原气泡仍在等待 polish，先展示这份基础译文；已经开始/完成 polish 时
+            // 则不覆盖质量更高的新结果。
+            setTranscripts((prev) => {
+              const index = prev.findIndex((item) => item.id === currentBlockId);
+              if (index === -1) return prev;
+
+              const current = prev[index];
+              if (current.isStreamingPolish || current.isPolished) return prev;
+
+              const updated = [...prev];
+              updated[index] = {
+                ...current,
+                zh,
+                isTranslating: false,
+                // 基础译文先可读，但 polish promise 仍在运行；保持独立 pending 标记，
+                // 防止此时开放编辑或误报“润色就绪”，随后又被 AI 结果覆盖。
+                isBaselineWhilePolishing: true,
+              };
+              return updated;
+            });
           }
         } catch (error) {
           console.error("Real-time translation error", error);
@@ -4025,6 +4052,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
       if (!item) return false;
       // 占位气泡仍在等 polish 第一波 ZH delta
       if (item.isTranslating) return true;
+      // 基础机译已显示，但 polish promise 尚未完成
+      if (item.isBaselineWhilePolishing) return true;
       // 流式 polish 已开始喷字、但尚未 splice 落定（applyFinalSegments 未跑）
       if (item.isStreamingPolish) return true;
       const speaker = String(item.speaker || "");
@@ -6295,6 +6324,8 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
             asrStatus === "live"
               ? isPaused
                 ? "识别已暂停"
+                : liveTranslateActive
+                ? "LiveTranslate"
                 : "Paraformer"
               : asrStatus === "connecting"
               ? "连接中…"
@@ -6316,19 +6347,27 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
           asrStatus === "error"
             ? `识别异常：${asrErrorReason}`
             : asrStatus === "connecting"
-            ? "正在握手 Paraformer 任务"
+            ? liveTranslateActive
+              ? "正在握手 LiveTranslate 实时翻译"
+              : "正在握手 Paraformer 任务"
             : asrStatus === "live"
             ? isPaused
               ? "暂停：音频帧不再上行"
-              : "Paraformer 实时识别中"
+              : liveTranslateActive
+                ? "LiveTranslate 实时同传中"
+                : "Paraformer 实时识别中"
             : "未识别"
         }
         polish={{
           icon: Sparkles,
-          label: transcripts.some((t) => t.isTranslating || t.isStreamingPolish)
+          label: transcripts.some(
+            (t) => t.isTranslating || t.isBaselineWhilePolishing || t.isStreamingPolish
+          )
             ? "AI 润色中"
             : "润色就绪",
-          state: transcripts.some((t) => t.isTranslating || t.isStreamingPolish)
+          state: transcripts.some(
+            (t) => t.isTranslating || t.isBaselineWhilePolishing || t.isStreamingPolish
+          )
             ? "active"
             : "idle",
         }}
@@ -6458,7 +6497,10 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
               const liveEditKey = `live-${item.id}`;
               const isEditing =
                 bubbleEditDraft && bubbleEditDraft.key === liveEditKey;
-              const canEdit = !item.isTranslating && !item.isStreamingPolish;
+              const canEdit =
+                !item.isTranslating &&
+                !item.isBaselineWhilePolishing &&
+                !item.isStreamingPolish;
               return (
                 <>
                   <div className="flex items-center justify-between text-xs font-semibold mb-2 gap-2">
@@ -6542,7 +6584,11 @@ function MainApp({ user, signOut, authSession, isAdmin }) {
                         >
                           <WordEditableText
                             text={item.en}
-                            disabled={item.isTranslating || item.isStreamingPolish}
+                            disabled={
+                              item.isTranslating ||
+                              item.isBaselineWhilePolishing ||
+                              item.isStreamingPolish
+                            }
                             onWordClick={(e, wordIdx, word) =>
                               openWordEditPopover(e, {
                                 scope: "live",

@@ -4,12 +4,18 @@ import { supabase } from '../supabaseClient';
 const normalizeLegacyModelName = (value) =>
   value === 'qwen3.5-122b-a10b' ? 'qwen-plus' : value;
 
+const DEFAULT_ASR_MODEL = 'paraformer-realtime-v2';
+const normalizeLegacyAsrModelName = (value) =>
+  /livetranslate/i.test(String(value || '').trim())
+    ? DEFAULT_ASR_MODEL
+    : String(value || '').trim();
+
 export function useGlobalSettings() {
   const [settings, setSettings] = useState({
     aiModelName: 'qwen-plus',
     realtimeModelName: 'qwen-turbo',
     summaryModelName: 'qwen-plus',
-    asrModelName: 'paraformer-realtime-v2'
+    asrModelName: DEFAULT_ASR_MODEL
   });
   const [loading, setLoading] = useState(true);
 
@@ -24,7 +30,9 @@ export function useGlobalSettings() {
           if (item.key === 'ai_model_name') newSettings.aiModelName = normalizeLegacyModelName(item.value);
           if (item.key === 'realtime_model_name') newSettings.realtimeModelName = item.value;
           if (item.key === 'summary_model_name') newSettings.summaryModelName = normalizeLegacyModelName(item.value);
-          if (item.key === 'asr_model_name') newSettings.asrModelName = item.value;
+          if (item.key === 'asr_model_name') {
+            newSettings.asrModelName = normalizeLegacyAsrModelName(item.value) || DEFAULT_ASR_MODEL;
+          }
         });
         setSettings(newSettings);
       }
@@ -61,7 +69,12 @@ export function useGlobalSettings() {
       if (newValues.aiModelName) updates.push({ key: 'ai_model_name', value: newValues.aiModelName });
       if (newValues.realtimeModelName) updates.push({ key: 'realtime_model_name', value: newValues.realtimeModelName });
       if (newValues.summaryModelName) updates.push({ key: 'summary_model_name', value: newValues.summaryModelName });
-      if (newValues.asrModelName) updates.push({ key: 'asr_model_name', value: newValues.asrModelName });
+      if (newValues.asrModelName) {
+        updates.push({
+          key: 'asr_model_name',
+          value: normalizeLegacyAsrModelName(newValues.asrModelName) || DEFAULT_ASR_MODEL
+        });
+      }
 
       if (updates.length > 0) {
         const { error } = await supabase.from('global_settings').upsert(updates);
